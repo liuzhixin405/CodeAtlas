@@ -1,0 +1,130 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Text;
+using CodeAtlas.Core.Hashing;
+using CodeAtlas.Core.Model;
+using CodeAtlas.Core.Resolution;
+using CodeAtlas.Core.Storage;
+
+namespace CodeAtlas.Indexing.TreeSitter;
+
+public sealed class TreeSitterIndexer(IndexDatabase db, IReadOnlyList<ILanguageAdapter> adapters, IEdgeResolver resolver, IndexOptions? options = null)
+{
+    private readonly IndexOptions _options = options ?? new IndexOptions();
+
+    private sealed record ParseResult(ScannedFile File, ParsedFile? Parsed, string Hash, FileStatus Status, string? Error, bool Unchanged = false);
+
+    public async Task<IndexReport> IndexAsync(string root, IProgress<IndexProgress>? progress = null, CancellationToken ct = default)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var reader = new IndexReader(db);
+        var writer = new IndexWriter(db);
+        var adapterByLanguage = adapters.ToDictionary(a => a.LanguageId);
+        var extensionToLanguage = adapters
+            .SelectMany(a => a.Extensions.Select(e => (Extension: e, a.LanguageId)))
+            .ToDictionary(x => x.Extension, x => x.LanguageId, StringComparer.OrdinalIgnoreCase);
+
+        progress?.Report(new IndexProgress("scan", 0, 0, null));
+        var scanned = new RepositoryScanner(extensionToLanguage, _options.ExcludedDirectories).Scan(root).ToList();
+        var existing = reader.GetAllFiles().ToDictionary(f => f.Path, StringComparer.Ordinal);
+
+        // 1. 磁盘上已不存在的文件
+        var scannedPaths = scanned.Select(s => s.RelativePath).ToHashSet(StringComparer.Ordinal);
+        var removed = existing.Values.Where(f => !scannedPaths.Contains(f.Path)).ToList();
+        if (removed.Count > 0)
+        {
+            using var batch = db.BeginBatch();
+            foreach (var f in removed) writer.DeleteFile(f.Id);
+            batch.Commit();
+        }
+
+        // 2. 并行：读、哈希、比较、解析
+        var results = new ConcurrentBag<ParseResult>();
+        var done = 0;
+        var parallel = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _options.MaxParallelism), CancellationToken = ct };
+        await Parallel.ForEachAsync(scanned, parallel, async (file, token) =>
+        {
+            try
+            {
+                if (file.Size > _options.MaxFileBytes)
+                {
+                    results.Add(new ParseResult(file, null, "", FileStatus.Skipped, null));
+                    return;
+                }
+                var bytes = await File.ReadAllBytesAsync(file.FullPath, token);
+                var hash = FileHasher.Sha256Hex(bytes);
+                if (!_options.Full && existing.TryGetValue(file.RelativePath, out var old) && old.Hash == hash && old.Status == FileStatus.Ok)
+                {
+                    results.Add(new ParseResult(file, null, hash, FileStatus.Ok, null, Unchanged: true));
+                    return;
+                }
+                var parsed = adapterByLanguage[file.Language].Parse(file.RelativePath, Decode(bytes));
+                results.Add(new ParseResult(file, parsed, hash, FileStatus.Ok, null));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                results.Add(new ParseResult(file, null, "", FileStatus.ParseFailed, ex.Message));
+            }
+            finally
+            {
+                var d = Interlocked.Increment(ref done);
+                progress?.Report(new IndexProgress("parse", d, scanned.Count, file.RelativePath));
+            }
+        });
+
+        // 3. 串行分批写入
+        var pending = new List<PendingReference>();
+        var toWrite = results.Where(r => !r.Unchanged).OrderBy(r => r.File.RelativePath, StringComparer.Ordinal).ToList();
+        var written = 0;
+        foreach (var chunk in toWrite.Chunk(_options.WriteBatchSize))
+        {
+            ct.ThrowIfCancellationRequested();
+            using var batch = db.BeginBatch();
+            foreach (var r in chunk)
+            {
+                if (existing.TryGetValue(r.File.RelativePath, out var old)) writer.DeleteFileContents(old.Id);
+                var fileId = writer.UpsertFile(r.File.RelativePath, r.File.Language, r.Hash, r.File.Size, r.Status);
+                if (r.Parsed is null) continue;
+                var ids = writer.WriteSymbols(fileId, r.Parsed.Symbols, IndexSource.TreeSitter);
+                writer.WriteImports(fileId, r.Parsed.Imports);
+                foreach (var reference in r.Parsed.References)
+                    pending.Add(new PendingReference(ids[reference.FromIndex], fileId, r.File.RelativePath, r.File.Language, reference.Name, reference.Kind, reference.Line, reference.Via));
+            }
+            batch.Commit();
+            written += chunk.Length;
+            progress?.Report(new IndexProgress("write", written, toWrite.Count, null));
+        }
+
+        // 4. 解析引用并重挂悬空边
+        progress?.Report(new IndexProgress("resolve", 0, pending.Count, null));
+        using (var batch = db.BeginBatch())
+        {
+            await resolver.ResolveAsync(new ResolveContext(db, pending), ct);
+            writer.ReattachDanglingEdges();
+            batch.Commit();
+        }
+        progress?.Report(new IndexProgress("resolve", pending.Count, pending.Count, null));
+        if (_options.Full || !db.NeedsRebuild) db.MarkCurrentVersion();
+
+        var list = results.ToList();
+        return new IndexReport(
+            FilesScanned: scanned.Count,
+            FilesParsed: list.Count(r => r.Parsed is not null),
+            FilesFailed: list.Count(r => r.Status == FileStatus.ParseFailed),
+            FilesSkipped: list.Count(r => r.Status == FileStatus.Skipped),
+            FilesRemoved: removed.Count,
+            FilesUnchanged: list.Count(r => r.Unchanged),
+            TotalSymbols: db.Scalar<long>("SELECT COUNT(*) FROM symbols"),
+            TotalEdges: db.Scalar<long>("SELECT COUNT(*) FROM edges"),
+            Elapsed: stopwatch.Elapsed,
+            Errors: list.Where(r => r.Error is not null).Select(r => (r.File.RelativePath, r.Error!)).ToList());
+    }
+
+    /// <summary>按 BOM 识别编码，默认 UTF-8；无效字节用替换字符，不抛异常。</summary>
+    private static string Decode(byte[] bytes)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        using var reader = new StreamReader(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), detectEncodingFromByteOrderMarks: true);
+        return reader.ReadToEnd();
+    }
+}

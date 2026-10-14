@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CodeAtlas.Cli/CodeAtlas.Cli.csproj" />
+    <Project Path="src/CodeAtlas.Core/CodeAtlas.Core.csproj" />
+    <Project Path="src/CodeAtlas.Indexing.Roslyn/CodeAtlas.Indexing.Roslyn.csproj" />
+    <Project Path="src/CodeAtlas.Indexing.TreeSitter/CodeAtlas.Indexing.TreeSitter.csproj" />
+    <Project Path="src/CodeAtlas.Roslyn.Worker/CodeAtlas.Roslyn.Worker.csproj" />
+    <Project Path="src/CodeAtlas.Server/CodeAtlas.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CodeAtlas.Cli.Tests/CodeAtlas.Cli.Tests.csproj" />
+    <Project Path="tests/CodeAtlas.Core.Tests/CodeAtlas.Core.Tests.csproj" />
+    <Project Path="tests/CodeAtlas.Indexing.Roslyn.Tests/CodeAtlas.Indexing.Roslyn.Tests.csproj" />
+    <Project Path="tests/CodeAtlas.Indexing.TreeSitter.Tests/CodeAtlas.Indexing.TreeSitter.Tests.csproj" />
+    <Project Path="tests/CodeAtlas.Server.Tests/CodeAtlas.Server.Tests.csproj" />
+  </Folder>
+</Solution>

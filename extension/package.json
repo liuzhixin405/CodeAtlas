@@ -1,0 +1,176 @@
+{
+  "name": "codeatlas",
+  "displayName": "CodeAtlas",
+  "description": "代码地图：点开一个符号，看它调了谁、被谁调。",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "package": "node scripts/package.mjs"
+  },
+  "dependencies": {
+    "cytoscape": "3.34.3",
+    "cytoscape-elk": "2.3.0",
+    "elkjs": "0.12.0"
+  },
+  "devDependencies": {
+    "@types/cytoscape": "3.21.9",
+    "@types/node": "22.15.0",
+    "@types/vscode": "1.100.0",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "vitest": "5.0.4",
+    "@vscode/vsce": "4.0.0"
+  },
+  "publisher": "victor-liu",
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "categories": [
+    "Visualization",
+    "Other"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeatlas.showSymbol",
+        "title": "在 CodeAtlas 中查看",
+        "category": "CodeAtlas"
+      },
+      {
+        "command": "codeatlas.openPanel",
+        "title": "打开面板",
+        "category": "CodeAtlas"
+      },
+      {
+        "command": "codeatlas.indexWorkspace",
+        "title": "索引工作区（增量）",
+        "category": "CodeAtlas"
+      },
+      {
+        "command": "codeatlas.indexWorkspaceFull",
+        "title": "索引工作区（全量重建）",
+        "category": "CodeAtlas"
+      },
+      {
+        "command": "codeatlas.restartServer",
+        "title": "重启服务",
+        "category": "CodeAtlas"
+      },
+      {
+        "command": "codeatlas.ai.selectService",
+        "title": "选择 AI 服务",
+        "category": "CodeAtlas"
+      },
+      {
+        "command": "codeatlas.ai.setApiKey",
+        "title": "设置 AI API Key",
+        "category": "CodeAtlas"
+      },
+      {
+        "command": "codeatlas.ai.clearApiKey",
+        "title": "清除 AI API Key",
+        "category": "CodeAtlas"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codeatlas.showSymbol",
+          "group": "navigation@1",
+          "when": "editorTextFocus"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codeatlas.showSymbol",
+          "when": "editorIsOpen"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "codeatlas.showSymbol",
+        "key": "ctrl+alt+g",
+        "mac": "cmd+alt+g",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "CodeAtlas",
+      "properties": {
+        "codeatlas.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "codeatlas 可执行文件路径。留空则先找扩展自带的 server/，再找 PATH。"
+        },
+        "codeatlas.ai.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用 AI 叙述（本地或联网）：容器 / 组件 / 入口流程各一段话加事实引用。关掉后服务以 --no-ai 启动，叙述卡显示「AI 未启用」。改动后服务自动重启。",
+          "order": 0
+        },
+        "codeatlas.ai.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic"
+          ],
+          "enumDescriptions": [
+            "OpenAI 兼容协议（本地 llama-server、DeepSeek、通义、OpenAI 等）",
+            "Anthropic Claude Messages API"
+          ],
+          "default": "openai",
+          "markdownDescription": "AI 服务的协议。推荐用命令 **CodeAtlas: 选择 AI 服务** 一次性设好协议、端点和模型。",
+          "order": 1
+        },
+        "codeatlas.ai.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:8080/v1",
+          "markdownDescription": "AI 服务的 API 基地址（到 `/v1` 为止），如本地 llama-server `http://127.0.0.1:8080/v1`、DeepSeek `https://api.deepseek.com/v1`。不是本机回环地址时叙述卡会醒目提示：事实子图（以及开启 `includeSource` 时的入口源码）会发到那里。API Key 用命令 **CodeAtlas: 设置 AI API Key** 保存在 SecretStorage，不写在这里。",
+          "order": 2
+        },
+        "codeatlas.ai.model": {
+          "type": "string",
+          "default": "qwen3.6-27b",
+          "markdownDescription": "请求里的模型名，如 `qwen3.6-27b`、`deepseek-chat`、`qwen-plus`、`gpt-4o-mini`、`claude-sonnet-5-5`。换模型后缓存按「子图哈希 + 模型名」失效，叙述会重算。",
+          "order": 3
+        },
+        "codeatlas.ai.concurrency": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "同时生成的叙述条数。联网服务可调到 2–4；本地模型保持 1（并发只会互相拖慢）。",
+          "order": 4
+        },
+        "codeatlas.ai.timeoutSeconds": {
+          "type": "integer",
+          "default": 300,
+          "minimum": 10,
+          "description": "单条叙述的超时（秒）。本地 27B 模型慢，保持 300；联网服务 60 足够。",
+          "order": 5
+        },
+        "codeatlas.ai.includeSource": {
+          "type": "boolean",
+          "default": true,
+          "description": "生成入口流程叙述时把入口方法源码（≤80 行）一并发给模型。关掉后只发事实子图（名字、边、配置键、调用树）。",
+          "order": 6
+        },
+        "codeatlas.indexOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "保存支持的源文件后自动增量索引。"
+        }
+      }
+    }
+  }
+}

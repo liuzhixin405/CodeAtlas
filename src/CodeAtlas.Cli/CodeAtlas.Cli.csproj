@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodeAtlas.Core\CodeAtlas.Core.csproj" />
+    <ProjectReference Include="..\CodeAtlas.Indexing.TreeSitter\CodeAtlas.Indexing.TreeSitter.csproj" />
+    <ProjectReference Include="..\CodeAtlas.Server\CodeAtlas.Server.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CodeAtlas.Cli.Tests" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>codeatlas</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

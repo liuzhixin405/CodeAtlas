@@ -1,0 +1,8 @@
+.codeatlas/
+bin/
+obj/
+.vs/
+node_modules/
+web/dist/
+*.user
+dist/

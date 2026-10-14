@@ -1,0 +1,5 @@
+media/
+dist/
+node_modules/
+server/
+*.vsix

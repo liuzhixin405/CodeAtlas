@@ -1,0 +1,5 @@
+(call_expression function: (identifier) @ref.calls)
+(call_expression function: (member_expression property: (property_identifier) @ref.calls))
+(new_expression constructor: (identifier) @ref.calls)
+(class_heritage (identifier) @ref.inherits)
+(import_statement source: (string (string_fragment) @ref.imports))
