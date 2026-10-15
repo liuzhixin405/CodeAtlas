@@ -4,7 +4,7 @@
 
 - 市场显示名：`CodeTrail Graph`。
 - 扩展包名：`codetrail-graph`。
-- 当前配置的发布者 ID：`victor-liu`，最终扩展 ID 为 `victor-liu.codetrail-graph`。**这只是仓库配置，不代表该发布者已经注册或归你所有**。
+- 当前配置的发布者 ID：`164910441`，最终扩展 ID 为 `164910441.codetrail-graph`。发布时必须使用有权管理该发布者的账号或 Token。
 - 同名显示名不等于扩展 ID 冲突；身份由 `<publisher>.<name>` 决定。名称可用性及商标问题需在正式提交前确认，仓库配置不能预留名称。
 - 市场图标：[`extension/images/icon.png`](../extension/images/icon.png)，256 × 256 PNG；可编辑源稿为同目录的 `icon.svg`。Marketplace 图标使用 PNG，活动栏单色图标单独保留在 `extension/webview/icon.svg`。
 - 后端仍叫 CodeAtlas；已有的 `codeatlas.*` 命令 / 设置、SecretStorage 键和 `.codeatlas` 索引目录不变。
@@ -14,7 +14,7 @@
 ## 2. 注册发布者与授权
 
 1. 登录 [Marketplace 发布者管理页](https://marketplace.visualstudio.com/manage)，创建你拥有的 publisher，记录 **ID**（不是显示名）。
-2. 如果 ID 不是 `victor-liu`，修改 `extension/package.json` 的 `publisher` 后重新打包。
+2. 如果使用其他发布者 ID，修改 `extension/package.json` 的 `publisher` 后重新打包。
 3. 按 [VS Code 官方发布指南](https://code.visualstudio.com/api/working-with-extensions/publishing-extension) 创建 Azure DevOps Personal Access Token（PAT）：组织选择 **All accessible organizations**，授权范围仅选择 **Marketplace → Manage**，并设置合理的有效期。账号必须有该 publisher 的发布权限。
 4. 在 `extension` 目录运行 `npx vsce login <你的发布者ID>`，在交互提示中输入 PAT。不要把 PAT 写入仓库、文档、命令行参数或截图。也可以使用管理页手动上传 VSIX，不需要在本机配置 PAT。
 
@@ -49,6 +49,10 @@ code --install-extension .\codetrail-graph-win32-x64-0.1.0.vsix --force
 
 打包前检查 `package.json` 的版本、publisher、仓库链接、图标和 README。检查打包日志中的文件清单：应包含 `dist/extension.js`、`media/panel.js`、样式、活动栏图标、`images/icon.png`、服务程序和 `server/target.json`。每个平台都需要真实的自带运行时服务，不要只运行 `vsce package` 生成缺后端的包。
 
+SQLite 依赖使用 `Microsoft.Data.Sqlite` 10.0.13，携带更新的 SQLitePCLRaw，避免旧版原生 SQLite 的 CVE-2025-6965。数据库测试会检查实际加载的 SQLite 版本至少为 3.50.2；发布前也应检查 NuGet 依赖漏洞报告。
+
+Roslyn worker 显式引用 `System.Security.Cryptography.Pkcs` 和 `System.Security.Cryptography.Xml` 10.0.13，覆盖 MSBuild 引入的旧版 8.0.0 传递依赖。升级 MSBuild 时也需保留依赖审计和 Roslyn 回归验证。
+
 ## 4. 正式上传
 
 ### 方式 A：网页上传（首次发布最直观）
@@ -66,6 +70,8 @@ npx vsce publish --packagePath .\codetrail-graph-win32-x64-0.1.0.vsix .\codetrai
 仅发布 Windows 时，只保留 Windows 的路径。上传预构建的 VSIX，不要直接运行不带 `--packagePath` 的 `vsce publish`：本项目的打包脚本负责把对应平台的后端放入扩展，循环构建后工作区的 `server` 只保留最后一个平台。
 
 上传后在管理页检查验证 / 扫描结果；通过后再在干净的 VS Code 环境中从 Marketplace 安装，确认安装到本机平台的版本。市场页面和搜索可能不会立即更新。
+
+注意：本次发布中，`@vscode/vsce` 4.0.0 的二进制 PUT 更新请求返回 HTTP 404，但 CLI 仍输出 `Published`。因此不能只以 CLI 成功日志判断多平台上传完成，必须核实服务端实际存在的版本和平台。遇到该情况可从发布者管理页上传；本次通过 Marketplace 支持的 JSON `ExtensionPackage` 上传接口完成其余平台。已上传与已通过市场验证是两个不同状态，平台包仍需等待扫描。
 
 ## 5. 后续升级
 

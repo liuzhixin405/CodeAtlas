@@ -50,7 +50,7 @@
     "vitest": "5.0.4",
     "@vscode/vsce": "4.0.0"
   },
-  "publisher": "victor-liu",
+  "publisher": "164910441",
   "main": "./dist/extension.js",
   "activationEvents": [
     "onStartupFinished",

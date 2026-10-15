@@ -5,6 +5,15 @@ namespace CodeAtlas.Core.Tests;
 public class IndexDatabaseTests
 {
     [Fact]
+    public void OpenInMemory_UsesSqlitePatchedForCve20256965()
+    {
+        using var db = IndexDatabase.OpenInMemory();
+        var version = Version.Parse(db.Scalar<string>("SELECT sqlite_version()"));
+
+        Assert.True(version >= new Version(3, 50, 2), $"SQLite {version} is affected by CVE-2025-6965.");
+    }
+
+    [Fact]
     public void OpenInMemory_CreatesAllTables()
     {
         using var db = IndexDatabase.OpenInMemory();

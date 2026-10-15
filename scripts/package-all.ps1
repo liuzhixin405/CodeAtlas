@@ -19,6 +19,6 @@ foreach ($t in $Targets) {
     }
     finally { Pop-Location }
 }
-$extensionName = (Get-Content (Join-Path $root 'extension\package.json') -Raw | ConvertFrom-Json).name
+$extensionName = (Get-Content (Join-Path $root 'extension\package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).name
 Get-ChildItem (Join-Path $root 'extension') -Filter "$extensionName-*.vsix" | Sort-Object Name |
     ForEach-Object { Write-Host ("{0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB)) }
