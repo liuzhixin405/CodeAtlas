@@ -4,8 +4,11 @@ using CodeAtlas.Core.Storage;
 
 namespace CodeAtlas.Core.Resolution;
 
-/// <summary>四级启发式解析（spec 4.2）：同文件 0.9、import 范围 0.7、全仓库唯一 0.5、多候选各 0.3、无候选 external 0.5。</summary>
-public sealed class HeuristicEdgeResolver : IEdgeResolver
+/// <summary>
+/// 四级启发式解析（spec 4.2）：同文件 0.9、import 范围 0.7、全仓库唯一 0.5、多候选各 0.3、无候选 external 0.5。
+/// TS/JS 引用带绑定信息时先按 import 绑定解析，见 HeuristicEdgeResolver.Script.cs。
+/// </summary>
+public sealed partial class HeuristicEdgeResolver : IEdgeResolver
 {
     public const int MaxCandidates = 20;
 
@@ -64,19 +67,47 @@ public sealed class HeuristicEdgeResolver : IEdgeResolver
         var importsByFile = reader.GetAllImports().GroupBy(i => i.FileId)
             .ToDictionary(g => g.Key, g => g.Select(i => (i.Target, i.IsPath)).ToList());
 
+        ScriptIndex? script = null;
+        ScriptIndex Script() => script ??= new ScriptIndex(all, byId, files, modulesByPathNoExt, importsByFile, context.ScriptConfigs);
+        GoIndex? go = null;
+        GoIndex Go() => go ??= new GoIndex(all, files, importsByFile, context.GoModules, context.References);
+        PythonIndex? python = null;
+        PythonIndex Python() => python ??= new PythonIndex(all, byId, files, importsByFile, context.References, reader);
+        JavaIndex? java = null;
+        JavaIndex Java() => java ??= new JavaIndex(all, byId, files, importsByFile, context.References, reader);
+        CSharpIndex? csharp = null;
+        CSharpIndex CSharp() => csharp ??= new CSharpIndex(all, byId, files, importsByFile, context.References, reader);
+
         var edges = new List<NewEdge>();
         // handles（Handler 类 → 它处理的类型）先处理并先入库，后面的 dispatch 推导要查它
         var ordered = context.References.OrderBy(r => r.Via == "handles" ? 0 : 1).ToList();
+        // 每个引用解析出的边统一盖上调用处的字符偏移与所在控制结构（各语言的解析分支不用各自记得带上）
         foreach (var r in ordered)
         {
             ct.ThrowIfCancellationRequested();
+            var start = edges.Count;
+            ResolveOne(r);
+            if (r.Pos >= 0 || r.Context is not null)
+                for (var i = start; i < edges.Count; i++)
+                    edges[i] = edges[i] with { Pos = r.Pos >= 0 ? r.Pos : edges[i].Pos, Ctx = r.Context ?? edges[i].Ctx };
+        }
+
+        void ResolveOne(PendingReference r)
+        {
+            var family = LanguageFamily(r.Language);
+            if (family == "go") { edges.AddRange(ResolveGo(r, Go(), writer)); return; } // 见 HeuristicEdgeResolver.Go.cs
+            if (family == "python") { edges.AddRange(ResolvePython(r, Python(), writer)); return; } // 见 HeuristicEdgeResolver.Python.cs
+            if (family == "java") { edges.AddRange(ResolveJava(r, Java(), writer)); return; }       // 见 HeuristicEdgeResolver.Java.cs
+            // C# 调用带接收者绑定（CSharpAdapter 产出）时按类型解析，见 HeuristicEdgeResolver.CSharp.cs；没有绑定的仍走下面的按名字启发式
+            if (family == "csharp" && r.Kind == EdgeKind.Calls && r.Script is not null) { edges.AddRange(ResolveCSharpCall(r, CSharp(), writer)); return; }
             if (r.Kind == EdgeKind.Imports)
             {
-                edges.AddRange(ResolveImport(r, modulesByPathNoExt, namespacesByName, writer));
-                continue;
+                // 脚本：相对路径之外还认 tsconfig 别名（@/x）；C#：using 命名空间
+                if (family == "js") edges.Add(ResolveScriptImport(r, Script(), writer));
+                else edges.AddRange(ResolveImport(r, modulesByPathNoExt, namespacesByName, writer));
+                return;
             }
 
-            var family = LanguageFamily(r.Language);
             var candidates = byName.TryGetValue(r.Name, out var list)
                 ? list.Where(s => KindCompatible(r.Kind, s.Kind)
                                   && files.TryGetValue(s.FileId, out var sf)
@@ -84,25 +115,31 @@ public sealed class HeuristicEdgeResolver : IEdgeResolver
                 : [];
             if (r.Kind == EdgeKind.Calls) candidates = PreferImplementations(candidates, byId);
 
+            if (r.Script is not null && family == "js" && ResolveScript(r, candidates, Script(), writer) is { } scripted)
+            {
+                edges.AddRange(scripted);
+                return;
+            }
+
             // 1. 同文件唯一
             var sameFile = candidates.Where(c => c.FileId == r.FileId).ToList();
-            if (sameFile.Count == 1) { edges.Add(Edge(r, sameFile[0], 0.9)); continue; }
+            if (sameFile.Count == 1) { edges.Add(Edge(r, sameFile[0], 0.9)); return; }
 
             // 2. import 范围唯一
             var scope = BuildImportScope(r, importsByFile, namespacesByFile);
             var inScope = candidates.Where(c => scope.Contains(c, files)).ToList();
-            if (inScope.Count == 1) { edges.Add(Edge(r, inScope[0], 0.7)); continue; }
+            if (inScope.Count == 1) { edges.Add(Edge(r, inScope[0], 0.7)); return; }
 
             // 3. 全仓库唯一（LINQ/BCL 常见名字除外：仓库里碰巧有一个同名方法不足为凭，更可能是框架方法）
             if (candidates.Count == 1 && !(r.Kind == EdgeKind.Calls && CommonFrameworkNames.Contains(r.Name)))
-            { edges.Add(Edge(r, candidates[0], 0.5)); continue; }
+            { edges.Add(Edge(r, candidates[0], 0.5)); return; }
 
             // 5. 无候选（或名字太常见） → external
             if (candidates.Count == 0 || (r.Kind == EdgeKind.Calls && CommonFrameworkNames.Contains(r.Name)))
             {
                 var ext = writer.GetOrCreateExternal(r.Name);
                 edges.Add(new NewEdge(r.FromSymbolId, ext, "external:" + r.Name, r.Kind, IndexSource.TreeSitter, 0.5, r.FileId, r.Line));
-                continue;
+                return;
             }
 
             // 4. 多候选：取最窄的非空层级（同文件重载 > import 范围 > 全仓库），而不是全仓库按字母序截断
@@ -115,8 +152,11 @@ public sealed class HeuristicEdgeResolver : IEdgeResolver
         var others = edges.Where(e => e.Via != "handles").ToList();
         writer.WriteEdges(handles);
         var dispatch = DeriveDispatchEdges(reader, others, out var conduitIndexes);
-        for (var i = 0; i < others.Count; i++)
-            if (conduitIndexes.Contains(i)) others[i] = others[i] with { Via = "conduit" };
+        // 分发方法（IDispatcher.QueryAsync）调用推导出的"接口 → 实现"边：消息已经由 dispatches 边送到 Handler，
+        // 再连到 Dispatcher 实现（含测试里的桩）只是噪声，丢掉。与 ImplementationLinker 不给 conduit 边推实现一致
+        others = others
+            .Select((e, i) => !conduitIndexes.Contains(i) ? e : e.Via == ImplementationLinker.Via ? null : e with { Via = "conduit" })
+            .OfType<NewEdge>().ToList();
         writer.WriteEdges(others);
         writer.WriteEdges(dispatch);
         return Task.CompletedTask;
@@ -158,7 +198,8 @@ public sealed class HeuristicEdgeResolver : IEdgeResolver
             {
                 var entry = reader.GetChildren(handler.Id).FirstOrDefault(c => c.Kind == SymbolKind.Method && IsHandlerEntry(c.Name)) ?? handler;
                 if (!seen.Add((e.FromId, entry.Id))) continue;
-                result.Add(new NewEdge(e.FromId, entry.Id, entry.QualifiedName, EdgeKind.Dispatches, IndexSource.TreeSitter, 0.4, e.FileId, e.Line, Via: "dispatch:" + target.Name, EvidenceLine: e.Line));
+                result.Add(new NewEdge(e.FromId, entry.Id, entry.QualifiedName, EdgeKind.Dispatches, IndexSource.TreeSitter, 0.4, e.FileId, e.Line, Via: "dispatch:" + target.Name, EvidenceLine: e.Line,
+                    Pos: e.Pos, Ctx: e.Ctx));
             }
         }
         return result;
@@ -220,7 +261,7 @@ public sealed class HeuristicEdgeResolver : IEdgeResolver
         yield return noExt + "/index";
     }
 
-    private static string NormalizePath(string path)
+    internal static string NormalizePath(string path)
     {
         var parts = new List<string>();
         foreach (var seg in path.Replace('\\', '/').Split('/'))
@@ -232,7 +273,7 @@ public sealed class HeuristicEdgeResolver : IEdgeResolver
         return string.Join('/', parts);
     }
 
-    private static string StripScriptExtension(string path)
+    internal static string StripScriptExtension(string path)
     {
         foreach (var ext in ScriptExtensions)
             if (path.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) return path[..^ext.Length];

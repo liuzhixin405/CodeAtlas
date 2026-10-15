@@ -3,6 +3,7 @@ using CodeAtlas.Core.Model;
 using CodeAtlas.Core.Resolution;
 using CodeAtlas.Core.Roslyn;
 using CodeAtlas.Core.Storage;
+using CodeAtlas.Core.Workspace;
 using CodeAtlas.Indexing.TreeSitter;
 using CodeAtlas.Indexing.TreeSitter.Adapters;
 
@@ -18,7 +19,7 @@ public sealed class IndexService : IDisposable
     private readonly IndexDatabase _writeDb;
     private readonly IndexDatabase _readDb;
     private readonly SemaphoreSlim _readLock = new(1, 1);
-    private readonly List<ILanguageAdapter> _adapters = [new TypeScriptAdapter(), new TsxAdapter(), new JavaScriptAdapter(), new CSharpAdapter()];
+    private readonly List<ILanguageAdapter> _adapters = LanguageAdapters.Create();
     private readonly object _stateLock = new();
     private Task? _indexTask;
     private IndexProgress? _progress;
@@ -32,9 +33,14 @@ public sealed class IndexService : IDisposable
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
         _writeDb = IndexDatabase.Open(options.DbPath);
         _readDb = IndexDatabase.Open(options.DbPath);
+        _roots = options.LoadRoots();
     }
 
     public string RepoRoot => _options.RepoRoot;
+
+    /// <summary>当前的根集合（主根 + 外部根）；每次索引开始时按 --project 与 .codeatlas/config.json 重新读。</summary>
+    private ProjectRoots _roots;
+    public ProjectRoots Roots { get { lock (_stateLock) return _roots; } }
 
     public HealthDto Health() => Read(r =>
     {
@@ -55,29 +61,30 @@ public sealed class IndexService : IDisposable
             if (_indexTask is { IsCompleted: false }) return false;
             _progress = new IndexProgress("scan", 0, 0, null);
             _lastError = null;
+            var roots = _roots = _options.LoadRoots();
             var indexer = new TreeSitterIndexer(_writeDb, _adapters, new HeuristicEdgeResolver(), new IndexOptions { Full = full });
             var progress = new Progress<IndexProgress>(p => _progress = p);
             _indexTask = Task.Run(async () =>
             {
                 try
                 {
-                    var r = await indexer.IndexAsync(_options.RepoRoot, progress);
+                    var r = await indexer.IndexAsync(roots, progress);
                     var report = new IndexReportDto(r.FilesScanned, r.FilesParsed, r.FilesFailed, r.FilesSkipped, r.FilesRemoved, r.FilesUnchanged,
                         r.TotalSymbols, r.TotalEdges, r.Elapsed.TotalSeconds);
                     lock (_stateLock) _lastReport = report;
                     if (ShouldRunRoslyn(full, roslyn))
                     {
-                        var roslynReport = await RunRoslynAsync();
+                        var roslynReport = await RunRoslynAsync(roots);
                         lock (_stateLock) _lastReport = report with { Roslyn = roslynReport };
                     }
                     // 容器图事实：几秒钟的文件与文本扫描；失败只记错误不影响索引
-                    try { lock (_stateLock) _progress = new IndexProgress("arch", 0, 0, null); ArchitectureScanner.ScanAndStore(_options.RepoRoot, _writeDb); }
+                    try { lock (_stateLock) _progress = new IndexProgress("arch", 0, 0, null); ArchitectureScanner.ScanAndStore(roots, _writeDb); }
                     catch (Exception ex) { lock (_stateLock) _lastError = "容器图扫描失败：" + ex.Message; }
                     // git 行为统计：没有 git 时 Error 里写原因，DSM 的叠加层为空
-                    try { lock (_stateLock) _progress = new IndexProgress("git", 0, 0, null); GitStorage.Replace(_writeDb, GitHistory.Run(_options.RepoRoot)); }
+                    try { lock (_stateLock) _progress = new IndexProgress("git", 0, 0, null); GitStorage.Replace(_writeDb, GitHistory.Run(roots)); }
                     catch (Exception ex) { lock (_stateLock) _lastError = "git 统计失败：" + ex.Message; }
                     // 入口与路由匹配：靠索引里的符号和边，所以放在最后；失败同样只记错误
-                    try { lock (_stateLock) _progress = new IndexProgress("entries", 0, 0, null); ArchitecturePostProcess.Run(_options.RepoRoot, _writeDb); }
+                    try { lock (_stateLock) _progress = new IndexProgress("entries", 0, 0, null); ArchitecturePostProcess.Run(roots, _writeDb); }
                     catch (Exception ex) { lock (_stateLock) _lastError = "入口识别失败：" + ex.Message; }
                 }
                 catch (Exception ex)
@@ -103,20 +110,23 @@ public sealed class IndexService : IDisposable
             && _writeDb.Scalar<long>("SELECT COUNT(*) FROM files WHERE language = 'csharp'") > 0;
     }
 
-    private async Task<RoslynReportDto> RunRoslynAsync()
+    /// <summary>主根、外部根、被纳入的嵌套仓库各找一个解决方案，依次跑 worker 写回同一个库；部分失败不影响其余（失败原因进 error）。</summary>
+    private async Task<RoslynReportDto> RunRoslynAsync(ProjectRoots roots)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var worker = RoslynRunner.FindWorker();
         if (worker is null) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, $"没有找到 {RoslynRunner.WorkerName}（应与 codeatlas 同目录），跳过 Roslyn 精确语义。");
-        var sln = RoslynRunner.DiscoverSolution(_options.RepoRoot);
-        if (sln is null) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, "仓库里没有找到 .sln/.slnx，跳过 Roslyn 精确语义。");
+        var solutions = RoslynRunner.DiscoverSolutions(roots);
+        if (solutions.Count == 0) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, "仓库里没有找到 .sln/.slnx，跳过 Roslyn 精确语义。");
+        if (await RoslynRunner.ProbeAsync(worker) is { } unavailable) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, unavailable, Unavailable: true);
         lock (_stateLock) _progress = new IndexProgress("roslyn", 0, 0, null);
         try
         {
-            var r = await RoslynRunner.RunAndApplyAsync(_writeDb, worker, sln, _options.RepoRoot,
+            var r = await RoslynRunner.RunAndApplyAsync(_writeDb, worker, solutions, roots,
                 p => { lock (_stateLock) _progress = new IndexProgress("roslyn", p.Done, p.Total, p.Current); },
                 null, CancellationToken.None);
-            return new RoslynReportDto(r.Files, r.FilesSkipped, r.SymbolsMerged, r.SymbolsAdded, r.Edges, r.DiRegistrations, r.Errors, sw.Elapsed.TotalSeconds, null);
+            var partial = r.FailedSolutions is { Count: > 0 } failed ? $"{failed.Count}/{r.Solutions} 个解决方案失败：" + string.Join("；", failed) : null;
+            return new RoslynReportDto(r.Files, r.FilesSkipped, r.SymbolsMerged, r.SymbolsAdded, r.Edges, r.DiRegistrations, r.Errors, sw.Elapsed.TotalSeconds, partial);
         }
         catch (Exception ex)
         {
@@ -180,10 +190,22 @@ public sealed class IndexService : IDisposable
                     other = other with { Callers = (int)r.CountIncoming(o.Id, EdgeKind.Calls) };
             }
             list.Add(new NeighborDto(n.Edge.Id, DbNames.ToDb(n.Edge.Kind), dir, n.Edge.Confidence, n.Edge.Line, ambiguous,
-                other, n.Edge.ToName, n.Edge.Via, n.Edge.EvidenceLine));
+                other, n.Edge.ToName, n.Edge.Via, n.Edge.EvidenceLine, n.Edge.Pos, n.Edge.Ctx));
         }
         return list;
     });
+
+    /// <summary>调用大纲：这个方法按源码顺序的一层调用（见 OutlineBuilder）。只查它自己的出边与相关符号，不走整库缓存。符号不存在返回 null。</summary>
+    public OutlineDto? Outline(long id, OutlineOptions options) => Read(_ => OutlineQuery.Build(_readDb, id, options));
+
+    /// <summary>模块关系：以这个符号所属的类（或模块）为中心，类与类之间的依赖（见 RelationsBuilder）。按需查，不走整库缓存。符号不存在返回 null。</summary>
+    public RelationsDto? Relations(long id, RelationsOptions options) => Read(_ => RelationsQuery.Build(_readDb, id, options));
+
+    /// <summary>快速跳转：文件里每个方法的调用计数（见 LensQuery）。path 相对仓库根或绝对路径；不在索引里返回空 Symbols。</summary>
+    public FileLensDto Lens(string path) => Read(_ => LensQuery.Build(_readDb, Roots, path, NormalizeToRelative(path)));
+
+    /// <summary>影响范围：这个符号的直接调用方，entries=true 时另附往上能走到的入口（见 ImpactBuilder）。按需查入边，不走整库缓存。符号不存在返回 null。</summary>
+    public ImpactDto? Impact(long id, ImpactOptions options) => Read(_ => ImpactQuery.Build(_readDb, id, options));
 
     private readonly Dictionary<string, MapDto> _mapCache = new(StringComparer.Ordinal);
     private readonly Dictionary<string, PipelineDto> _pipelineCache = new(StringComparer.Ordinal);
@@ -230,7 +252,7 @@ public sealed class IndexService : IDisposable
             var edges = model.Edges.Select(e => new ArchEdgeDto(e.FromKey, e.ToKey, e.Protocol, e.Confidence, e.Source.ToString().ToLowerInvariant(), e.Evidence, e.ConfigKey, e.Url)).ToList();
             string? note = null;
             if (nodes.Count == 0)
-                note = _readDb.Scalar<long>("SELECT COUNT(*) FROM files") == 0 ? "还没有索引" : "没有发现可部署单元（可执行项目、前端应用）：这个仓库只有类库，直接看命名空间地图";
+                note = _readDb.Scalar<long>("SELECT COUNT(*) FROM files") == 0 ? "还没有索引" : "没有发现可部署单元（可执行项目、前端应用）：这个仓库只有类库，显示整库的模块依赖（组件矩阵）";
             return _archCache = new ArchDto(nodes, edges, model.Conflicts, note);
         }
     });
@@ -242,8 +264,9 @@ public sealed class IndexService : IDisposable
         foreach (var dir in container.Members)
         {
             var like = dir.Length == 0 ? "%" : dir.Replace("%", "\\%").Replace("_", "\\_") + "/%";
+            // 成员 "" 是主根：外部根的 ../… 文件不算（多项目时主根上的前端容器不能吞掉后端的命名空间）
             namespaces.AddRange(_readDb.Query<string>(
-                "SELECT DISTINCT s.qualified_name FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.kind = 'namespace' AND f.path LIKE $p ESCAPE '\\'", ("$p", like)));
+                "SELECT DISTINCT s.qualified_name FROM symbols s JOIN files f ON f.id = s.file_id WHERE s.kind = 'namespace' AND f.path LIKE $p ESCAPE '\\' AND ($p <> '%' OR f.path NOT LIKE '../%')", ("$p", like)));
         }
         if (namespaces.Count == 0) return container.Path is null ? [] : [container.Path];
         // 取"多数派"的公共前缀：一两个漏写前缀的命名空间（或全局命名空间）不能把根拉成空串
@@ -255,13 +278,14 @@ public sealed class IndexService : IDisposable
 
     private readonly Dictionary<(string, string), DsmDto> _dsmCache = new();
 
-    /// <summary>L2：某个容器内的组件 DSM。容器不存在返回 null。</summary>
+    /// <summary>L2：某个容器内的组件 DSM。容器不存在返回 null；键是 <see cref="DsmBuilder.RepoKey"/> 时按整个仓库算（纯类库仓库的第一屏）。</summary>
     public DsmDto? Dsm(string containerKey, string root) => Read(r =>
     {
         lock (_mapCache)
         {
             if (_dsmCache.TryGetValue((containerKey, root), out var cached)) return cached;
-            var container = ArchStorage.Read(_readDb).Nodes.FirstOrDefault(n => n.Key == containerKey && n.Kind == ArchNodeKind.Container);
+            var container = ArchStorage.Read(_readDb).Nodes.FirstOrDefault(n => n.Key == containerKey && n.Kind == ArchNodeKind.Container)
+                            ?? (containerKey == DsmBuilder.RepoKey ? DsmBuilder.RepoContainer(Roots) : null); // 纯类库仓库：整库伪容器
             if (container is null) return null;
             var (symbols, edges) = Data(r);
             var git = GitStorage.Read(_readDb);
@@ -316,9 +340,13 @@ public sealed class IndexService : IDisposable
             var (entries, matches) = EntryStorage.Read(_readDb);
             var entry = entries.FirstOrDefault(e => e.SymbolId == symbolId);
             if (entry is null) return _flowCache[(symbolId, maxDepth)] = null;
-            var containers = ArchStorage.Read(_readDb).Nodes.Where(n => n.Kind == ArchNodeKind.Container).ToList();
+            var arch = ArchStorage.Read(_readDb);
+            var containers = arch.Nodes.Where(n => n.Kind == ArchNodeKind.Container).ToList();
+            var externals = arch.Nodes.Where(n => n.Kind == ArchNodeKind.External).ToList();
             var (symbols, edges) = Data(r);
-            return _flowCache[(symbolId, maxDepth)] = FlowBuilder.Build(symbols, edges, entry, containers, matches, entries, maxDepth);
+            // 出口：没对上路由的 HTTP 调用画成 http 叶子（单独打开前端时后端不在索引里）
+            return _flowCache[(symbolId, maxDepth)] = FlowBuilder.Build(symbols, edges, entry, containers, matches, entries, maxDepth,
+                outbound: arch.Outbound, externalNodes: externals);
         }
     });
 
@@ -357,15 +385,11 @@ public sealed class IndexService : IDisposable
     /// <summary>整库符号与边只加载一次（ccs-backend 约 6 万符号 / 70 万边要两三秒），地图 / 管道 / DSM / 流程共用；索引结束时随其他缓存一起清。调用方持有 _mapCache 锁。</summary>
     private (List<MapSymbol> Symbols, List<MapEdge> Edges) Data(IndexReader r) => _mapData ??= MapData.Load(r);
 
+    /// <summary>绝对路径：落在主根或某个外部根之下时转成入库用的相对路径（外部根是 ../other/…），否则 null；相对路径原样（去掉开头的 /）。</summary>
     private string? NormalizeToRelative(string path)
     {
         var p = path.Replace('\\', '/');
-        if (Path.IsPathRooted(path))
-        {
-            var rel = Path.GetRelativePath(_options.RepoRoot, path).Replace('\\', '/');
-            if (rel.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(rel)) return null;
-            return rel;
-        }
+        if (Path.IsPathRooted(path)) return Roots.ToRelative(path);
         return p.TrimStart('/');
     }
 

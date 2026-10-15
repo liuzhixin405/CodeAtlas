@@ -37,7 +37,7 @@ public sealed class AnalyzerFixture : IAsyncLifetime
     public IEnumerable<EdgeRec> EdgesFrom(string fromQname, string kind) => Edges.Where(e => e.FromQualifiedName == fromQname && e.Kind == kind);
 }
 
-public class AnalyzerTests(AnalyzerFixture fx) : IClassFixture<AnalyzerFixture>
+public partial class AnalyzerTests(AnalyzerFixture fx) : IClassFixture<AnalyzerFixture>
 {
     [Fact]
     public void Symbols_QualifiedNamesCarryParameterTypes_SoOverloadsAreDistinct()

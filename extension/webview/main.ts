@@ -3,6 +3,7 @@ import { SubKindLabels } from "./archLayout";
 import { ArchRenderer } from "./archRenderer";
 import { reorderDsm } from "./dsmOrder";
 import { DsmView, type DsmCellModel } from "./dsmView";
+import { findSameEntry, hasDsmContent, isRepoContainer, MaxDefaultEntryTries, NoServiceHint, pickDefaultEntry, repoContainerNode, RepoDsmKey, shouldOpenRepoDsm, soleContainer } from "./firstScreen";
 import { EntryKindLabels, FlowView, entryTitle } from "./flowView";
 import { NarrationCard, parseEdgeEvidence, type EvidenceRef } from "./narrationCard";
 import { DefaultPreset, LayoutPresets, presetLabel } from "./presets";
@@ -14,18 +15,23 @@ import { collapseImplementations } from "./neighborRules";
 import type { CellKind } from "./pipelineLayout";
 import { PipelineRenderer } from "./pipelineRenderer";
 import { resolveRefreshedSymbol } from "./refresh";
+import { fileName, kindsSummary, RelationKindLabels, relationToCenter, reverseNote, unitKindLabel, unitLabel } from "./relationsLayout";
+import { RelationsRenderer } from "./relationsRenderer";
+import { RelationsHistory } from "./relationsState";
 import { Renderer } from "./renderer";
-import type { ArchDto, ArchEdgeDto, ArchNodeDto, DsmComponentDto, DsmDto, EntryDto, EvidenceDto, FlowDto, FlowNodeDto, MapEdgeDto, MapGroupDto, NarrativeKind, NeighborDto, PipelineBehaviorDto, PipelineDto, PipelineFlowDto, PipelineItemDto, PipelineRowDto, SymbolDto } from "./types";
+import type { ArchDto, ArchEdgeDto, ArchNodeDto, DsmComponentDto, DsmDto, EntryDto, EvidenceDto, FlowDto, FlowNodeDto, MapEdgeDto, MapGroupDto, NarrativeKind, NeighborDto, PipelineBehaviorDto, PipelineDto, PipelineFlowDto, PipelineItemDto, PipelineRowDto, RelationComponentDto, RelationEdgeDto, RelationNodeDto, RelationsDto, SymbolDto } from "./types";
 
 // ---------- DOM 骨架 ----------
 
 const app = document.getElementById("app")!;
+const RelationsHint = "在编辑器里右键一个方法或类，或在调用图里选一个节点";
 app.innerHTML = `
   <header>
-    <div id="mode"><button id="mode-graph" class="tab active">调用图</button><button id="mode-map" class="tab">项目地图</button></div>
+    <div id="mode"><button id="mode-graph" class="tab active">调用图</button><button id="mode-rel" class="tab" title="以一个类为中心看类与类之间的依赖，按组件分框">模块关系</button><button id="mode-map" class="tab">项目地图</button></div>
     <input id="search" placeholder="搜索符号（前缀，多个词用空格）" autocomplete="off" />
     <div id="dropdown"></div>
     <nav id="crumbs"></nav>
+    <span id="rel-opts" style="display:none"><span id="rel-depth" class="seg" title="1 = 只看与中心直接相连的类；2 = 再往外一层"><span class="seg-label">深度</span><button class="tab active" data-depth="1">1</button><button class="tab" data-depth="2">2</button></span><span id="rel-trunc" class="warn" style="display:none" title="服务端按与中心之间的边权重保留了前若干个">节点过多，只显示最相关的 40 个</span></span>
     <label class="opt" title="聚焦时自动沿调用/分发边向下展开到叶子"><input type="checkbox" id="auto-chain" checked /> 自动向下</label>
     <label class="opt" title="每个节点自动展开几个最像主流程的分支，其余折成「还有 N 个」"><select id="branch-width"><option value="1">主线</option><option value="2" selected>2 分支</option><option value="3">3 分支</option><option value="5">5 分支</option><option value="30">全部</option></select></label>
     <button id="chain-down" class="secondary" title="从焦点沿调用链向下展开到底">↓ 到底</button>
@@ -33,9 +39,11 @@ app.innerHTML = `
     <label class="opt" title="显示参数/字段等类型引用"><input type="checkbox" id="show-refs" /> 类型引用</label>
     <label class="opt" title="把测试项目里的调用者/被调用者也画出来"><input type="checkbox" id="show-tests" /> 测试代码</label>
     <label class="opt" title="显示分发管道本身：对 QueryAsync/SendAsync 的调用和消息对象的构造"><input type="checkbox" id="show-conduit" /> 分发细节</label>
+    <label class="opt" title="编辑器光标移进哪个方法，调用图就以它为焦点（停下约 0.4 秒后换）"><input type="checkbox" id="follow-cursor" /> 跟随光标</label>
     <button id="reindex" class="secondary" title="增量索引">⟳ 索引</button>
   </header>
-  <main id="cy"><div id="hint">在编辑器里右键"在 CodeAtlas 中查看"，或在上面搜索一个符号。</div></main>
+  <main id="cy"><div id="hint">在编辑器里右键"在 CodeTrail Graph 中查看"，或在上面搜索一个符号。</div></main>
+  <main id="rel" style="display:none"><div id="rel-cy"></div><div id="rel-hint">${RelationsHint}</div></main>
   <main id="map" style="display:none">
     <nav id="map-crumbs"><span id="map-crumb-list"></span><span id="map-view"><button id="view-arch" class="tab" title="容器图：可部署单元、外部系统与它们之间的边">容器</button><button id="view-pipeline" class="tab" title="按管道角色（入口 → 消息 → 行为链 → Handler → 下游）分泳道">管道</button><button id="view-ns" class="tab" title="按命名空间 / 目录分组">命名空间</button></span><label class="opt" id="map-layout-wrap" title="版式预设：AI 的排版建议也只在这些里选" style="display:none"><span>版式</span><select id="map-layout"></select></label></nav>
     <div id="arch-cy" style="display:none"></div><div id="dsm-view" style="display:none"></div><div id="flow-view" style="display:none"></div><div id="pipe-cy" style="display:none"></div><div id="map-cy"></div>
@@ -99,10 +107,30 @@ let dsmShown: DsmDto | null = null;
 /** 右侧叙述卡（M5d）与三类对象当前用的版式预设。 */
 let card: NarrationCard | null = null;
 const presets: Record<NarrativeKind, string> = { ...DefaultPreset };
-let mode: "graph" | "map" = "graph";
+type Mode = "graph" | "relations" | "map";
+let mode: Mode = "graph";
+/** 模块关系（以一个类为中心的类间依赖）：当前数据、中心历史、深度。 */
+let relRenderer: RelationsRenderer | null = null;
+let relDto: RelationsDto | null = null;
+const relHistory = new RelationsHistory();
+let relDepth: 1 | 2 = 1;
+/** relDto 是按哪组参数取的；切回模块关系时参数变了（测试代码开关、索引刷新）就重取。 */
+let relParams = "";
+/** 上次从调用图带进模块关系的符号 id：调用图里的焦点 / 选中没变时，切回来不覆盖用户在模块关系里走到的中心。 */
+let relSyncedFromGraph: number | null = null;
+/** 请求批次号：用户连点时只认最后一次。 */
+let relSeq = 0;
+/** init 之前宿主发来的 showRelations。 */
+let pendingRelations: { symbolId: number; depth?: 1 | 2 } | null = null;
 type MapViewKind = "arch" | "dsm" | "flow" | "pipeline" | "ns";
 /** 地图模式下看哪个视图；null = 还没问过服务。有容器就从容器图开始，否则管道，再否则命名空间。 */
 let mapView: MapViewKind | null = null;
+/**
+ * 第一屏「只有一个容器就直接进它的入口流程」还没判过。每个仓库只自动跳一次：
+ * 判过之后用户点面包屑「项目」回容器图，不会再被跳回去；切仓库时重置。
+ * 容器图为空（还没索引）时不算判过，索引完成后再判。
+ */
+let autoFlowPending = true;
 let selectedNode: GraphNode | null = null;
 
 /** 链展开的安全阀：深度与每个节点的分支数。超过分支数就停在那个节点，让用户手动展开。 */
@@ -191,6 +219,7 @@ function render(): void {
 
 function renderCrumbs(): void {
   crumbsEl.innerHTML = "";
+  if (mode === "relations") { renderRelationsCrumbs(); return; }
   state.breadcrumbs.forEach((b, i) => {
     if (i > 0) crumbsEl.insertAdjacentHTML("beforeend", '<span class="sep">›</span>');
     const el = document.createElement("span");
@@ -210,10 +239,11 @@ function edgeKindText(e: GraphEdge): string {
 }
 
 function confidenceText(c: number): string {
-  if (c >= 1) return "确定";
-  if (c >= 0.9) return "同文件唯一";
-  if (c >= 0.7) return "import 范围唯一";
-  if (c >= 0.5) return "全仓库唯一或外部";
+  if (c >= 1) return "确定（编译器 / 包含关系）";
+  if (c >= 0.95) return "按 import 解析";
+  if (c >= 0.9) return "按类型解析";
+  if (c >= 0.7) return "名字唯一";
+  if (c >= 0.5) return "外部库或弱匹配";
   return "多候选之一";
 }
 
@@ -240,7 +270,7 @@ function showEdgeDetails(e: GraphEdge | null): void {
   const src = state.getNode(e.source)?.label ?? e.source;
   const dst = state.getNode(e.target)?.label ?? e.target;
   detailsEl.innerHTML = `<span class="kind">${esc(edgeKindText(e))}</span><span class="mono">${esc(src)} → ${esc(dst)}</span>` +
-    `<span class="muted">confidence ${e.confidence.toFixed(1)}（${confidenceText(e.confidence)}）· 第 ${e.line} 行</span>`;
+    `<span class="muted">confidence ${e.confidence.toFixed(2)}（${confidenceText(e.confidence)}）· 第 ${e.line} 行</span>`;
 }
 
 function esc(s: string): string {
@@ -366,11 +396,14 @@ function chooseNeighbors(title: string, items: NeighborDto[]): Promise<NeighborD
   });
 }
 
+type MenuItem = { label: string; run?: () => void };
+
 function showContextMenu(node: GraphNode, x: number, y: number): void {
-  const items: Array<{ label: string; run?: () => void }> = [];
+  const items: MenuItem[] = [];
   if (node.type === "symbol" && node.symbol) {
     const s = node.symbol;
     items.push({ label: "设为焦点", run: () => void focusSymbol(s) });
+    if (s.kind !== "external") items.push({ label: "在模块关系中查看", run: () => showRelationsFor(s.id) });
     if (node.expandable) items.push({ label: node.expanded ? "折叠邻居" : "展开一层", run: () => (node.expanded ? (state.collapse(node.id), render()) : void expandNode(node)) });
     if (node.id !== state.focusNodeId) items.push({ label: "从图中隐藏", run: () => { state.hide(node.id); render(); } });
     if (s.kind !== "external") items.push({ label: "在编辑器中打开", run: () => openInEditor(s) });
@@ -380,6 +413,10 @@ function showContextMenu(node: GraphNode, x: number, y: number): void {
   } else {
     items.push({ label: "从图中隐藏", run: () => { state.hide(node.id); render(); } });
   }
+  openMenu(items, x, y);
+}
+
+function openMenu(items: MenuItem[], x: number, y: number): void {
   ctxmenu.innerHTML = items.map((i, idx) => `<div class="mi${i.run ? "" : " disabled"}" data-i="${idx}">${esc(i.label)}</div>`).join("");
   ctxmenu.querySelectorAll<HTMLElement>(".mi").forEach((el) => {
     el.onclick = () => { ctxmenu.classList.remove("open"); items[Number(el.dataset["i"])]?.run?.(); };
@@ -391,7 +428,7 @@ function showContextMenu(node: GraphNode, x: number, y: number): void {
 document.addEventListener("click", () => ctxmenu.classList.remove("open"));
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { ctxmenu.classList.remove("open"); chooser.classList.remove("open"); dropdown.classList.remove("open"); }
-  if (e.key === "Enter" && selectedNode?.type === "symbol" && selectedNode.symbol && document.activeElement !== searchEl) openInEditor(selectedNode.symbol);
+  if (e.key === "Enter" && mode === "graph" && selectedNode?.type === "symbol" && selectedNode.symbol && document.activeElement !== searchEl) openInEditor(selectedNode.symbol);
 });
 
 // ---------- 搜索 ----------
@@ -428,22 +465,256 @@ function highlight(): void {
 function pick(i: number): void {
   const s = lastHits[i];
   dropdown.classList.remove("open");
-  if (s) { searchEl.value = ""; void focusSymbol(s); }
+  if (!s) return;
+  searchEl.value = "";
+  // 在当前模式下打开：模块关系里以它为中心；调用图（以及项目地图，地图没有"符号焦点"）里聚焦它
+  if (mode === "relations") { void openRelations(s.id, "push"); return; }
+  if (mode !== "graph") setMode("graph");
+  void focusSymbol(s);
+}
+
+// ---------- 模块关系 ----------
+
+function relTests(): boolean {
+  return $<HTMLInputElement>("show-tests").checked;
+}
+function relParamKey(): string {
+  return `${relDepth}|${relTests()}`;
+}
+
+/** 调用图里能带进模块关系的符号：选中的符号节点优先，其次焦点；外部 / 悬空 / 多候选不算。 */
+function graphSymbolForRelations(): SymbolDto | null {
+  const pickable = (n: GraphNode | null | undefined): SymbolDto | null => (n && n.type === "symbol" && n.symbol && n.symbol.kind !== "external" ? n.symbol : null);
+  return pickable(selectedNode) ?? pickable(state.focusNodeId ? state.getNode(state.focusNodeId) : null);
+}
+
+function ensureRelRenderer(): RelationsRenderer {
+  relRenderer ??= new RelationsRenderer($("rel-cy"), {
+    onUnitSelect: showRelUnitDetails,
+    onUnitDoubleClick: (n) => {
+      if (n.unit.id === relDto?.focus.id) { toast("已经是中心"); return; }
+      void openRelations(n.unit, "push");
+    },
+    onUnitContext: showRelContextMenu,
+    onComponentSelect: showRelComponentDetails,
+    onEdgeSelect: showRelEdgeDetails,
+    onClear: showRelationsSummary,
+  });
+  return relRenderer;
+}
+
+/** 进入模块关系模式。sync：从调用图带符号过来（见 setMode）；false 表示调用方马上会自己指定中心，这里只摆好界面。 */
+function enterRelations(sync: boolean): void {
+  ensureRelRenderer().resize();
+  renderRelationsChrome();
+  if (!sync) return;
+  const s = graphSymbolForRelations();
+  if (s && s.id !== relSyncedFromGraph) { relSyncedFromGraph = s.id; void openRelations(s, "push"); return; }
+  const center = relHistory.current;
+  // 离开期间切过测试代码开关 / 索引刷新过：按新参数重取
+  if (center && (relDto === null || relParams !== relParamKey())) { void openRelations(center, "replace"); return; }
+  showRelationsSummary();
+}
+
+/** 侧边栏 / 宿主消息 / 调用图右键：切到模块关系并以 symbolId 为中心。 */
+function showRelationsFor(symbolId: number, depth?: 1 | 2): void {
+  if (depth === 1 || depth === 2) relDepth = depth;
+  // 调用图当前的选中 / 焦点算"已经带过来了"，之后切标签不会把这里指定的中心覆盖掉
+  relSyncedFromGraph = graphSymbolForRelations()?.id ?? relSyncedFromGraph;
+  setMode("relations", false);
+  void openRelations(symbolId, "push");
+}
+
+/**
+ * 取模块关系并画出来。target 可以是方法 / 属性 / 类型（服务端换成所属单元，中心是 dto.focus）。
+ * push：推入中心历史（同一个单元不重复）；replace：替换当前这一格（面包屑回退、换深度、刷新）。
+ * target 是旧符号且 404 时（增量索引后 id 变了）按位置 / 限定名找回再试一次。
+ */
+async function openRelations(target: number | SymbolDto, how: "push" | "replace"): Promise<void> {
+  if (!api) return;
+  const a = api;
+  ensureRelRenderer();
+  const seq = ++relSeq;
+  const params = relParamKey();
+  const depth = relDepth;
+  const tests = relTests();
+  let dto: RelationsDto | null;
+  try {
+    dto = await a.relations(typeof target === "number" ? target : target.id, depth, tests);
+    if (dto === null && typeof target !== "number") {
+      const s = await resolveRefreshedSymbol(a, target);
+      if (s && s.id !== target.id) dto = await a.relations(s.id, depth, tests);
+    }
+  } catch (e) {
+    if (seq === relSeq) toast(`取模块关系失败：${e}`, 5000);
+    return;
+  }
+  if (seq !== relSeq) return;
+  if (dto === null) {
+    toast("拿不到模块关系：服务版本太旧（没有 /api/symbols/{id}/relations，重启服务或更新扩展），或符号已不在索引里", 6000);
+    renderRelationsChrome();
+    return;
+  }
+  relDto = dto;
+  relParams = params;
+  const label = unitLabel(dto.focus);
+  if (how === "push") relHistory.visit(dto.focus, label);
+  else relHistory.replaceCurrent(dto.focus, label);
+  relRenderer!.render(dto);
+  renderRelationsChrome();
+  showRelationsSummary();
+}
+
+/** 顶部：深度按钮、截断提示、面包屑；画布上的提示语。 */
+function renderRelationsChrome(): void {
+  $("rel-depth").querySelectorAll<HTMLButtonElement>("button[data-depth]").forEach((b) => b.classList.toggle("active", Number(b.dataset["depth"]) === relDepth));
+  $("rel-trunc").style.display = relDto?.truncated ? "" : "none";
+  $("rel-hint").style.display = relHistory.current ? "none" : "block";
+  if (mode === "relations") renderCrumbs();
+}
+
+function renderRelationsCrumbs(): void {
+  relHistory.crumbs.forEach((c, i) => {
+    if (i > 0) crumbsEl.insertAdjacentHTML("beforeend", '<span class="sep">›</span>');
+    const el = document.createElement("span");
+    el.className = "crumb" + (i === relHistory.currentIndex ? " current" : "");
+    el.textContent = c.label;
+    el.title = c.symbol.qualifiedName;
+    el.onclick = () => {
+      if (i === relHistory.currentIndex) return;
+      const s = relHistory.goTo(i);
+      renderCrumbs();
+      if (s) void openRelations(s, "replace");
+    };
+    crumbsEl.appendChild(el);
+  });
+}
+
+function relUnitName(id: number): string {
+  const n = relDto?.nodes.find((x) => x.unit.id === id);
+  return n ? unitLabel(n.unit) : String(id);
+}
+
+function relComponentLabel(key: string): string {
+  return relDto?.components.find((c) => c.key === key)?.label ?? key;
+}
+
+function showRelationsSummary(): void {
+  relSelectedEdge = null;
+  if (mode !== "relations") return;
+  const d = relDto;
+  if (!d || !relHistory.current) { detailsEl.innerHTML = `<span class="muted">${esc(RelationsHint)}</span>`; return; }
+  const units = d.nodes.length;
+  const comps = new Set(d.nodes.map((n) => n.componentKey)).size;
+  const reverse = d.edges.filter((e) => reverseNote(e, d) !== null).length;
+  const body = units <= 1 ? "没有找到与其他类的依赖" : `${units} 个单元，${comps} 个组件，${d.edges.length} 条依赖${reverse > 0 ? `，其中 ${reverse} 条反向（红色描边）` : ""}`;
+  detailsEl.innerHTML = `<span class="kind">${esc(unitKindLabel(d.focus))}</span><span class="mono" title="${esc(d.focus.qualifiedName)}">${esc(unitLabel(d.focus))}</span><span>${esc(body)}</span>` +
+    `<span class="muted">组件按依赖序从左到右（被依赖的在左，外部最右）；单击边看示例，双击类换中心，右键更多</span>`;
+}
+
+function showRelUnitDetails(n: RelationNodeDto): void {
+  if (!relDto) return;
+  relSelectedEdge = null;
+  const u = n.unit;
+  const canOpen = !n.external && u.kind !== "external";
+  detailsEl.innerHTML = `<span class="kind">${esc(unitKindLabel(u))}</span><span class="mono" title="${esc(u.path)}:${u.startLine}">${esc(u.qualifiedName)}</span>` +
+    `<span class="muted">组件：${esc(relComponentLabel(n.componentKey))}${n.external ? " · 仓库外" : ""}</span>` +
+    `<span>${esc(relationToCenter(relDto, u.id))}</span>` +
+    (canOpen ? `<a id="rel-open">在编辑器中打开</a>` : "");
+  detailsEl.querySelector<HTMLAnchorElement>("#rel-open")?.addEventListener("click", () => openInEditor(u));
+}
+
+function showRelComponentDetails(c: RelationComponentDto): void {
+  relSelectedEdge = null;
+  const count = relDto?.nodes.filter((n) => n.componentKey === c.key).length ?? 0;
+  detailsEl.innerHTML = `<span class="kind">组件</span><span class="mono" title="${esc(c.key)}">${esc(c.label)}</span><span class="muted">依赖序 ${c.order}${c.containerKey ? ` · 容器 ${esc(c.containerKey)}` : ""} · 图里 ${count} 个单元</span>`;
+}
+
+let relSelectedEdge: RelationEdgeDto | null = null;
+
+function showRelEdgeDetails(e: RelationEdgeDto): void {
+  if (!relDto) return;
+  relSelectedEdge = e;
+  const rev = reverseNote(e, relDto);
+  const samples = e.samples.map((x, i) =>
+    `<span class="rel-sample"><a data-sample="${i}" title="${esc(x.file)}:${x.line}">${esc(x.fromLabel)} → ${esc(x.toLabel)}</a><span class="muted">${esc(RelationKindLabels[x.kind] ?? x.kind)} · ${esc(fileName(x.file))}:${x.line}${x.confidence < 0.7 ? ` · 置信 ${x.confidence.toFixed(1)}` : ""}</span></span>`).join("");
+  detailsEl.innerHTML = `<span class="kind">依赖</span><span class="mono">${esc(relUnitName(e.from))} → ${esc(relUnitName(e.to))}</span><span>${esc(kindsSummary(e.kinds))}</span>` +
+    (rev ? `<span class="warn">${esc(rev)}</span>` : "") +
+    (samples ? `<span class="rel-samples"><span class="muted">示例：</span>${samples}</span>` : `<span class="muted">没有成员层面的示例</span>`);
+}
+
+/** 打开文件到行；pos（UTF-16 偏移）有值时宿主优先用它定位到调用名。 */
+function openLocation(path: string, line: number, col: number, pos: number | null): void {
+  host.post({ type: "open", path, line, col, pos });
+  if (!host.isVsCode) toast(`（浏览器模式）打开 ${path}:${line}${pos !== null ? ` @${pos}` : ""}`);
+}
+
+detailsEl.addEventListener("click", (ev) => {
+  const a = (ev.target as HTMLElement).closest("a[data-sample]") as HTMLElement | null;
+  const x = a && relSelectedEdge ? relSelectedEdge.samples[Number(a.dataset["sample"])] : undefined;
+  if (x) openLocation(x.file, x.line, 1, x.pos);
+});
+
+function showRelContextMenu(n: RelationNodeDto, x: number, y: number): void {
+  const u = n.unit;
+  const canOpen = !n.external && u.kind !== "external";
+  const items: MenuItem[] = [
+    { label: "在编辑器中打开", run: canOpen ? () => openInEditor(u) : undefined },
+    { label: "在调用图中查看", run: canOpen ? () => { setMode("graph"); void focusSymbol(u); } : undefined },
+    { label: "设为中心", run: u.id !== relDto?.focus.id ? () => void openRelations(u, "push") : undefined },
+  ];
+  openMenu(items, x, y);
+}
+
+$("rel-depth").querySelectorAll<HTMLButtonElement>("button[data-depth]").forEach((b) => {
+  b.onclick = () => {
+    const d = Number(b.dataset["depth"]) === 2 ? 2 : 1;
+    if (d === relDepth) return;
+    relDepth = d;
+    renderRelationsChrome();
+    const center = relHistory.current;
+    if (center) void openRelations(center, "replace");
+  };
+});
+
+/** 索引刷新后：中心符号的 id 可能变了，找回后在模块关系模式下重取；不在这个模式就等切回来再取。 */
+async function refreshRelations(): Promise<void> {
+  if (!api) return;
+  const old = relHistory.current;
+  if (!old) return;
+  const s = await resolveRefreshedSymbol(api, old);
+  if (!s) { if (mode === "relations") toast("模块关系的中心在新索引里找不到了"); return; }
+  relHistory.replaceCurrent(s, unitLabel(s));
+  relParams = "";
+  if (mode === "relations") await openRelations(s, "replace");
 }
 
 // ---------- 项目地图 ----------
 
-function setMode(next: "graph" | "map"): void {
+/**
+ * 切模式。sync=true（用户点顶部的「模块关系」）时，调用图里有选中 / 焦点符号且和上次带过去的不同，就以它为中心打开；
+ * 宿主的 showRelations、右键「在模块关系中查看」自己指定中心，传 false。
+ */
+function setMode(next: Mode, sync = true): void {
   mode = next;
+  app.dataset["mode"] = next;
   $("cy").style.display = next === "graph" ? "" : "none";
+  $("rel").style.display = next === "relations" ? "" : "none";
   $("map").style.display = next === "map" ? "" : "none";
   $("mode-graph").classList.toggle("active", next === "graph");
+  $("mode-rel").classList.toggle("active", next === "relations");
   $("mode-map").classList.toggle("active", next === "map");
-  for (const id of ["auto-chain", "chain-down", "chain-up", "show-refs", "show-tests", "show-conduit", "branch-width"]) {
+  for (const id of ["auto-chain", "chain-down", "chain-up", "show-refs", "show-conduit", "branch-width", "follow-cursor"]) {
     const el = $(id);
     (el.closest("label") ?? el).style.display = next === "graph" ? "" : "none";
   }
-  if (next === "map") { mapRenderer?.resize(); pipelineRenderer?.resize(); archRenderer?.resize(); void loadMapView(); } else renderer?.resize();
+  // 「测试代码」开关两种模式共用：调用图里过滤测试邻居，模块关系里是 tests=true/false
+  $("show-tests").closest("label")!.style.display = next === "map" ? "none" : "";
+  $("rel-opts").style.display = next === "relations" ? "" : "none";
+  renderCrumbs();
+  if (next === "map") { mapRenderer?.resize(); pipelineRenderer?.resize(); archRenderer?.resize(); void loadMapView(); }
+  else if (next === "relations") enterRelations(sync);
+  else { renderer?.resize(); showNodeDetails(selectedNode); }
 }
 
 /** 第一次进地图模式先问服务：有容器就从容器图开始；没有再看有没有分发数据（管道）；都没有就命名空间视图。 */
@@ -460,7 +731,22 @@ async function loadMapView(): Promise<void> {
     $<HTMLButtonElement>("view-pipeline").disabled = !pipelineAvailable;
     $("view-pipeline").title = p === null ? "服务版本太旧，没有 /api/pipeline；重启服务或更新扩展"
       : pipelineAvailable ? "按管道角色（入口 → 消息 → 行为链 → Handler → 下游）分泳道" : "索引里没有分发（dispatches）数据，看不出管道";
-    if (archAvailable) { applyMapView("arch"); showArch(a!); return; }
+    // 纯类库仓库（没有任何可部署容器）：直接看整库的模块依赖矩阵；DSM 没有组件（还没索引等）才退回管道 / 命名空间视图
+    if (autoFlowPending && shouldOpenRepoDsm(a) && hasDsmContent(await api.dsm(RepoDsmKey, ""))) {
+      autoFlowPending = false;
+      $<HTMLButtonElement>("view-arch").disabled = false;
+      $("view-arch").title = NoServiceHint;
+      toast(NoServiceHint);
+      openDsm(repoContainerNode(repoDisplayName()));
+      return;
+    }
+    if (archAvailable) {
+      // 只有一个容器（单独打开的前端仓库等）：容器图没什么可看，直接进它的入口流程；没有入口时仍停在容器图
+      const sole = autoFlowPending ? soleContainer(a) : null;
+      autoFlowPending = false;
+      if (sole && (await api.entries(sole.key)).length > 0) { openFlow(sole); return; }
+      applyMapView("arch"); showArch(a!); return;
+    }
     applyMapView(pipelineAvailable ? "pipeline" : "ns");
     if (p !== null && pipelineAvailable) { showPipeline(p); return; }
   }
@@ -616,8 +902,15 @@ function openDsm(container: ArchNodeDto): void {
   dsmContainer = container;
   dsmPath = [];
   applyMapView("dsm");
-  showContainerCard(container);
+  // 整库伪容器没有容器叙述
+  if (isRepoContainer(container)) card?.clear(); else showContainerCard(container);
   void loadDsm();
+}
+
+/** 仓库目录名（整库 DSM 的标题）。 */
+function repoDisplayName(): string {
+  const root = (currentRepo ?? "").replace(/[\\/]+$/, "");
+  return root.slice(Math.max(root.lastIndexOf("/"), root.lastIndexOf("\\")) + 1) || "仓库";
 }
 
 async function loadDsm(): Promise<void> {
@@ -642,12 +935,14 @@ async function loadDsm(): Promise<void> {
   const cyc = d.cycles.length > 0 ? `，${d.cycles.length} 个环（红框）` : "，没有环";
   const cpl = d.coupling.length > 0 ? `，${d.coupling.length} 对隐性耦合（虚框 ~）` : "";
   const git = d.gitAvailable ? "" : "；没有 git 统计";
-  detailsEl.innerHTML = `<span class="kind">DSM</span><span>${esc(dsmContainer.name)}${root ? " › " + esc(root) : ""}：${d.components.length} 个组件，${d.cells.length} 个依赖格${cyc}${cpl}${git}${d.note ? "；" + esc(d.note) : ""}</span><span class="muted">行依赖列；双击带下划线的行头钻入</span>`;
+  const hint = isRepoContainer(dsmContainer) ? `<span class="muted">${esc(NoServiceHint)}</span>` : "";
+  detailsEl.innerHTML = `${hint}<span class="kind">DSM</span><span>${esc(dsmContainer.name)}${root ? " › " + esc(root) : ""}：${d.components.length} 个组件，${d.cells.length} 个依赖格${cyc}${cpl}${git}${d.note ? "；" + esc(d.note) : ""}</span><span class="muted">行依赖列；双击带下划线的行头钻入</span>`;
 }
 
 /**
  * 容器层的面包屑：项目 › 容器 [组件矩阵 | 入口流程] › …。
- * DSM 后面跟钻取路径；入口流程后面跟「入口流程 › 入口」。
+ * DSM 后面跟钻取路径；入口流程后面只跟选中的入口——子标签已经写着「入口流程」，不再重复一段（用户反馈导航重复）。
+ * 在入口流程里再点一次「入口流程」子标签 = 回到入口清单（原来那段面包屑的作用）。
  */
 function renderContainerCrumbs(sub: "dsm" | "flow"): void {
   const crumbs = $("map-crumb-list");
@@ -660,7 +955,9 @@ function renderContainerCrumbs(sub: "dsm" | "flow"): void {
     el.onclick = onClick;
     crumbs.appendChild(el);
   };
-  add("项目", false, () => setMapView("arch"));
+  const repo = isRepoContainer(dsmContainer);
+  // 整库伪容器：没有容器图可回、也没有入口流程
+  if (!repo) add("项目", false, () => setMapView("arch"));
   add(dsmContainer?.name ?? "容器", sub === "dsm" && dsmPath.length === 0, () => { if (dsmContainer) openDsm(dsmContainer); });
   const tabs = document.createElement("span");
   tabs.className = "subtabs";
@@ -673,28 +970,57 @@ function renderContainerCrumbs(sub: "dsm" | "flow"): void {
     tabs.appendChild(b);
   };
   tab("组件矩阵", "组件依赖矩阵（DSM）：行依赖列，带环与 git 耦合", sub === "dsm", () => { if (dsmContainer && mapView !== "dsm") openDsm(dsmContainer); });
-  tab("入口流程", "从一个入口（路由 / 任务 / Handler）出发的调用时序", sub === "flow", () => { if (dsmContainer && mapView !== "flow") openFlow(dsmContainer); });
+  if (!repo) tab("入口流程", sub === "flow" && flowEntry ? "回到入口清单" : "从一个入口（路由 / 任务 / Handler）出发的调用时序", sub === "flow", () => {
+    if (!dsmContainer) return;
+    if (mapView !== "flow") openFlow(dsmContainer);
+    else if (flowEntry) backToEntryList();
+  });
   crumbs.appendChild(tabs);
   if (sub === "dsm") {
     dsmPath.forEach((key, i) => add(key.slice(Math.max(key.lastIndexOf("."), key.lastIndexOf("/")) + 1), i === dsmPath.length - 1, () => { dsmPath = dsmPath.slice(0, i + 1); void loadDsm(); }));
   } else {
-    add("入口流程", flowEntry === null, () => { flowEntry = null; flowDto = null; if (dsmContainer) showContainerCard(dsmContainer); void loadFlowEntries(); });
     if (flowEntry) add(entryTitle(flowEntry), true, () => {});
   }
 }
 
+/** 用户主动回到入口清单：不再自动挑入口（进行中的那次也作废）。 */
+function backToEntryList(): void {
+  autoPickSeq++;
+  flowEntry = null;
+  flowDto = null;
+  if (dsmContainer) showContainerCard(dsmContainer);
+  void loadFlowEntries();
+}
+
 // ---------- 入口流程（L3）----------
 
+/** 进入入口流程；还没选中入口时自动挑一个（见 firstScreen.pickDefaultEntry），右边不空着。 */
 function openFlow(container: ArchNodeDto): void {
   if (flowContainerKey !== container.key) { flowContainerKey = container.key; flowEntries = []; flowEntry = null; flowDto = null; }
   dsmContainer = container;
   applyMapView("flow");
   if (flowEntry) card?.show("flow", String(flowEntry.symbolId), entryTitle(flowEntry));
   else showContainerCard(container);
-  void loadFlowEntries();
+  void loadFlowEntries(true);
 }
 
-async function loadFlowEntries(): Promise<void> {
+/** 自动挑入口的批次号：用户中途自己点了入口、换了容器或离开视图，旧批次作废。 */
+let autoPickSeq = 0;
+
+async function autoSelectEntry(): Promise<void> {
+  if (!api || flowEntries.length === 0 || flowEntry) return;
+  const seq = ++autoPickSeq;
+  const a = api;
+  const container = flowContainerKey;
+  const stale = () => seq !== autoPickSeq || flowEntry !== null || flowContainerKey !== container || mapView !== "flow";
+  flowView?.clearFlow("正在挑一个入口…");
+  const pick = await pickDefaultEntry(flowEntries, (e) => a.flow(e.symbolId), MaxDefaultEntryTries, stale);
+  if (stale()) return;
+  if (!pick) { flowView?.clearFlow(); return; }
+  await selectFlowEntry(pick.entry, pick.flow);
+}
+
+async function loadFlowEntries(autoPick = false): Promise<void> {
   if (!api || !dsmContainer) { setMapView("arch"); return; }
   flowContainerKey = dsmContainer.key;
   flowEntries = await api.entries(dsmContainer.key);
@@ -702,27 +1028,29 @@ async function loadFlowEntries(): Promise<void> {
     onEntrySelect: (e) => void selectFlowEntry(e),
     onNodeFocus: showFlowNodeDetails,
   });
-  flowView.renderEntries(flowEntries, flowEntry?.symbolId ?? null);
+  flowView.renderEntries(flowEntries, flowEntry);
   if (flowEntry && flowDto) flowView.renderFlow(flowDto);
   else flowView.clearFlow();
   renderContainerCrumbs("flow");
   if (flowEntry && flowDto) { showFlowEntryDetails(flowEntry, flowDto); return; }
+  if (autoPick && !flowEntry && flowEntries.length > 0) { await autoSelectEntry(); return; }
   const counts = new Map<string, number>();
   for (const e of flowEntries) counts.set(e.kind, (counts.get(e.kind) ?? 0) + 1);
   const parts = [...counts.entries()].map(([k, n]) => `${EntryKindLabels[k] ?? k} ${n}`).join("，");
   detailsEl.innerHTML = `<span class="kind">入口</span><span>${esc(dsmContainer.name)}：${flowEntries.length} 个入口${parts ? "（" + esc(parts) + "）" : ""}</span><span class="muted">${flowEntries.length ? "点一个入口看时序；点行展开 / 折叠，点名字切到调用图" : "没有发现入口，或服务没有 /api/arch/entries"}</span>`;
 }
 
-async function selectFlowEntry(e: EntryDto): Promise<void> {
+/** 选中一个入口并画它的时序图；preloaded 是自动挑选时已经拿到的流程，省一次请求。 */
+async function selectFlowEntry(e: EntryDto, preloaded: FlowDto | null = null): Promise<void> {
   if (!api) return;
   flowEntry = e;
   flowDto = null;
-  flowView?.renderEntries(flowEntries, e.symbolId);
-  flowView?.clearFlow("正在加载…");
+  flowView?.renderEntries(flowEntries, e);
+  if (!preloaded) flowView?.clearFlow("正在加载…");
   renderContainerCrumbs("flow");
   // 流程叙述的 key 是入口 symbolId 的十进制字符串
   card?.show("flow", String(e.symbolId), entryTitle(e));
-  const f = await api.flow(e.symbolId);
+  const f = preloaded ?? await api.flow(e.symbolId);
   if (flowEntry !== e) return; // 等待期间用户又点了别的
   if (f === null) { toast("服务没有 /api/arch/flow，或入口已不在索引里"); flowView?.clearFlow("拿不到这个入口的流程"); return; }
   flowDto = f;
@@ -816,7 +1144,11 @@ function showArchEdgeDetails(e: ArchEdgeDto | null): void {
   detailsEl.innerHTML = `<span class="kind">${esc(e.protocol)}</span><span class="mono">${esc(name(e.from))} → ${esc(name(e.to))}</span><span class="muted">${esc(tier)}${addr ? " · " + esc(addr) : ""}</span><span>证据：${evidenceLinks(e.evidence)}</span>`;
 }
 
-$("view-arch").onclick = () => setMapView("arch");
+// 没有容器的仓库：「容器」按钮回到整库 DSM
+$("view-arch").onclick = () => {
+  if (archDto && shouldOpenRepoDsm(archDto)) { openDsm(repoContainerNode(repoDisplayName())); return; }
+  setMapView("arch");
+};
 
 function renderMapCrumbs(s: MapState, reload: () => void): void {
   const crumbs = $("map-crumb-list");
@@ -954,6 +1286,7 @@ function showMapEdgeDetails(e: MapEdgeDto | null): void {
 }
 
 $("mode-graph").onclick = () => setMode("graph");
+$("mode-rel").onclick = () => { if (mode !== "relations") setMode("relations"); };
 $("mode-map").onclick = () => setMode("map");
 
 // ---------- 索引与连接 ----------
@@ -972,7 +1305,7 @@ async function checkHealth(): Promise<void> {
     const st = await api.status();
     if (st.running) pollStatus();
   } catch (e) {
-    showOverlay("连不上 CodeAtlas 服务", String(e), false);
+    showOverlay("连不上 CodeTrail Graph 服务", String(e), false);
   }
 }
 function showOverlay(title: string, text: string, showIndexButton: boolean): void {
@@ -1010,9 +1343,57 @@ function pollStatus(): void {
       overlay.classList.remove("open");
       if (s.error) toast(`索引失败：${s.error}`, 6000);
       else if (s.lastReport) toast(`索引完成：${s.lastReport.totalSymbols} 个符号，${s.lastReport.elapsedSeconds.toFixed(1)} 秒`);
+      refreshMapAfterIndex();
       await refreshFocus();
+      await refreshRelations();
     }
   }, 500);
+}
+
+/** 索引完成后刷新项目地图；轮询结束与扩展的 indexChanged 可能前后脚到，合并成一次。 */
+let mapRefresh: Promise<void> | null = null;
+function refreshMapAfterIndex(): void {
+  if (mapRefresh) return;
+  mapRefresh = doRefreshMap().catch((e) => toast(`刷新项目地图失败：${e}`)).finally(() => { mapRefresh = null; });
+}
+
+async function doRefreshMap(): Promise<void> {
+  if (!api) return;
+  // 第一屏还没判过（索引前容器图是空的）：重新走一遍第一屏决策，只有一个容器就直接进入口流程
+  if (autoFlowPending && mapView !== "dsm" && mapView !== "flow") {
+    mapView = null;
+    if (mode === "map") await loadMapView();
+    return;
+  }
+  if (mode !== "map") return;
+  if (mapView === "arch") {
+    const a = await api.arch();
+    // 没变就不重画，免得每次保存后的增量索引把用户的缩放 / 选中冲掉
+    if (a && mapView === "arch" && JSON.stringify(a) !== JSON.stringify(archDto)) { archDto = a; showArch(a); }
+  } else if (mapView === "flow") await reloadFlow();
+}
+
+/** 入口流程视图下索引完成：重取入口清单，按 id / 限定名找回原来的入口再重取流程；找不到就重新自动挑一个。 */
+async function reloadFlow(): Promise<void> {
+  if (!api || !dsmContainer) return;
+  const container = dsmContainer.key;
+  const old = flowEntry;
+  const oldFlow = flowDto;
+  const entries = await api.entries(container);
+  if (mapView !== "flow" || dsmContainer?.key !== container || flowEntry !== old) return;
+  const same = old ? findSameEntry(entries, old) : null;
+  if (same) {
+    const f = await api.flow(same.symbolId);
+    if (mapView !== "flow" || flowEntry !== old) return;
+    const unchanged = same.symbolId === old!.symbolId && JSON.stringify(entries) === JSON.stringify(flowEntries) && JSON.stringify(f) === JSON.stringify(oldFlow);
+    if (unchanged) return;
+    flowEntries = entries;
+    await selectFlowEntry(same, f);
+    return;
+  }
+  flowEntry = null;
+  flowDto = null;
+  await loadFlowEntries(old !== null);
 }
 async function refreshFocus(): Promise<void> {
   if (!api || !state.focusNodeId) return;
@@ -1028,9 +1409,26 @@ $("reindex").onclick = () => void startIndex(false);
 $("chain-down").onclick = () => { if (state.focusNodeId) void expandChain(state.focusNodeId, "out"); };
 $("chain-up").onclick = () => { if (state.focusNodeId) void expandChain(state.focusNodeId, "in"); };
 $("show-refs").onchange = () => { void refreshFocus(); };
-$("show-tests").onchange = () => { void refreshFocus(); };
+$("show-tests").onchange = () => {
+  void refreshFocus();
+  // 模块关系：tests=true/false；不在这个模式时 relParams 对不上，切回来会自动重取
+  const center = relHistory.current;
+  if (mode === "relations" && center) void openRelations(center, "replace");
+};
 $("show-conduit").onchange = () => { void refreshFocus(); };
 $("branch-width").onchange = () => { void refreshFocus(); };
+
+// 跟随光标（调用图）：勾上后宿主把编辑器光标所在方法发过来（已防抖、同一方法不重发）。浏览器调试模式没有编辑器，不显示
+if (!host.isVsCode) $("follow-cursor").closest("label")!.remove();
+else $<HTMLInputElement>("follow-cursor").onchange = (e) => host.post({ type: "followCursor", enabled: (e.target as HTMLInputElement).checked });
+
+function onCursorSymbol(symbolId: number): void {
+  const box = document.getElementById("follow-cursor") as HTMLInputElement | null;
+  // 只在调用图模式下跟；别的模式（模块关系、项目地图）不打断
+  if (!box?.checked || mode !== "graph" || !api) return;
+  if (state.focusNodeId === GraphState.nodeIdFor({ id: symbolId } as SymbolDto)) return;
+  void api.symbol(symbolId).then((s) => { if (s && box.checked && mode === "graph") void focusSymbol(s); });
+}
 
 // ---------- 启动 ----------
 
@@ -1044,10 +1442,14 @@ function init(apiBase: string, token: string | null, repoRoot: string | null): v
     mapState.reset();
     pipeState.reset();
     mapView = null;
+    autoFlowPending = true;
+    autoPickSeq++;
     archDto = null;
     dsmContainer = null; dsmPath = []; dsmDto = null; dsmShown = null;
     flowContainerKey = null; flowEntries = []; flowEntry = null; flowDto = null;
     flowView?.renderEntries([], null); flowView?.clearFlow();
+    relHistory.reset(); relDto = null; relParams = ""; relSyncedFromGraph = null; relSeq++; relSelectedEdge = null;
+    relRenderer?.clear(); renderRelationsChrome();
     card?.clear();
     render();
     showNodeDetails(null);
@@ -1078,14 +1480,28 @@ function init(apiBase: string, token: string | null, repoRoot: string | null): v
     onEdgeSelect: showEdgeDetails,
   });
   void checkHealth();
+  if (pendingRelations) { const p = pendingRelations; pendingRelations = null; showRelationsFor(p.symbolId, p.depth); }
 }
 
 host.onMessage((msg) => {
   if (msg.type === "init") init(msg.apiBase, msg.token ?? null, msg.repoRoot ?? null);
-  else if (msg.type === "focus") { if (mode !== "graph") setMode("graph"); void api?.symbol(msg.symbolId).then((s) => s && focusSymbol(s)); }
-  else if (msg.type === "indexChanged") { sawRunning = false; overlay.classList.remove("open"); void refreshFocus(); }
+  else if (msg.type === "focus") {
+    if (mode !== "graph") setMode("graph");
+    const chain = msg.chain;
+    void api?.symbol(msg.symbolId).then(async (s) => {
+      if (!s) return;
+      await focusSymbol(s);
+      if (chain) await expandChain(String(s.id), chain);
+    });
+  }
+  else if (msg.type === "cursorSymbol") onCursorSymbol(msg.symbolId);
+  else if (msg.type === "indexChanged") { sawRunning = false; overlay.classList.remove("open"); refreshMapAfterIndex(); void refreshFocus(); void refreshRelations(); }
+  else if (msg.type === "showRelations") {
+    if (api) showRelationsFor(msg.symbolId, msg.depth);
+    else pendingRelations = { symbolId: msg.symbolId, depth: msg.depth };
+  }
 });
-window.addEventListener("resize", () => { renderer?.resize(); mapRenderer?.resize(); pipelineRenderer?.resize(); archRenderer?.resize(); });
+window.addEventListener("resize", () => { renderer?.resize(); relRenderer?.resize(); mapRenderer?.resize(); pipelineRenderer?.resize(); archRenderer?.resize(); });
 
 const params = new URLSearchParams(location.search);
 const apiParam = params.get("api");

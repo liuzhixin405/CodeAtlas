@@ -1,4 +1,5 @@
 using CodeAtlas.Core.Roslyn;
+using CodeAtlas.Core.Workspace;
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
@@ -18,18 +19,36 @@ public static partial class RoslynAnalyzer
 {
     private static readonly object MsBuildGate = new();
 
-    public static async IAsyncEnumerable<RoslynRecord> AnalyzeAsync(string solutionOrProjectPath, string repoRoot, [EnumeratorCancellation] CancellationToken ct)
+    public static IAsyncEnumerable<RoslynRecord> AnalyzeAsync(string solutionOrProjectPath, string repoRoot, CancellationToken ct) =>
+        AnalyzeAsync(solutionOrProjectPath, [repoRoot], repoRoot, ct);
+
+    /// <summary>
+    /// 多根：repoRoots（主根 + 外部根）之下的源码文件才输出、定义在它们之下的符号才算仓库内；
+    /// 输出路径相对 basePath（主根），外部根的文件是 ../other/…，嵌套仓库的文件带子目录前缀，与 tree-sitter 入库路径一致。
+    /// </summary>
+    public static async IAsyncEnumerable<RoslynRecord> AnalyzeAsync(string solutionOrProjectPath, IReadOnlyList<string> repoRoots, string basePath, [EnumeratorCancellation] CancellationToken ct)
     {
         EnsureMsBuild();
+        var roots = repoRoots.Select(r => Path.GetFullPath(r).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)).ToList();
         var channel = Channel.CreateUnbounded<RoslynRecord>(new UnboundedChannelOptions { SingleReader = true });
         var producer = Task.Run(async () =>
         {
-            try { await AnalyzeCoreAsync(solutionOrProjectPath, Path.GetFullPath(repoRoot), r => channel.Writer.TryWrite(r), ct); }
+            try { await AnalyzeCoreAsync(solutionOrProjectPath, roots, Path.GetFullPath(basePath), r => channel.Writer.TryWrite(r), ct); }
             catch (Exception ex) when (ex is not OperationCanceledException) { channel.Writer.TryWrite(new ErrorRec("analyzer", ex.ToString())); channel.Writer.TryWrite(new DoneRec(0, 0, 1)); }
             finally { channel.Writer.Complete(); }
         }, ct);
         await foreach (var r in channel.Reader.ReadAllAsync(ct)) yield return r;
         await producer;
+    }
+
+    /// <summary>
+    /// 探测本机能不能用 MSBuild：返回找到的 SDK 描述（版本 + 路径），找不到返回 null。
+    /// worker 的 --probe 用它；不注册，所以之后照样能 AnalyzeAsync。
+    /// </summary>
+    public static string? ProbeMsBuild()
+    {
+        var instance = MSBuildLocator.QueryVisualStudioInstances().OrderByDescending(i => i.Version).FirstOrDefault();
+        return instance is null ? null : $"{instance.Version} {instance.MSBuildPath}";
     }
 
     private static void EnsureMsBuild()
@@ -42,7 +61,7 @@ public static partial class RoslynAnalyzer
 
     // ---- 以下方法只在 MSBuild 注册之后才会被 JIT，避免提前加载 Microsoft.Build 程序集 ----
 
-    private static async Task AnalyzeCoreAsync(string path, string repoRoot, Action<RoslynRecord> emit, CancellationToken ct)
+    private static async Task AnalyzeCoreAsync(string path, IReadOnlyList<string> repoRoot, string basePath, Action<RoslynRecord> emit, CancellationToken ct)
     {
         var errors = 0;
         using var workspace = MSBuildWorkspace.Create();
@@ -87,14 +106,15 @@ public static partial class RoslynAnalyzer
         var documents = compilations
             .SelectMany(c => c.Project.Documents.Select(d => (c.Compilation, Document: d)))
             .Where(x => x.Document.FilePath is { } fp && fp.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
-                        && fp.StartsWith(repoRoot, StringComparison.OrdinalIgnoreCase) && !SymbolKeys.IsGeneratedPath(fp))
-            .GroupBy(x => x.Document.FilePath!, StringComparer.OrdinalIgnoreCase).Select(g => g.First())
+                        && SymbolKeys.IsUnderAny(fp, repoRoot) && !SymbolKeys.IsGeneratedPath(fp))
+            // 同一文件被多个项目（多目标框架、链接文件）包含时只出一次；大小写按平台——Linux 上 Program.cs 与 program.cs 是两个文件
+            .GroupBy(x => x.Document.FilePath!, ProjectRoots.PathComparer).Select(g => g.First())
             .ToList();
         var done = 0;
         foreach (var (compilation, document) in documents)
         {
             ct.ThrowIfCancellationRequested();
-            var relative = Path.GetRelativePath(repoRoot, document.FilePath!).Replace('\\', '/');
+            var relative = Path.GetRelativePath(basePath, document.FilePath!).Replace('\\', '/');
             try
             {
                 var model = await document.GetSemanticModelAsync(ct);
@@ -114,7 +134,7 @@ public static partial class RoslynAnalyzer
         emit(new DoneRec(compilations.Count, documents.Count, errors));
     }
 
-    private static IEnumerable<INamedTypeSymbol> SourceTypes(INamespaceSymbol ns, string repoRoot)
+    private static IEnumerable<INamedTypeSymbol> SourceTypes(INamespaceSymbol ns, IReadOnlyList<string> repoRoot)
     {
         foreach (var t in ns.GetTypeMembers())
             foreach (var nested in SelfAndNested(t))

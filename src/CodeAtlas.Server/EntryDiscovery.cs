@@ -13,11 +13,15 @@ namespace CodeAtlas.Server;
 public static partial class EntryDiscovery
 {
     private static readonly HashSet<string> ControllerBases = new(StringComparer.Ordinal) { "ControllerBase", "Controller" };
+
+    /// <summary>沿继承链找 ControllerBase / Hub 等框架基类时最多往上走几层。</summary>
+    private const int MaxBaseDepth = 8;
     private static readonly HashSet<string> HostedBases = new(StringComparer.Ordinal) { "BackgroundService" };
     private static readonly HashSet<string> HostedInterfaces = new(StringComparer.Ordinal) { "IHostedService", "IHostedLifecycleService" };
     private static readonly HashSet<string> JobInterfaces = new(StringComparer.Ordinal) { "IJob" };
     private static readonly HashSet<string> HubBases = new(StringComparer.Ordinal) { "Hub" };
     private static readonly HashSet<string> ConsumerInterfaces = new(StringComparer.Ordinal) { "IConsumer" };
+    private static readonly HashSet<string> HttpVerbs = new(StringComparer.Ordinal) { "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS" };
 
     // app.MapGrpcService<GreeterService>()
     [GeneratedRegex(@"\.MapGrpcService\s*<\s*(?:[\w.]+\.)?(\w+)\s*>")]
@@ -28,6 +32,20 @@ public static partial class EntryDiscovery
     // RecurringJob.AddOrUpdate("id", () => Static.Method(...), …)
     [GeneratedRegex(@"\b(?:RecurringJob|BackgroundJob)\s*\.\s*(?:AddOrUpdate|Enqueue|Schedule|ContinueJobWith)\s*\([^;]*?\(\s*\)\s*=>\s*(?:[\w.]+\.)?(\w+)\s*\.\s*(\w+)\s*\(")]
     private static partial Regex HangfireStatic();
+
+    private static readonly HashSet<string> HostSubKinds = new(StringComparer.Ordinal) { "dotnet-exe", "dotnet-worker", "dotnet-web" };
+    // static void Main(string[] args) / static int Main() / static async Task<int> Main(string[] args)
+    [GeneratedRegex(@"\bstatic\b[^(]*\bMain\s*\(\s*(?:string\s*\[\s*\]\s*\w+)?\s*\)")]
+    private static partial Regex StaticMain();
+
+    /// <summary>
+    /// 顶级语句：Roslyn 给它补的 function 符号（限定名 Program.&lt;Main&gt;$(string[])，手造数据是 &lt;top-level&gt;）。它没有父符号，入库时挂到文件模块上；
+    /// 顶级语句里的局部函数（Program.&lt;Main&gt;$(string[]).Usage()）父符号是它，不算。
+    /// </summary>
+    private static bool IsTopLevelStatements(MapSymbol s, IReadOnlyDictionary<long, MapSymbol> byId) =>
+        s.Kind == SymbolKind.Function
+        && (s.ParentId is not { } p || !byId.TryGetValue(p, out var parent) || parent.Kind is SymbolKind.Module or SymbolKind.Namespace)
+        && (s.QualifiedName.Contains("<Main>$", StringComparison.Ordinal) || s.QualifiedName.Contains("<top-level>", StringComparison.Ordinal));
 
     [GeneratedRegex(@"\[\s*Route\s*\(\s*""([^""]*)""", RegexOptions.IgnoreCase)]
     private static partial Regex RouteAttr();
@@ -66,18 +84,20 @@ public static partial class EntryDiscovery
         IReadOnlyList<ArchNode> ContainersOf(string path) =>
             containers.Where(c => c.Members.Any(m => RuleContext.Under(path, m))).ToList();
 
-        // 继承链上的名字（最多 4 层）与直接实现的接口名
+        // 继承链上的名字（最多 MaxBaseDepth 层）与直接实现的接口名。
+        // Roslyn 把只差泛型参数个数的同名基类分开（CrudControllerBase<,> → CrudControllerBase<,,,> → QueryControllerBase<,> → …），
+        // 链比 tree-sitter 看到的深；tree-sitter 又可能给出"自己继承自己"的边，所以记下走过的类型防环
         IEnumerable<string> BaseNames(long typeId)
         {
             var cur = typeId;
-            for (var depth = 0; depth < 4; depth++)
+            var seen = new HashSet<long> { typeId };
+            for (var depth = 0; depth < MaxBaseDepth; depth++)
             {
-                var bases = inherits[cur].ToList();
-                if (bases.Count == 0) yield break;
-                var next = bases[0];
-                if (!byId.TryGetValue(next, out var b)) yield break;
+                var next = inherits[cur].FirstOrDefault(id => !seen.Contains(id));
+                if (next == 0 || !byId.TryGetValue(next, out var b)) yield break;
                 yield return b.Name;
                 if (b.Kind == SymbolKind.External) yield break;
+                seen.Add(next);
                 cur = next;
             }
         }
@@ -101,7 +121,7 @@ public static partial class EntryDiscovery
 
         foreach (var type in symbols.Where(s => s.Kind is SymbolKind.Class && s.Kind != SymbolKind.External))
         {
-            if (PipelineBuilder.IsTest(type.Path, type.QualifiedName)) continue;
+            if (PipelineBuilder.IsTest(type.Path, type.QualifiedName) || IsGo(type.Path) || IsPython(type.Path) || IsJava(type.Path)) continue; // Go / Python / Java 有自己的规则
             var owners = ContainersOf(type.Path);
             if (owners.Count == 0) continue;
             var bases = BaseNames(type.Id).ToList();
@@ -157,6 +177,19 @@ public static partial class EntryDiscovery
                 var entry = methods.FirstOrDefault(m => m.Name == "Execute") ?? methods.FirstOrDefault();
                 if (entry is not null) foreach (var c in owners) Add(new EntryPoint(entry.Id, c.Key, "quartz.job", "job", type.Name, null, entry.Path, entry.StartLine));
             }
+        }
+
+        // 控制台 / 宿主程序的启动入口：顶级语句（Roslyn 补的 function 符号，限定名带 <Main>$）或 static Main。
+        // 一个容器只取一个——两者并存时编译器用顶级语句（Main 只给警告）；只看容器自己的项目目录，引用的类库里的 Main 不是它的入口
+        foreach (var c in containers.Where(c => c.Kind == ArchNodeKind.Container && HostSubKinds.Contains(c.SubKind)))
+        {
+            IEnumerable<MapSymbol> Own(Func<MapSymbol, bool> match) => symbols
+                .Where(s => s.Path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) && match(s) && !PipelineBuilder.IsTest(s.Path, s.QualifiedName)
+                            && (c.Path is { } home ? RuleContext.Under(s.Path, home) : c.Members.Any(m => RuleContext.Under(s.Path, m))))
+                .OrderBy(s => s.Path, StringComparer.Ordinal).ThenBy(s => s.StartLine);
+            var main = Own(s => IsTopLevelStatements(s, byId)).FirstOrDefault()
+                       ?? Own(s => s.Kind == SymbolKind.Method && s.Name == "Main" && StaticMain().IsMatch(DeclarationText(readLines(s.Path), s))).FirstOrDefault();
+            if (main is not null) Add(new EntryPoint(main.Id, c.Key, "csharp.main", "hosted", c.Name, null, main.Path, main.StartLine));
         }
 
         // 分发处理器：handles 边的起点类型 → 入口方法
@@ -238,23 +271,70 @@ public static partial class EntryDiscovery
             }
         }
 
-        // 前端：按文件路径约定
+        // 前端：按文件路径约定。入口落在默认导出的组件 / 处理函数上（流程从它往下走渲染边与调用），找不到才退回模块
+        MapSymbol DefaultExport(MapSymbol module) =>
+            children[module.Id].Where(s => s.Visibility == "export default" && s.Kind is SymbolKind.Function or SymbolKind.Class or SymbolKind.Variable)
+                .OrderBy(s => s.StartLine).FirstOrDefault() ?? module;
         foreach (var c in containers.Where(c => c.SubKind == "frontend"))
         {
             foreach (var module in symbols.Where(s => s.Kind == SymbolKind.Module && RuleContext.Under(s.Path, c.Path ?? "") && !PipelineBuilder.IsTest(s.Path, s.QualifiedName)))
             {
                 var page = NextPage().Match(module.Path);
-                if (page.Success) { Add(new EntryPoint(module.Id, c.Key, "frontend.route", "page", NextRoute(page.Groups["path"].Value), null, module.Path, module.StartLine)); continue; }
+                if (page.Success)
+                {
+                    var target = DefaultExport(module);
+                    Add(new EntryPoint(target.Id, c.Key, "frontend.route", "page", NextRoute(page.Groups["path"].Value), null, module.Path, target.StartLine));
+                    continue;
+                }
                 var api = NextApiRoute().Match(module.Path);
-                if (api.Success) { Add(new EntryPoint(module.Id, c.Key, "frontend.route", "api-route", NextRoute(api.Groups["path"].Value), null, module.Path, module.StartLine)); continue; }
+                if (api.Success)
+                {
+                    // App Router 的 route.ts 按 HTTP 方法导出具名函数（export async function GET），一个方法一个入口
+                    var route = NextRoute(api.Groups["path"].Value);
+                    var handlers = children[module.Id].Where(s => s.Kind == SymbolKind.Function && s.Visibility == "export" && HttpVerbs.Contains(s.Name)).OrderBy(s => s.StartLine).ToList();
+                    foreach (var h in handlers) Add(new EntryPoint(h.Id, c.Key, "frontend.route", "api-route", route, h.Name, module.Path, h.StartLine));
+                    if (handlers.Count == 0)
+                    {
+                        var target = DefaultExport(module);
+                        Add(new EntryPoint(target.Id, c.Key, "frontend.route", "api-route", route, null, module.Path, target.StartLine));
+                    }
+                    continue;
+                }
                 var pages = PagesRouter().Match(module.Path);
                 if (pages.Success && !pages.Groups["path"].Value.StartsWith('_'))
-                    Add(new EntryPoint(module.Id, c.Key, "frontend.route", "page", NextRoute(pages.Groups["path"].Value.Replace("/index", "")), null, module.Path, module.StartLine));
+                {
+                    var target = DefaultExport(module);
+                    Add(new EntryPoint(target.Id, c.Key, "frontend.route", "page", NextRoute(pages.Groups["path"].Value.Replace("/index", "")), null, module.Path, target.StartLine));
+                }
             }
         }
 
+        // Go / Python：同一个处理函数可以挂在多条路由上，按 (符号, 容器, 规则, 路由, 方法) 去重
+        var seenRoutes = new HashSet<(long, string, string, string?, string?)>();
+        // 容器嵌套（仓库根的成员 "" 包住 backend/）时只归成员目录最具体的那个；成员同样具体（C# 共享库那样同一目录进多个容器）照旧都算
+        IReadOnlyList<ArchNode> SpecificContainersOf(string path)
+        {
+            var owners = ContainersOf(path);
+            if (owners.Count <= 1) return owners;
+            int Specificity(ArchNode c) => c.Members.Where(m => RuleContext.Under(path, m)).Max(m => m.Length);
+            var best = owners.Max(Specificity);
+            return owners.Where(c => Specificity(c) == best).ToList();
+        }
+        var scan = new Scan(symbols, byId, children, readLines, SpecificContainersOf,
+            e => { if (seenRoutes.Add((e.SymbolId, e.ContainerKey, e.RuleId, e.Route, e.HttpMethod))) result.Add(e); });
+        DiscoverCSharpCli(scan);
+        DiscoverGo(scan);
+        DiscoverPython(scan);
+        DiscoverJava(scan);
+        DiscoverNode(scan);
+
         return result.OrderBy(e => e.ContainerKey, StringComparer.Ordinal).ThenBy(e => e.Kind, StringComparer.Ordinal).ThenBy(e => e.Route, StringComparer.Ordinal).ThenBy(e => e.File, StringComparer.Ordinal).ThenBy(e => e.Line).ToList();
     }
+
+    /// <summary>Go / Python 规则共用的索引视图。Add 已带去重。</summary>
+    private sealed record Scan(
+        IReadOnlyList<MapSymbol> Symbols, IReadOnlyDictionary<long, MapSymbol> ById, ILookup<long, MapSymbol> Children,
+        Func<string, string[]> ReadLines, Func<string, IReadOnlyList<ArchNode>> ContainersOf, Action<EntryPoint> Add);
 
     /// <summary>方法声明的文本：从起始行起到出现 "Name(" 的那一行为止（最多 4 行，不越过 EndLine），用来看 override / ServerCallContext 这类修饰与参数。</summary>
     internal static string DeclarationText(string[] lines, MapSymbol m)
@@ -274,7 +354,8 @@ public static partial class EntryDiscovery
     {
         for (var i = declLine - 1; i >= 0 && i < lines.Length && lines[i].TrimStart().StartsWith('['); i++)
             yield return lines[i].Trim();
-        for (var i = declLine - 2; i >= 0 && i >= declLine - 13; i--)
+        // 文件比索引里记的短（索引之后被改过、或读不到）时不越界
+        for (var i = Math.Min(declLine - 2, lines.Length - 1); i >= 0 && i >= declLine - 13; i--)
         {
             var t = lines[i].Trim();
             if (t.Length == 0 || t.StartsWith("//", StringComparison.Ordinal) || t.StartsWith("///", StringComparison.Ordinal)) continue;

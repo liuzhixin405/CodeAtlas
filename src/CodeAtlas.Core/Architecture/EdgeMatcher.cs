@@ -3,12 +3,14 @@ using CodeAtlas.Core.Architecture.Rules;
 namespace CodeAtlas.Core.Architecture;
 
 /// <summary>
-/// 把出口变成边。三档：按路由对上 0.9（5c 做）、URL 的 host:port 对上另一容器的监听端口 0.7、只知道客户端 0.5（挂到外部系统）。
+/// 把出口变成边。档位：按路由对上 0.9（5c 做）、gRPC 客户端桩与服务端注册按服务名对上 0.9（<see cref="GrpcServiceRule"/>）、
+/// URL 的 host:port 对上另一容器的监听端口 0.7、只知道客户端 0.5（挂到外部系统）。同一对节点同一协议只留一条边，置信度取最高。
 /// 消费类协议（*-consume）方向反过来：外部系统 → 容器。
 /// </summary>
 public static class EdgeMatcher
 {
     public const double ByRoute = 0.9;
+    public const double ByServiceName = 0.9;
     public const double ByConfig = 0.7;
     public const double ClientOnly = 0.5;
 
@@ -34,10 +36,18 @@ public static class EdgeMatcher
 
         foreach (var o in ctx.Outbound)
         {
-            var evidence = new Evidence(o.File, o.Line, o.ClientName ?? o.ConfigKey ?? o.Url);
-            if (o.TargetKey is not null) { Add(o.ContainerKey, o.TargetKey, o.Protocol, ClientOnly, evidence, o.ConfigKey, o.Url); resolved.Add(o); continue; }
+            var evidence = new Evidence(o.File, o.Line, Note(o));
+            if (o.TargetKey is not null)
+            {
+                var byName = o.RuleId == GrpcServiceRule.RuleId && containers.Any(c => c.Key == o.TargetKey);
+                Add(o.ContainerKey, o.TargetKey, o.Protocol, byName ? ByServiceName : ClientOnly, evidence, o.ConfigKey, o.Url);
+                resolved.Add(o);
+                continue;
+            }
 
             var url = o.Url ?? (o.ConfigKey is not null ? ResolveConfig(ctx, o) : null);
+            // gRPC 地址常写成 host:port（Go / Python 的 Dial、insecure_channel），补上方案才能按 URI 解析
+            if (url is not null && o.Protocol == "grpc" && !url.Contains("://", StringComparison.Ordinal)) url = "http://" + (url.StartsWith("dns:///", StringComparison.Ordinal) ? url[7..] : url);
             var target = url is not null ? ContainerByUrl(containers, o.ContainerKey, url) : null;
             if (target is not null)
             {
@@ -87,14 +97,25 @@ public static class EdgeMatcher
             var hits = containers.Where(c => c.Key != selfKey && c.Ports.Contains(port)).ToList();
             return hits.Count == 1 ? hits[0] : null; // 两个容器声明同一端口时不猜
         }
-        // 服务发现名（Aspire / compose / k8s）：主机名去掉分隔符后与容器名或目录名相同（catalog-api ↔ Catalog.API）
+        // 服务发现名（Aspire / compose / k8s / Spring Cloud 的 lb://服务名 与 Eureka）：主机名去掉分隔符后与容器名或目录名相同（catalog-api ↔ Catalog.API）
         var host = Normalize(u.Host);
         var byName = containers.Where(c => c.Key != selfKey && (Normalize(c.Name) == host || Normalize(LastSegment(c.Key)) == host)).ToList();
+        // Java 容器名常是带项目前缀的 artifactId（spring-petclinic-config-server），compose / k8s 的主机名是去掉前缀的 config-server
+        if (byName.Count == 0 && u.Host.Length >= 4)
+            byName = containers.Where(c => c.Key != selfKey && c.SubKind == "java-service" && c.Name.EndsWith("-" + u.Host, StringComparison.OrdinalIgnoreCase)).ToList();
         return byName.Count == 1 ? byName[0] : null;
     }
 
     private static string Normalize(string s) => new(s.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
     private static string LastSegment(string key) { var i = key.LastIndexOf('/'); return i < 0 ? key : key[(i + 1)..]; }
+
+    /// <summary>边证据的说明：前端出口的 ClientName 存的是"方法 [经代理 前缀]"，拼成"GET /api/proxy-gateway/api/v5/x"；其余照旧取客户端名 / 配置键 / URL。</summary>
+    private static string? Note(Outbound o)
+    {
+        if (o.RuleId != "frontend-http") return o.ClientName ?? o.ConfigKey ?? o.Url;
+        var (method, _) = FrontendHttpRule.ParseCall(o.ClientName);
+        return method is null ? o.Url : $"{method} {o.Url}";
+    }
 
     /// <summary>外部系统名：配置节名（Billing:Url → Billing）> 客户端名 > URL 主机名。</summary>
     private static string ExternalName(Outbound o, string? url)

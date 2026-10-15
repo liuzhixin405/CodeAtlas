@@ -2,10 +2,11 @@ using System.Diagnostics;
 using CodeAtlas.Core.Architecture;
 using CodeAtlas.Core.Model;
 using CodeAtlas.Core.Storage;
+using CodeAtlas.Core.Workspace;
 
 namespace CodeAtlas.Server;
 
-/// <param name="EntriesByKind">入口数按 kind（http / hosted / job / hub / handler / page / api-route）。</param>
+/// <param name="EntriesByKind">入口数按 kind（http / hosted / command / job / hub / grpc / handler / page / api-route）。</param>
 /// <param name="Matches">出口路径对上另一容器入口的处数。</param>
 /// <param name="Rules">声明规则数（NetArchTest 还原 + architecture.yaml）。</param>
 /// <param name="RulesByKind">规则数按 kind（forbid-dependency / require-dependency / placement）。</param>
@@ -30,8 +31,12 @@ public sealed record PostProcessReport(IReadOnlyDictionary<string, int> EntriesB
 /// </summary>
 public static class ArchitecturePostProcess
 {
-    public static PostProcessReport Run(string repoRoot, IndexDatabase db)
+    public static PostProcessReport Run(string repoRoot, IndexDatabase db) => Run(ProjectRoots.Single(repoRoot), db);
+
+    /// <summary>多根：外部根的文件路径是 ../other/…，MakeReadLines 用 Path.Combine(主根, 相对路径) 照样读得到；清单要扫全部根。</summary>
+    public static PostProcessReport Run(ProjectRoots roots, IndexDatabase db)
     {
+        var repoRoot = roots.Main;
         var sw = Stopwatch.StartNew();
         var model = ArchStorage.Read(db);
         var (symbols, edges) = MapData.Load(new IndexReader(db));
@@ -45,7 +50,7 @@ public static class ArchitecturePostProcess
         ArchStorage.Replace(db, upgraded);
         EntryStorage.Replace(db, entries, matches);
 
-        var inventory = ProjectInventory.Load(repoRoot);
+        var inventory = ProjectInventory.Load(roots);
         var rules = ArchRuleScanner.Scan(inventory, new SymbolTypeResolver(symbols, inventory), readLines, ArchitectureDeclarations.Load(repoRoot));
         ArchRuleStorage.Replace(db, rules.Rules);
 
@@ -55,7 +60,7 @@ public static class ArchitecturePostProcess
         return new PostProcessReport(byKind, matches.Count, sw.Elapsed, rules.Rules.Count, rulesByKind, rules.SkippedPredicates);
     }
 
-    /// <summary>仓库相对路径 → 源码行；读不到（文件被删、编码错）返回空数组，规则按"没有特性"处理。</summary>
+    /// <summary>仓库相对路径 → 源码行；读不到（文件被删、编码错）返回空数组，规则按"没有特性"处理。外部根的 ../other/… 也是相对主根，直接拼接即可。</summary>
     public static Func<string, string[]> MakeReadLines(string repoRoot)
     {
         var cache = new Dictionary<string, string[]>(StringComparer.Ordinal);
@@ -121,15 +126,14 @@ public static class ArchitecturePostProcess
         /// <summary>限定名去掉泛型参数与最后一段：A.B.ICommand&lt;T&gt; → A.B；没有点 → ""。</summary>
         private static string NamespaceOfQualified(string qualified)
         {
-            var lt = qualified.IndexOf('<');
-            if (lt >= 0) qualified = qualified[..lt];
+            qualified = MapBuilder.StripGenericArgs(qualified);
             var dot = qualified.LastIndexOf('.');
             return dot < 0 ? "" : qualified[..dot];
         }
 
         private static class Rules
         {
-            public static bool Under(string rel, string dir) => dir.Length == 0 || rel == dir || rel.StartsWith(dir + "/", StringComparison.Ordinal);
+            public static bool Under(string rel, string dir) => Core.Architecture.Rules.RuleContext.Under(rel, dir);
         }
     }
 }

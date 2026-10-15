@@ -1,10 +1,31 @@
 {
-  "name": "codeatlas",
-  "displayName": "CodeAtlas",
+  "name": "codetrail-graph",
+  "displayName": "CodeTrail Graph",
   "description": "代码地图：点开一个符号，看它调了谁、被谁调。",
   "version": "0.1.0",
   "private": true,
   "license": "MIT",
+  "icon": "images/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/liuzhixin405/CodeAtlas.git",
+    "directory": "extension"
+  },
+  "homepage": "https://github.com/liuzhixin405/CodeAtlas#readme",
+  "bugs": {
+    "url": "https://github.com/liuzhixin405/CodeAtlas/issues"
+  },
+  "keywords": [
+    "call graph",
+    "code navigation",
+    "architecture",
+    "impact analysis",
+    "code map"
+  ],
+  "galleryBanner": {
+    "color": "#102438",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.100.0"
   },
@@ -32,7 +53,15 @@
   "publisher": "victor-liu",
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact",
+    "onLanguage:csharp",
+    "onLanguage:go",
+    "onLanguage:python",
+    "onLanguage:java"
   ],
   "categories": [
     "Visualization",
@@ -42,43 +71,241 @@
     "commands": [
       {
         "command": "codeatlas.showSymbol",
-        "title": "在 CodeAtlas 中查看",
-        "category": "CodeAtlas"
+        "title": "在 CodeTrail Graph 中查看",
+        "category": "CodeTrail Graph"
       },
       {
         "command": "codeatlas.openPanel",
         "title": "打开面板",
-        "category": "CodeAtlas"
+        "category": "CodeTrail Graph"
       },
       {
         "command": "codeatlas.indexWorkspace",
         "title": "索引工作区（增量）",
-        "category": "CodeAtlas"
+        "category": "CodeTrail Graph"
       },
       {
         "command": "codeatlas.indexWorkspaceFull",
         "title": "索引工作区（全量重建）",
-        "category": "CodeAtlas"
+        "category": "CodeTrail Graph"
       },
       {
         "command": "codeatlas.restartServer",
         "title": "重启服务",
-        "category": "CodeAtlas"
+        "category": "CodeTrail Graph"
       },
       {
         "command": "codeatlas.ai.selectService",
         "title": "选择 AI 服务",
-        "category": "CodeAtlas"
+        "category": "CodeTrail Graph"
       },
       {
         "command": "codeatlas.ai.setApiKey",
         "title": "设置 AI API Key",
-        "category": "CodeAtlas"
+        "category": "CodeTrail Graph"
       },
       {
         "command": "codeatlas.ai.clearApiKey",
         "title": "清除 AI API Key",
-        "category": "CodeAtlas"
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.outline.pin",
+        "title": "固定当前方法（不跟随光标）",
+        "category": "CodeTrail Graph",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "codeatlas.outline.unpin",
+        "title": "跟随光标",
+        "category": "CodeTrail Graph",
+        "icon": "$(pinned)"
+      },
+      {
+        "command": "codeatlas.outline.hideExternals",
+        "title": "隐藏框架调用",
+        "category": "CodeTrail Graph",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "codeatlas.outline.showExternals",
+        "title": "显示框架调用",
+        "category": "CodeTrail Graph",
+        "icon": "$(filter-filled)"
+      },
+      {
+        "command": "codeatlas.outline.openInPanel",
+        "title": "在 CodeTrail Graph 面板中打开",
+        "category": "CodeTrail Graph",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "codeatlas.outline.refresh",
+        "title": "刷新调用大纲",
+        "category": "CodeTrail Graph",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codeatlas.outline.goToDefinition",
+        "title": "转到定义",
+        "category": "CodeTrail Graph",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "codeatlas.outline.open",
+        "title": "跳到调用处",
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.impact.pin",
+        "title": "固定影响范围的当前方法（不跟随光标）",
+        "category": "CodeTrail Graph",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "codeatlas.impact.unpin",
+        "title": "影响范围跟随光标",
+        "category": "CodeTrail Graph",
+        "icon": "$(pinned)"
+      },
+      {
+        "command": "codeatlas.impact.includeTests",
+        "title": "包含测试调用方",
+        "category": "CodeTrail Graph",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "codeatlas.impact.excludeTests",
+        "title": "排除测试调用方",
+        "category": "CodeTrail Graph",
+        "icon": "$(beaker-stop)"
+      },
+      {
+        "command": "codeatlas.impact.openInPanel",
+        "title": "在 CodeTrail Graph 面板中打开",
+        "category": "CodeTrail Graph",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "codeatlas.impact.refresh",
+        "title": "刷新影响范围",
+        "category": "CodeTrail Graph",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codeatlas.impact.goToDefinition",
+        "title": "转到定义",
+        "category": "CodeTrail Graph",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "codeatlas.impact.open",
+        "title": "跳转",
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.impact.showFor",
+        "title": "在影响范围中查看",
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.gotoCallers",
+        "title": "转到调用方…",
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.gotoCallees",
+        "title": "转到被调方…",
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.gotoEntries",
+        "title": "转到受影响的入口…",
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.showRelations",
+        "title": "在 CodeTrail Graph 模块关系中查看",
+        "category": "CodeTrail Graph"
+      },
+      {
+        "command": "codeatlas.outline.openRelations",
+        "title": "在模块关系中查看",
+        "category": "CodeTrail Graph",
+        "icon": "$(type-hierarchy-sub)"
+      },
+      {
+        "command": "codeatlas.impact.openRelations",
+        "title": "在模块关系中查看",
+        "category": "CodeTrail Graph",
+        "icon": "$(type-hierarchy-sub)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codeatlas",
+          "title": "CodeTrail Graph",
+          "icon": "webview/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codeatlas": [
+        {
+          "id": "codeatlas.callOutline",
+          "name": "调用大纲",
+          "icon": "webview/icon.svg",
+          "contextualTitle": "CodeTrail Graph"
+        },
+        {
+          "id": "codeatlas.impact",
+          "name": "影响范围",
+          "icon": "webview/icon.svg",
+          "contextualTitle": "CodeTrail Graph"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "codeatlas.callOutline",
+        "contents": "这个工作区还没有 CodeTrail Graph 索引。\n[建立索引](command:codeatlas.indexWorkspace)",
+        "when": "codeatlas.outline.state == noIndex"
+      },
+      {
+        "view": "codeatlas.callOutline",
+        "contents": "把光标放进一个方法，这里显示它按顺序调了什么。",
+        "when": "!codeatlas.outline.state || codeatlas.outline.state == noMethod"
+      },
+      {
+        "view": "codeatlas.callOutline",
+        "contents": "CodeTrail Graph 服务没能启动，详见输出面板「CodeTrail Graph」。\n[重试](command:codeatlas.outline.refresh)",
+        "when": "codeatlas.outline.state == noServer"
+      },
+      {
+        "view": "codeatlas.callOutline",
+        "contents": "调用大纲请求失败，详见输出面板「CodeTrail Graph」。\n[重试](command:codeatlas.outline.refresh)",
+        "when": "codeatlas.outline.state == error"
+      },
+      {
+        "view": "codeatlas.impact",
+        "contents": "这个工作区还没有 CodeTrail Graph 索引。\n[建立索引](command:codeatlas.indexWorkspace)",
+        "when": "codeatlas.impact.state == noIndex"
+      },
+      {
+        "view": "codeatlas.impact",
+        "contents": "把光标放进一个方法，这里显示改它会影响谁：哪些方法调用了它、最终走到哪些入口。",
+        "when": "!codeatlas.impact.state || codeatlas.impact.state == noMethod"
+      },
+      {
+        "view": "codeatlas.impact",
+        "contents": "CodeTrail Graph 服务没能启动，详见输出面板「CodeTrail Graph」。\n[重试](command:codeatlas.impact.refresh)",
+        "when": "codeatlas.impact.state == noServer"
+      },
+      {
+        "view": "codeatlas.impact",
+        "contents": "影响范围请求失败，详见输出面板「CodeTrail Graph」。\n[重试](command:codeatlas.impact.refresh)",
+        "when": "codeatlas.impact.state == error"
       }
     ],
     "menus": {
@@ -87,12 +314,191 @@
           "command": "codeatlas.showSymbol",
           "group": "navigation@1",
           "when": "editorTextFocus"
+        },
+        {
+          "command": "codeatlas.showRelations",
+          "group": "navigation@2",
+          "when": "editorTextFocus"
         }
       ],
       "commandPalette": [
         {
           "command": "codeatlas.showSymbol",
           "when": "editorIsOpen"
+        },
+        {
+          "command": "codeatlas.outline.pin",
+          "when": "!codeatlas.outline.pinned"
+        },
+        {
+          "command": "codeatlas.outline.unpin",
+          "when": "codeatlas.outline.pinned"
+        },
+        {
+          "command": "codeatlas.outline.hideExternals",
+          "when": "codeatlas.outline.externals"
+        },
+        {
+          "command": "codeatlas.outline.showExternals",
+          "when": "!codeatlas.outline.externals"
+        },
+        {
+          "command": "codeatlas.outline.goToDefinition",
+          "when": "false"
+        },
+        {
+          "command": "codeatlas.outline.open",
+          "when": "false"
+        },
+        {
+          "command": "codeatlas.impact.pin",
+          "when": "!codeatlas.impact.pinned"
+        },
+        {
+          "command": "codeatlas.impact.unpin",
+          "when": "codeatlas.impact.pinned"
+        },
+        {
+          "command": "codeatlas.impact.includeTests",
+          "when": "!codeatlas.impact.tests"
+        },
+        {
+          "command": "codeatlas.impact.excludeTests",
+          "when": "codeatlas.impact.tests"
+        },
+        {
+          "command": "codeatlas.impact.openInPanel",
+          "when": "false"
+        },
+        {
+          "command": "codeatlas.impact.goToDefinition",
+          "when": "false"
+        },
+        {
+          "command": "codeatlas.impact.open",
+          "when": "false"
+        },
+        {
+          "command": "codeatlas.impact.showFor",
+          "when": "false"
+        },
+        {
+          "command": "codeatlas.gotoCallers",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "codeatlas.gotoCallees",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "codeatlas.gotoEntries",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "codeatlas.showRelations",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "codeatlas.outline.openRelations",
+          "when": "false"
+        },
+        {
+          "command": "codeatlas.impact.openRelations",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "codeatlas.outline.pin",
+          "when": "view == codeatlas.callOutline && !codeatlas.outline.pinned",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeatlas.outline.unpin",
+          "when": "view == codeatlas.callOutline && codeatlas.outline.pinned",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeatlas.outline.hideExternals",
+          "when": "view == codeatlas.callOutline && codeatlas.outline.externals",
+          "group": "navigation@2"
+        },
+        {
+          "command": "codeatlas.outline.showExternals",
+          "when": "view == codeatlas.callOutline && !codeatlas.outline.externals",
+          "group": "navigation@2"
+        },
+        {
+          "command": "codeatlas.outline.openInPanel",
+          "when": "view == codeatlas.callOutline",
+          "group": "navigation@3"
+        },
+        {
+          "command": "codeatlas.outline.refresh",
+          "when": "view == codeatlas.callOutline",
+          "group": "navigation@4"
+        },
+        {
+          "command": "codeatlas.impact.pin",
+          "when": "view == codeatlas.impact && !codeatlas.impact.pinned",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeatlas.impact.unpin",
+          "when": "view == codeatlas.impact && codeatlas.impact.pinned",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeatlas.impact.includeTests",
+          "when": "view == codeatlas.impact && !codeatlas.impact.tests",
+          "group": "navigation@2"
+        },
+        {
+          "command": "codeatlas.impact.excludeTests",
+          "when": "view == codeatlas.impact && codeatlas.impact.tests",
+          "group": "navigation@2"
+        },
+        {
+          "command": "codeatlas.impact.openInPanel",
+          "when": "view == codeatlas.impact",
+          "group": "navigation@3"
+        },
+        {
+          "command": "codeatlas.impact.refresh",
+          "when": "view == codeatlas.impact",
+          "group": "navigation@4"
+        },
+        {
+          "command": "codeatlas.outline.openRelations",
+          "when": "view == codeatlas.callOutline",
+          "group": "navigation@3"
+        },
+        {
+          "command": "codeatlas.impact.openRelations",
+          "when": "view == codeatlas.impact",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "codeatlas.outline.goToDefinition",
+          "when": "view == codeatlas.callOutline && viewItem =~ /target/",
+          "group": "inline"
+        },
+        {
+          "command": "codeatlas.outline.goToDefinition",
+          "when": "view == codeatlas.callOutline && viewItem =~ /target/",
+          "group": "navigation@1"
+        },
+        {
+          "command": "codeatlas.impact.goToDefinition",
+          "when": "view == codeatlas.impact && viewItem =~ /target/",
+          "group": "inline"
+        },
+        {
+          "command": "codeatlas.impact.goToDefinition",
+          "when": "view == codeatlas.impact && viewItem =~ /target/",
+          "group": "navigation@1"
         }
       ]
     },
@@ -102,10 +508,28 @@
         "key": "ctrl+alt+g",
         "mac": "cmd+alt+g",
         "when": "editorTextFocus"
+      },
+      {
+        "command": "codeatlas.gotoCallers",
+        "key": "ctrl+alt+h",
+        "mac": "ctrl+cmd+h",
+        "when": "editorTextFocus && resourceScheme == file && resourceExtname =~ /^\\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|cs|go|py|java)$/i"
+      },
+      {
+        "command": "codeatlas.gotoCallees",
+        "key": "ctrl+alt+j",
+        "mac": "ctrl+cmd+j",
+        "when": "editorTextFocus && resourceScheme == file && resourceExtname =~ /^\\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|cs|go|py|java)$/i"
+      },
+      {
+        "command": "codeatlas.gotoEntries",
+        "key": "ctrl+alt+r",
+        "mac": "ctrl+cmd+r",
+        "when": "editorTextFocus && resourceScheme == file && resourceExtname =~ /^\\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|cs|go|py|java)$/i"
       }
     ],
     "configuration": {
-      "title": "CodeAtlas",
+      "title": "CodeTrail Graph",
       "properties": {
         "codeatlas.serverPath": {
           "type": "string",
@@ -129,13 +553,13 @@
             "Anthropic Claude Messages API"
           ],
           "default": "openai",
-          "markdownDescription": "AI 服务的协议。推荐用命令 **CodeAtlas: 选择 AI 服务** 一次性设好协议、端点和模型。",
+          "markdownDescription": "AI 服务的协议。推荐用命令 **CodeTrail Graph: 选择 AI 服务** 一次性设好协议、端点和模型。",
           "order": 1
         },
         "codeatlas.ai.endpoint": {
           "type": "string",
           "default": "http://127.0.0.1:8080/v1",
-          "markdownDescription": "AI 服务的 API 基地址（到 `/v1` 为止），如本地 llama-server `http://127.0.0.1:8080/v1`、DeepSeek `https://api.deepseek.com/v1`。不是本机回环地址时叙述卡会醒目提示：事实子图（以及开启 `includeSource` 时的入口源码）会发到那里。API Key 用命令 **CodeAtlas: 设置 AI API Key** 保存在 SecretStorage，不写在这里。",
+          "markdownDescription": "AI 服务的 API 基地址（到 `/v1` 为止），如本地 llama-server `http://127.0.0.1:8080/v1`、DeepSeek `https://api.deepseek.com/v1`。不是本机回环地址时叙述卡会醒目提示：事实子图（以及开启 `includeSource` 时的入口源码）会发到那里。API Key 用命令 **CodeTrail Graph: 设置 AI API Key** 保存在 SecretStorage，不写在这里。",
           "order": 2
         },
         "codeatlas.ai.model": {
@@ -165,10 +589,28 @@
           "description": "生成入口流程叙述时把入口方法源码（≤80 行）一并发给模型。关掉后只发事实子图（名字、边、配置键、调用树）。",
           "order": 6
         },
+        "codeatlas.projects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "和当前工作区一起索引的其他项目目录（相对第一个工作区文件夹或绝对路径），例如前端仓库旁边的后端 `../shop-api`。多根工作区里第一个文件夹之外的文件夹会自动加进来，不用写在这里。外部目录的文件以 `../shop-api/…` 的相对路径入库，前端调用能连到后端控制器。也可写在仓库的 `.codeatlas/config.json`：`{\"projects\": [\"../other-repo\"]}`。改动后服务自动重启并增量索引。"
+        },
+        "codeatlas.includeNestedRepos": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "索引工作区里带自己 `.git` 目录的子仓库（独立克隆）与子模块。关掉后它们整个跳过（服务以 `--no-nested` 启动）。git worktree（`.git` 是指向 `…/worktrees/…` 的文件，如 `.claude/worktrees/*`）无论如何都跳过，避免重复。改动后服务自动重启并增量索引。"
+        },
         "codeatlas.indexOnSave": {
           "type": "boolean",
           "default": true,
           "description": "保存支持的源文件后自动增量索引。"
+        },
+        "codeatlas.codeLens.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "在每个方法 / 函数 / 构造函数上方显示 CodeLens：`入口 · 被 N 处调用 · 测试 K · 调用 M 个 · 影响范围`，点开列出调用方 / 被调方并跳转。只对本会话用过 CodeTrail Graph、或仓库已有 `.codeatlas/index.db` 的文件夹显示，不会因此新建索引。"
         }
       }
     }

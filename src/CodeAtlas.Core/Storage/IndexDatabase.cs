@@ -42,8 +42,13 @@ public sealed class IndexDatabase : IDisposable
     /// 5：git 行为统计表 git_file_stats / git_coupling / git_meta（DSM 叠加）。
     /// 6：入口与路由匹配表 entry_points / route_matches（入口流程）。
     /// 7：声明规则表 arch_rules（NetArchTest 还原）。（AI 叙述缓存后来挪到单独的 narratives.db，旧库里残留的空 narratives 表无害。）
+    /// 8：TS / TSX / JS 解析规则变了：JSX 渲染边（calls + via=render）、按 import 绑定解析调用、Next.js 页面入口指向默认导出组件；
+    ///    嵌套仓库纳入索引、Roslyn 一个仓库一个解决方案。旧库没有这些边，增量索引只重解析改过的文件补不齐，必须全量重建。
+    /// 9：加入 Java；TS/JS 认 CommonJS require / exports、memo / forwardRef、onX 事件边、this.字段 按类型；Go / Python 按字段、链式、局部变量类型解析，
+    ///    外部调用带包名；C# 的 tree-sitter 解析修正；Roslyn 绑不上的行保留 ≥0.7 的启发式调用边。已有语言的边都变了，必须全量重建。
+    /// 10：edges.pos / edges.ctx——调用名的字符偏移与所在控制结构（循环 / 条件 / try / catch / 回调），调用大纲按偏移排序并在行尾标注。旧边没有这两列的值，必须全量重建。
     /// </summary>
-    public const long CurrentIndexVersion = 7;
+    public const long CurrentIndexVersion = 10;
 
     /// <summary>库是旧版本建的，内容与当前解析规则不一致。</summary>
     public bool NeedsRebuild { get; private set; }
@@ -64,6 +69,9 @@ public sealed class IndexDatabase : IDisposable
     {
         var fileColumns = Query<string>("SELECT name FROM pragma_table_info('files')");
         if (!fileColumns.Contains("roslyn_at")) Execute("ALTER TABLE files ADD COLUMN roslyn_at TEXT");
+        var edgeColumns = Query<string>("SELECT name FROM pragma_table_info('edges')");
+        if (!edgeColumns.Contains("pos")) Execute("ALTER TABLE edges ADD COLUMN pos INTEGER");
+        if (!edgeColumns.Contains("ctx")) Execute("ALTER TABLE edges ADD COLUMN ctx TEXT");
     }
 
     /// <summary>全量重建完成后调用，把库标记为当前版本。</summary>

@@ -83,13 +83,17 @@ button:disabled { opacity: .5; cursor: default; }
 .dsm-empty { color: var(--ca-muted); }
 
 /* ---- 入口流程（L3）---- */
-#flow-view { display: grid; grid-template-columns: 300px minmax(0, 1fr); }
-.flow-list { border-right: 1px solid var(--ca-border); display: flex; flex-direction: column; min-height: 0; }
+/* 左栏宽度可拖动（--flow-list-width 由 flowView 设置） */
+#flow-view { display: grid; grid-template-columns: var(--flow-list-width, 300px) minmax(0, 1fr); }
+.flow-list { border-right: 1px solid var(--ca-border); display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative; }
+.flow-resizer { position: absolute; top: 0; right: -3px; width: 6px; height: 100%; cursor: col-resize; z-index: 2; }
+.flow-resizer:hover, .flow-resizer.dragging { background: var(--ca-accent); opacity: .5; }
 .flow-search { margin: 8px; padding: 4px 8px; border: 1px solid var(--ca-border); background: var(--ca-input-bg); color: var(--ca-input-fg); border-radius: 3px; outline: none; font: inherit; }
 .flow-search:focus { border-color: var(--ca-accent); }
 .flow-entries { overflow: auto; min-height: 0; padding: 0 4px 8px; }
 .flow-group { color: var(--ca-muted); font-size: 11px; padding: 8px 6px 2px; text-transform: uppercase; }
-.flow-entry { display: flex; gap: 6px; align-items: baseline; padding: 3px 6px; border-radius: 3px; cursor: pointer; white-space: nowrap; overflow: hidden; }
+/* 长名字不截断：行宽取内容宽度（至少占满一列），名字太长时整列横向滚动 */
+.flow-entry { display: flex; gap: 6px; align-items: baseline; padding: 3px 6px; border-radius: 3px; cursor: pointer; white-space: nowrap; width: max-content; min-width: 100%; box-sizing: border-box; }
 .flow-entry:hover { background: var(--ca-hover); }
 .flow-entry.active { background: var(--ca-button-bg); color: var(--ca-button-fg); }
 .flow-entry .method { font-size: 10px; font-weight: 600; min-width: 34px; color: var(--ca-muted); }
@@ -98,8 +102,8 @@ button:disabled { opacity: .5; cursor: default; }
 .flow-entry .method.put, .flow-entry .method.patch { color: #d18616; }
 .flow-entry .method.delete { color: #e5484d; }
 .flow-entry.active .method { color: inherit; }
-.flow-entry .route { font-family: var(--ca-mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.flow-entry .name { color: var(--ca-muted); font-size: 11px; margin-left: auto; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+.flow-entry .route { font-family: var(--ca-mono); font-size: 12px; }
+.flow-entry .name { color: var(--ca-muted); font-size: 11px; margin-left: auto; padding-left: 12px; }
 .flow-entry.active .name { color: inherit; opacity: .8; }
 .flow-empty { color: var(--ca-muted); padding: 12px; margin: 0; }
 
@@ -149,6 +153,14 @@ button:disabled { opacity: .5; cursor: default; }
 .flow-line { display: block; height: 0; border-top: 1.5px solid var(--c); position: relative; margin-bottom: 7px; }
 .flow-arrow.kind-dispatch .flow-line { border-top-style: dashed; }
 .flow-arrow.kind-external-group .flow-line { border-top-style: dotted; }
+/* 没对上后端的接口调用（kind=http）：灰蓝虚线指向外部列，标签前「接口」小标记；不可展开、不跳调用图 */
+.flow-arrow.kind-http { --c: #5b7a99; }
+.flow-arrow.kind-http.weak { opacity: .85; }
+.flow-arrow.kind-http .flow-line { border-top-style: dashed; }
+.flow-arrow.kind-http .flow-loop { border-style: dashed; border-left: none; }
+/* 接口调用的箭头常常一路拉到最右边的外部列：标签贴在调用方这一端，不然会被挤到最右边截断 */
+.flow-arrow.kind-http.right .flow-label { align-self: flex-start; text-align: left; }
+.flow-label .api-tag { font-size: 9px; font-family: var(--ca-font, inherit); border: 1px dashed currentColor; border-radius: 3px; padding: 0 3px; flex: none; opacity: .9; }
 .flow-line::after { content: ""; position: absolute; top: -5px; border: 4.5px solid transparent; }
 .flow-arrow.right .flow-line::after { right: -1px; border-left: 7px solid var(--c); border-right: 0; }
 .flow-arrow.left .flow-line::after { left: -1px; border-right: 7px solid var(--c); border-left: 0; }
@@ -264,3 +276,23 @@ footer a { color: var(--ca-accent); cursor: pointer; text-decoration: none; }
 .nc-stale { display: flex; gap: 8px; align-items: center; padding: 4px 6px 4px 8px; border-radius: 3px; border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(209, 134, 22, .5)); border-left-width: 3px; background: var(--vscode-inputValidation-warningBackground, rgba(209, 134, 22, .12)); color: var(--vscode-editorWarning-foreground, #d18616); font-size: 11px; }
 .nc-stale .nc-stale-text { flex: 1; min-width: 0; line-height: 1.45; }
 .nc-stale .nc-stale-btn { flex: none; padding: 0 8px; font-size: 11px; }
+/* 时序图：JSX 渲染边（页面 → 组件）用绿色细线 + "渲染"标签，和函数调用区分开 */
+.flow-arrow.via-render { --c: #22a06b; }
+.flow-arrow.via-render .flow-line { border-top-width: 1px; }
+.flow-arrow.via-render .flow-label .via { font-size: 9px; opacity: .85; }
+/* ---- 模块关系：以一个类为中心，组件分框、依赖序从左到右 ---- */
+#rel { position: relative; min-height: 0; }
+#rel-cy { position: absolute; inset: 0; }
+#rel-hint { position: absolute; left: 12px; top: 10px; color: var(--ca-muted); pointer-events: none; }
+#rel-opts { display: inline-flex; align-items: center; gap: 8px; flex: none; }
+.seg { display: inline-flex; align-items: center; border: 1px solid var(--ca-border); border-radius: 3px; overflow: hidden; font-size: 12px; }
+.seg .seg-label { padding: 0 6px; color: var(--ca-muted); }
+.seg .tab { background: transparent; color: var(--ca-muted); border: none; border-left: 1px solid var(--ca-border); border-radius: 0; padding: 2px 9px; font-size: 12px; }
+.seg .tab.active { background: var(--ca-button-bg); color: var(--ca-button-fg); }
+#rel-trunc { color: var(--vscode-editorWarning-foreground, #d18616); font-size: 12px; white-space: nowrap; }
+/* 详情条在模块关系模式下可以换行：边的示例最多 5 条，每条可点开文件 */
+#app[data-mode="relations"] footer { flex-wrap: wrap; white-space: normal; row-gap: 4px; max-height: 32vh; overflow: auto; }
+#app[data-mode="relations"] footer > * { white-space: nowrap; }
+#app[data-mode="relations"] footer > .rel-samples { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px 14px; white-space: normal; overflow: visible; }
+.rel-sample { display: inline-flex; gap: 6px; align-items: baseline; min-width: 0; }
+.rel-sample a { font-family: var(--ca-mono); }

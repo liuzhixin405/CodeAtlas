@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, chmodSync, constants, readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { Readable } from "node:stream";
 
@@ -48,6 +48,39 @@ export function waitForPortLine(stream: Readable, timeoutMs: number): Promise<nu
   });
 }
 
+/** VS Code 平台名（vsce --target）：win32-x64、linux-arm64、darwin-arm64 … */
+export function currentTarget(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
+  return `${platform}-${arch}`;
+}
+
+const TargetLabels: Record<string, string> = {
+  "win32-x64": "Windows x64",
+  "win32-arm64": "Windows ARM64",
+  "linux-x64": "Linux x64",
+  "linux-arm64": "Linux ARM64",
+  "darwin-x64": "macOS（Intel 芯片）",
+  "darwin-arm64": "macOS（Apple 芯片）",
+};
+
+const targetLabel = (t: string) => (TargetLabels[t] ? `${TargetLabels[t]}（${t}）` : t);
+
+/**
+ * 自带服务是给哪个平台打的（打包时写进 server/target.json）。和当前系统不一致时返回给用户看的提示，一致或没有 target.json（开发环境）返回 null。
+ * 本地 VSIX 安装不拦平台不匹配的包，不检查的话用户只会看到"找不到路径"。
+ */
+export function packageTargetMismatch(bundledDir: string, version: string, platform: NodeJS.Platform = process.platform, arch: string = process.arch): string | null {
+  let target: unknown;
+  try {
+    target = (JSON.parse(readFileSync(path.join(bundledDir, "target.json"), "utf8")) as { target?: unknown }).target;
+  } catch {
+    return null;
+  }
+  const current = currentTarget(platform, arch);
+  if (typeof target !== "string" || target === current) return null;
+  return `CodeTrail Graph：这个安装包是给 ${targetLabel(target)} 的，当前系统是 ${targetLabel(current)}，服务无法启动。`
+    + `请完全退出 VS Code 后安装 codetrail-graph-${current}-${version}.vsix。`;
+}
+
 /** 查找顺序：扩展自带的 server/ 目录 → 用户设置 → PATH。返回 null 表示都没有。 */
 export function findServerExecutable(bundledDir: string | null, configured: string | null, envPath: string | undefined): string | null {
   const exe = process.platform === "win32" ? "codeatlas.exe" : "codeatlas";
@@ -59,6 +92,25 @@ export function findServerExecutable(bundledDir: string | null, configured: stri
     try { accessSync(c, constants.F_OK); return c; } catch { /* 下一个 */ }
   }
   return null;
+}
+
+/**
+ * Linux / macOS：VSIX 解压后不一定保留可执行位（在 Windows 上打的包里没有 Unix 权限），启动前补上 u+x、g+x、o+x。
+ * 返回是否改过；Windows 上什么都不做。
+ */
+export function ensureExecutable(file: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (platform === "win32") return false;
+  try {
+    accessSync(file, constants.X_OK);
+    return false;
+  } catch {
+    try {
+      chmodSync(file, statSync(file).mode | 0o111);
+      return true;
+    } catch {
+      return false; // 改不了就照常启动，spawn 的报错会进输出面板
+    }
+  }
 }
 
 export interface ServerLogger {
@@ -123,6 +175,51 @@ export function aiArgs(ai: AiOptions | null): string[] {
   return args;
 }
 
+/**
+ * 多项目设置：主根之外一起索引的目录（多根工作区的其余 folder + codeatlas.projects），以及是否纳入嵌套仓库。
+ * projects 已是绝对路径（resolveProjects 算好）。
+ */
+export interface ProjectOptions {
+  projects: string[];
+  /** false 时加 --no-nested：带独立 .git 的子目录（克隆 / 子模块）不索引。 */
+  includeNested: boolean;
+}
+
+/**
+ * 算外部项目根：多根工作区里第一个 folder 是主根，其余 folder 依次在前；再接 codeatlas.projects（相对主根或绝对路径）。
+ * 去掉空项、主根本身与重复项（Windows 上不分大小写、不分 / 与 \、忽略结尾分隔符）。
+ */
+export function resolveProjects(primary: string, otherFolders: readonly string[], configured: readonly string[], platform: NodeJS.Platform = process.platform): string[] {
+  const p = platform === "win32" ? path.win32 : path.posix;
+  // 去掉结尾分隔符，但盘符根 D:\ 与 / 保留
+  const trim = (s: string) => (s.length > p.parse(s).root.length ? s.replace(/[\\/]+$/, "") : s);
+  const fold = platform === "win32" || platform === "darwin";
+  const key = (s: string) => (fold ? trim(p.normalize(s)).toLowerCase() : trim(p.normalize(s)));
+  const seen = new Set<string>([key(primary)]);
+  const out: string[] = [];
+  const add = (raw: string) => {
+    const t = raw.trim();
+    if (!t) return;
+    const abs = trim(p.isAbsolute(t) ? p.normalize(t) : p.resolve(primary, t));
+    const k = key(abs);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(abs);
+  };
+  for (const f of otherFolders) add(f);
+  for (const c of configured) add(c);
+  return out;
+}
+
+/** 多项目设置 → serve 参数：每个外部根一对 `--project <路径>`，关掉嵌套仓库时再加 `--no-nested`；null 表示不传。 */
+export function projectArgs(projects: ProjectOptions | null): string[] {
+  if (!projects) return [];
+  const args: string[] = [];
+  for (const p of projects.projects) args.push("--project", p);
+  if (!projects.includeNested) args.push("--no-nested");
+  return args;
+}
+
 /** 把日志行里出现的密钥换成 ***（防御：比如用户把 key 误填进了 model 设置）。 */
 export function redactSecrets(line: string, secrets: readonly (string | undefined)[]): string {
   let out = line;
@@ -152,8 +249,9 @@ export function buildServeLaunch(
   ai: AiOptions | null,
   apiKey: string | undefined,
   baseEnv: NodeJS.ProcessEnv,
+  projects: ProjectOptions | null = null,
 ): ServeLaunch {
-  const extra = aiArgs(ai);
+  const extra = [...projectArgs(projects), ...aiArgs(ai)];
   const args = ["serve", repoRoot, "--port", "0", "--parent-pid", String(parentPid), "--token", token, ...extra];
   const key = ai?.enabled && apiKey && apiKey.trim() ? apiKey.trim() : undefined;
   const env: NodeJS.ProcessEnv = key ? { ...baseEnv, [ApiKeyEnvVar]: key } : { ...baseEnv };
@@ -182,6 +280,7 @@ export class ServerProcess implements ProcessLike {
     private readonly log: ServerLogger,
     private readonly ai: AiOptions | null = null,
     private readonly getApiKey: () => Promise<string | undefined> = () => Promise.resolve(undefined),
+    private readonly projects: ProjectOptions | null = null,
   ) {}
 
   get alive(): boolean {
@@ -194,10 +293,11 @@ export class ServerProcess implements ProcessLike {
     if (this.ai?.enabled) {
       try { apiKey = await this.getApiKey(); } catch (e) { this.log.error(`读取 AI API Key 失败，按未设置处理：${e instanceof Error ? e.message : String(e)}`); }
     }
-    const launch = buildServeLaunch(this.exe, this.repoRoot, this.token, process.pid, this.ai, apiKey, process.env);
+    const launch = buildServeLaunch(this.exe, this.repoRoot, this.token, process.pid, this.ai, apiKey, process.env, this.projects);
     const secrets = [this.token, apiKey?.trim(), launch.env[ApiKeyEnvVar]];
     const scrub = (s: string) => redactSecrets(s, secrets);
     this.log.info(launch.logLine);
+    if (ensureExecutable(this.exe)) this.log.info(`已给 ${this.exe} 加上可执行权限`);
     const child = spawn(this.exe, launch.args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: launch.env });
     this.child = child;
     child.stderr?.on("data", (d: Buffer) => this.log.error(scrub(d.toString().trimEnd())));
@@ -271,7 +371,7 @@ export class ServerManager {
   /** 请求失败后的自动恢复：每个仓库只允许一次。 */
   recover(repoRoot: string): Promise<string> {
     const used = this.restartBudget.get(repoRoot) ?? 0;
-    if (used >= 1) return Promise.reject(new Error("CodeAtlas 服务已重启过一次仍不可用，请用命令「CodeAtlas: 重启服务」手动重启"));
+    if (used >= 1) return Promise.reject(new Error("CodeTrail Graph 服务已重启过一次仍不可用，请用命令「CodeTrail Graph: 重启服务」手动重启"));
     this.restartBudget.set(repoRoot, used + 1);
     this.servers.get(repoRoot)?.stop();
     this.servers.delete(repoRoot);
@@ -284,6 +384,14 @@ export class ServerManager {
     this.servers.get(repoRoot)?.stop();
     this.servers.delete(repoRoot);
     return this.ensure(repoRoot);
+  }
+
+  /** 停掉一个仓库的服务（多根工作区换了主根时用）；下次 ensure 会重新拉起。 */
+  stop(repoRoot: string): void {
+    this.servers.get(repoRoot)?.stop();
+    this.servers.delete(repoRoot);
+    this.starting.delete(repoRoot);
+    this.restartBudget.delete(repoRoot);
   }
 
   stopAll(): void {

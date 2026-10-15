@@ -3,7 +3,7 @@ using CodeAtlas.Core.Model;
 
 namespace CodeAtlas.Server.Tests;
 
-public class EntryDiscoveryTests
+public partial class EntryDiscoveryTests
 {
     private static MapSymbol Sym(long id, SymbolKind kind, string qname, string path, long? parent, int start, int end, string? vis = null) => new(id, kind, qname, path, parent, start, end, vis);
 
@@ -201,8 +201,10 @@ public class EntryDiscoveryTests
             ("/api/orders", "POST", 7, 9L),            // "/" 不留尾斜杠；CreateOrder 不在本文件
             ("/admin/jobs/{id}", "DELETE", 8, 9L),     // 同一行链式 MapGroup
         }, minimal.Select(e => (e.Route!, e.HttpMethod!, e.Line, e.SymbolId)));
-        var hosted = entries.Where(e => e.Kind == "hosted").ToList();
+        // 只看 BackgroundService：csharp.main 规则另给两个容器各加了一个 hosted 入口（Acme.Api/Program.cs 与 Acme.Worker/Startup.cs 的顶级语句，符号 9 / 60）
+        var hosted = entries.Where(e => e.RuleId == "hosted.background").ToList();
         Assert.Equal(new[] { "Acme.Api", "Acme.Worker" }, hosted.Select(e => e.ContainerKey)); // Infra 同时进两个容器
+        Assert.Equal(new[] { ("Acme.Api", 9L), ("Acme.Worker", 60L) }, entries.Where(e => e.RuleId == "csharp.main").Select(e => (e.ContainerKey, e.SymbolId)));
         Assert.All(hosted, e => Assert.Equal((21L, "Reaper"), (e.SymbolId, e.Route)));
         Assert.Equal(23, entries.First(e => e.Kind == "job").SymbolId);
         Assert.Equal("LiveHub.Ping", entries.First(e => e.Kind == "hub").Route);
@@ -264,6 +266,35 @@ public class EntryDiscoveryTests
         Assert.Contains(entries, e => e.Kind == "page" && e.Route == "/login/{id}" && e.SymbolId == 41); // (auth) 分组段去掉
         Assert.Contains(entries, e => e.Kind == "api-route" && e.Route == "/api/chat" && e.SymbolId == 42);
         Assert.DoesNotContain(entries, e => e.SymbolId == 43);
+    }
+
+    [Fact]
+    public void Frontend_Entries_PointAtDefaultExport_OrHttpVerbHandlers_FallingBackToModule()
+    {
+        List<MapSymbol> symbols =
+        [
+            Sym(40, SymbolKind.Module, "web/src/app/(main)/groups/page.tsx", "web/src/app/(main)/groups/page.tsx", null, 1, 30),
+            Sym(41, SymbolKind.Function, "web/src/app/(main)/groups/page.tsx:metadataHelper", "web/src/app/(main)/groups/page.tsx", 40, 3, 5, "export"),
+            Sym(42, SymbolKind.Function, "web/src/app/(main)/groups/page.tsx:GroupsPage", "web/src/app/(main)/groups/page.tsx", 40, 15, 29, "export default"),
+            Sym(50, SymbolKind.Module, "web/src/app/api/chat/route.ts", "web/src/app/api/chat/route.ts", null, 1, 30),
+            Sym(51, SymbolKind.Function, "web/src/app/api/chat/route.ts:GET", "web/src/app/api/chat/route.ts", 50, 4, 8, "export"),
+            Sym(52, SymbolKind.Function, "web/src/app/api/chat/route.ts:POST", "web/src/app/api/chat/route.ts", 50, 10, 20, "export"),
+            Sym(53, SymbolKind.Function, "web/src/app/api/chat/route.ts:helper", "web/src/app/api/chat/route.ts", 50, 22, 24),
+            Sym(60, SymbolKind.Module, "web/src/pages/legacy.tsx", "web/src/pages/legacy.tsx", null, 1, 9),
+            Sym(61, SymbolKind.Class, "web/src/pages/legacy.tsx:default", "web/src/pages/legacy.tsx", 60, 2, 8, "export default"), // export default class {}
+            Sym(70, SymbolKind.Module, "web/src/app/empty/page.tsx", "web/src/app/empty/page.tsx", null, 1, 3), // 没有可识别的默认导出
+        ];
+        var entries = EntryDiscovery.Discover(symbols, [], Containers, Read).Where(e => e.ContainerKey == "web")
+            .Select(e => (e.Kind, e.Route!, e.HttpMethod, e.SymbolId, e.Line)).ToList();
+
+        Assert.Equal(new (string, string, string?, long, int)[]
+        {
+            ("api-route", "/api/chat", "GET", 51, 4),
+            ("api-route", "/api/chat", "POST", 52, 10),
+            ("page", "/empty", null, 70, 1),
+            ("page", "/groups", null, 42, 15),
+            ("page", "/legacy", null, 61, 2),
+        }, entries.OrderBy(e => e.Kind, StringComparer.Ordinal).ThenBy(e => e.Item2, StringComparer.Ordinal).ThenBy(e => e.HttpMethod, StringComparer.Ordinal));
     }
 
     [Theory]

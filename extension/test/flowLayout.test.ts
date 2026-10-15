@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DefaultCollapseDepth, isExpanded, layoutFlow, toggle } from "../webview/flowLayout";
+import { DefaultCollapseDepth, isExpanded, layoutFlow, toggle, viaStyle } from "../webview/flowLayout";
 import type { FlowDto, FlowNodeDto } from "../webview/types";
 
 function node(partial: Partial<FlowNodeDto> & { label: string; kind: FlowNodeDto["kind"]; actor: string; depth: number }): FlowNodeDto {
@@ -125,5 +125,67 @@ describe("flow layout", () => {
     const odd: FlowDto = { ...dto, root: node({ label: "x", kind: "entry", actor: "api", depth: 0, children: [node({ label: "y", kind: "call", actor: "nope", depth: 1 })] }) };
     const l = layoutFlow(odd, new Set());
     expect([l.rows[1]!.fromCol, l.rows[1]!.toCol, l.rows[1]!.direction]).toEqual([0, 0, "self"]);
+  });
+});
+
+describe("unmatched http calls (kind http)", () => {
+  it("draws from the caller column to the external API column, as a leaf without children", () => {
+    const ui: FlowDto = {
+      ...dto,
+      actors: [
+        { key: "ccs-ui", label: "ccs-ui", kind: "container" },
+        { key: "hooks", label: "hooks", kind: "project" },
+        { key: "external:http-service:api-api-v5", label: "API /api/v5", kind: "external" },
+      ],
+      root: node({
+        label: "GroupsPage", kind: "entry", actor: "ccs-ui", depth: 0,
+        children: [
+          node({
+            label: "useMT5Groups", kind: "call", actor: "hooks", depth: 1,
+            children: [
+              node({
+                label: "GET /api/v5/mt5/groups", qualifiedName: "/api/v5/mt5/groups?serverId=${id}", kind: "http", symbolId: null,
+                actor: "external:http-service:api-api-v5", depth: 2, confidence: 0.5, count: 2,
+                note: "未对上后端（后端不在索引里，或路由没匹配上）",
+                // 万一服务端带了孩子也不展开
+                children: [node({ label: "ghost", kind: "call", actor: "hooks", depth: 3 })],
+              }),
+            ],
+          }),
+        ],
+      }),
+    };
+    const rows = layoutFlow(ui, toggle(new Set(), "0.0.0")).rows;
+    expect(rows.map((r) => r.id)).toEqual(["0", "0.0", "0.0.0"]);
+    const http = rows[2]!;
+    expect([http.fromCol, http.toCol, http.direction]).toEqual([1, 2, "right"]);
+    expect(http.hasChildren).toBe(false);
+    expect(http.collapsed).toBe(false);
+    expect(http.label).toBe("GET /api/v5/mt5/groups ×2");
+    expect(http.via).toBeNull();
+    // 外部列合并的版式下仍落在外部列
+    const grouped = layoutFlow(ui, new Set(), "grouped-external");
+    expect(grouped.rows[2]!.toCol).toBe(grouped.columns.length - 1);
+  });
+});
+
+describe("via styles", () => {
+  it("marks JSX render edges with their own class and a 渲染 tag; other edges get nothing", () => {
+    const page: FlowDto = {
+      ...dto,
+      root: node({
+        label: "GroupsPage", kind: "entry", actor: "api", depth: 0,
+        children: [
+          node({ label: "MT5GroupTable", kind: "call", actor: "app", depth: 1, via: "render", confidence: 0.95 }),
+          node({ label: "useMT5GroupByServerId", kind: "call", actor: "app", depth: 1, confidence: 0.95 }),
+          node({ label: "Repo.List", kind: "call", actor: "infra", depth: 1, via: "impl" }),
+        ],
+      }),
+    };
+    const rows = layoutFlow(page, new Set()).rows;
+    expect(rows.map((r) => r.via)).toEqual([null, { cls: "via-render", tag: "渲染" }, null, null]);
+    expect(viaStyle(node({ label: "x", kind: "call", actor: "api", depth: 1, via: "render" }))).toEqual({ cls: "via-render", tag: "渲染" });
+    // 只认 call：hop 的 via 是协议（http），照旧由 note/via 标签显示
+    expect(viaStyle(node({ label: "x", kind: "hop", actor: "api", depth: 1, via: "render" }))).toBeNull();
   });
 });

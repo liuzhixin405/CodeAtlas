@@ -1,12 +1,14 @@
-# CodeAtlas for VS Code 安装与使用指南
+# CodeTrail Graph for VS Code 安装与使用指南
 
 适用版本：扩展 0.1.0（里程碑 2，tree-sitter 解析）。本文只讲 VS Code 扩展；命令行用法见仓库根目录的 [README](../README.md)。
+
+市场品牌为 **CodeTrail Graph**，基于 CodeAtlas 后端；内部命令 / 设置 `codeatlas.*`、索引目录 `.codeatlas` 和后端程序名保持不变。构建并发布到 VS Code Marketplace 见 [发布指南](vscode-extension-publishing.md)。
 
 ---
 
 ## 1. 它是什么
 
-CodeAtlas 是一个本地代码阅读器。核心动作只有一个：把光标放在一个方法或类上，打开一张图，看它**调了谁、被谁调、实现了什么**，再沿着调用链一路向下走到底，或一路向上追到入口。它要解决的问题是：代码（尤其是 AI 写的代码）产出速度已经超过人读懂的速度，需要一个工具帮人重新建立对代码的心智模型。
+CodeTrail Graph 是一个本地代码阅读器。核心动作只有一个：把光标放在一个方法或类上，打开一张图，看它**调了谁、被谁调、实现了什么**，再沿着调用链一路向下走到底，或一路向上追到入口。它要解决的问题是：代码（尤其是 AI 写的代码）产出速度已经超过人读懂的速度，需要一个工具帮人重新建立对代码的心智模型。
 
 它不是：
 
@@ -15,7 +17,7 @@ CodeAtlas 是一个本地代码阅读器。核心动作只有一个：把光标�
 - 不含 AI 解释、不含 MCP（后续里程碑）。
 - 所有数据都在本机：服务进程只监听 127.0.0.1，索引库写在仓库目录里，不联网。
 
-支持的语言：TypeScript / TSX / JavaScript / C#。
+支持的语言：TypeScript / TSX / JavaScript / C# / Go / Python。框架层认得：ASP.NET Core、Next.js / React、Go 的 net/http · gorilla/mux · gin · echo · chi、Python 的 FastAPI · Flask · Django / DRF · Celery，以及跨语言的 gRPC（按服务名把客户端和服务端连起来）。
 
 ---
 
@@ -23,17 +25,10 @@ CodeAtlas 是一个本地代码阅读器。核心动作只有一个：把光标�
 
 | 项目 | 要求 | 怎么检查 |
 |---|---|---|
-| 操作系统 | Windows x64 | — |
+| 操作系统 | Windows x64、Linux x64 / arm64（glibc，如 Ubuntu 20.04+）、macOS x64 / arm64，每个平台一个 VSIX | — |
 | VS Code | 1.100 或更高 | 帮助 → 关于 |
-| .NET 运行时 | .NET 10（服务是 framework-dependent 发布的，不自带运行时） | 见下面命令 |
-
-检查 .NET 运行时：
-
-```bash
-dotnet --list-runtimes
-```
-
-输出里要有一行 `Microsoft.NETCore.App 10.x.x`。没有的话先安装 .NET 10 运行时。
+| .NET | **不需要**。服务自带 .NET 运行时，只看前端 / Go / Python / Java 什么都不用装 | — |
+| .NET 10 SDK（可选） | 只有 C# 项目想要 Roslyn 精确语义时才需要；没有时 C# 用 tree-sitter 解析（与 Roslyn 结果一致率 95–99%），首次索引时提示一次 | `dotnet --list-sdks` |
 
 ---
 
@@ -41,7 +36,7 @@ dotnet --list-runtimes
 
 ### 3.1 安装 VSIX
 
-拿到 `codeatlas-0.1.0.vsix` 后，在终端执行：
+按系统选包：`codetrail-graph-win32-x64-0.1.0.vsix`、`codetrail-graph-linux-x64-0.1.0.vsix`、`codetrail-graph-linux-arm64-0.1.0.vsix`、`codetrail-graph-darwin-arm64-0.1.0.vsix`（Apple 芯片）、`codetrail-graph-darwin-x64-0.1.0.vsix`（Intel Mac）。装错平台的包，服务起不来。在终端执行：
 
 ```bash
 code --install-extension <vsix 路径> --force
@@ -51,11 +46,13 @@ code --install-extension <vsix 路径> --force
 
 ### 3.2 更新
 
-更新到新版本时，必须先完全退出 VS Code 再执行上面的安装命令。扩展里带着服务进程 `server/codeatlas.exe`，VS Code 没退干净时文件被占用，安装会报 `EPERM` 重命名失败。
+更新到新版本时，必须先完全退出 VS Code 再执行上面的安装命令。扩展里带着服务进程 `server/codeatlas(.exe)`，VS Code 没退干净时文件被占用，安装会报 `EPERM` 重命名失败。
 
 ### 3.3 从源码构建 VSIX
 
 在仓库根目录：
+
+只打 Windows 包：
 
 ```bash
 powershell -ExecutionPolicy Bypass -File scripts/publish.ps1
@@ -64,31 +61,45 @@ npm install
 npm run package
 ```
 
-`scripts/publish.ps1` 把两个程序发布到 `dist/`：`codeatlas.exe`（服务与 CLI）和 `codeatlas-roslyn.exe`（C# 精确语义的 Roslyn worker）。产物是 `extension/codeatlas-0.1.0.vsix`。打包脚本会把 `dist/` 整个拷进 VSIX 的 `server/` 目录；没找到 `dist/codeatlas.exe` 会直接报错，没找到 `codeatlas-roslyn.exe` 只提示（扩展照样能用，但 C# 只有 tree-sitter 的启发式结果）。
+全部平台（在 Windows 上就能交叉发布）：
 
-**Roslyn 什么时候跑**：全量索引（命令 "CodeAtlas: 全量重建索引"）之后、以及第一次索引一个含 `.sln`/`.slnx` 的仓库时，服务会在 tree-sitter 之后自动拉起 worker，状态栏显示 "Roslyn 编译中" → "Roslyn 123/4538"。保存文件触发的增量索引只跑 tree-sitter，改过的文件会退回启发式结果，直到下一次全量。Roslyn 需要本机能用 `dotnet` 还原/编译该解决方案（SDK 版本不限，分析器只借 MSBuild 读项目）。
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/package-all.ps1
+```
+
+`scripts/publish.ps1 [-Rid win-x64|linux-x64|linux-arm64|osx-x64|osx-arm64] [-Out dist]` 发布两个程序：
+- `codeatlas`：服务与 CLI，**自带 .NET 运行时**，只保留用到的 7 个 tree-sitter 语法库。
+- `roslyn/codeatlas-roslyn`：C# 精确语义的 Roslyn worker。它依赖本机 .NET 10，因为要用 SDK 里的 MSBuild 读项目。它必须放在子目录：和自带运行时的服务放在同一目录时，它会误用服务带的运行时。
+
+`npm run package -- --target <平台> --dist <目录>` 把发布目录拷进 VSIX 的 `server/`，再用 `vsce package --target` 打成对应平台的包。以下两种情况会直接报错：
+- 没有服务程序；
+- 发布目录不是自带运行时的（缺 hostfxr）。
+
+缺 worker 只提示，打出来的扩展照样能用，但 C# 只有 tree-sitter 的结果。Linux / macOS 上，VSIX 解压后可能丢失可执行位：扩展启动服务前、服务启动 worker 前都会自动补上。
+
+**Roslyn 什么时候跑**：全量索引（命令 "CodeTrail Graph: 全量重建索引"）之后、以及第一次索引一个含 `.sln`/`.slnx` 的仓库时，服务会在 tree-sitter 之后自动拉起 worker，状态栏显示 "Roslyn 编译中" → "Roslyn 123/4538"。保存文件触发的增量索引只跑 tree-sitter，改过的文件会退回启发式结果，直到下一次全量。Roslyn 需要本机有 .NET 10 运行时和一个 .NET SDK。worker 运行在 .NET 10 上，分析时借 SDK 里的 MSBuild 读项目，被分析项目本身的目标框架不限。跑之前会先用 `codeatlas-roslyn --probe` 探测；缺运行时或缺 SDK 时跳过 Roslyn，在输出面板写明原因，并弹一次提示。
 
 ---
 
 ## 4. 三步上手
 
 1. **打开仓库**。用 VS Code 打开一个 TS / JS / C# 仓库作为工作区文件夹。
-2. **选一个方法**。把光标放到任意方法名或类名上，右键 → **在 CodeAtlas 中查看**（或按 `Ctrl+Alt+G`，macOS 是 `Cmd+Alt+G`）。
-3. **首次建立索引**。第一次会弹出提示"这个工作区还没有 CodeAtlas 索引。"，点 **建立索引**。状态栏显示进度（`CodeAtlas · parse 123/4538` 这样，阶段依次是 scan → parse → write → resolve）。ccs-backend 规模（约 4500 个文件）大约 40 秒。索引完成后面板自动在编辑器右侧打开，并聚焦到光标处的符号，不用再右键一次。
+2. **选一个方法**。把光标放到任意方法名或类名上，右键 → **在 CodeTrail Graph 中查看**（或按 `Ctrl+Alt+G`，macOS 是 `Cmd+Alt+G`）。
+3. **首次建立索引**。第一次会弹出提示"这个工作区还没有 CodeTrail Graph 索引。"，点 **建立索引**。状态栏显示进度（`CodeTrail Graph · parse 123/4538` 这样，阶段依次是 scan → parse → write → resolve）。约 4500 个文件的仓库大约 40 秒。索引完成后面板自动在编辑器右侧打开，并聚焦到光标处的符号，不用再右键一次。
 
 之后再右键其他方法，面板直接切换焦点，面包屑里追加一项。
 
-状态栏左侧常驻一个 `CodeAtlas` 项，点它可以打开面板。文字会随状态变化：
+状态栏左侧常驻一个 `CodeTrail Graph` 项，点它可以打开面板。文字会随状态变化：
 
 | 状态栏文字 | 含义 |
 |---|---|
-| `CodeAtlas` | 刚启动，还没连过服务 |
-| `CodeAtlas · 启动服务…` | 正在拉起服务进程 |
-| `CodeAtlas · 未索引` | 服务在，但这个仓库还没有索引 |
-| `CodeAtlas · 5.9k 符号` | 已索引，悬停显示文件数、符号数和仓库路径 |
-| `CodeAtlas · 索引中` / `CodeAtlas · parse N/M` | 索引进行中 |
-| `CodeAtlas · 索引失败` | 索引出错，详情在输出面板 |
-| `CodeAtlas · 服务不可用` | 服务连不上，见第 10 节 |
+| `CodeTrail Graph` | 刚启动，还没连过服务 |
+| `CodeTrail Graph · 启动服务…` | 正在拉起服务进程 |
+| `CodeTrail Graph · 未索引` | 服务在，但这个仓库还没有索引 |
+| `CodeTrail Graph · 5.9k 符号` | 已索引，悬停显示文件数、符号数和仓库路径 |
+| `CodeTrail Graph · 索引中` / `CodeTrail Graph · parse N/M` | 索引进行中 |
+| `CodeTrail Graph · 索引失败` | 索引出错，详情在输出面板 |
+| `CodeTrail Graph · 服务不可用` | 服务连不上，见第 14 节 |
 
 ---
 
@@ -156,10 +167,20 @@ npm run package
 
 ## 6. confidence 是什么意思
 
-当前版本的解析是 tree-sitter 按名字做的启发式，不是编译器级语义。每条边带一个 0 到 1 的分数：
+每条边带一个 0 到 1 的分数。C# 开了 Roslyn 时多数边是编译器给的 1.0；其余语言（以及 Roslyn 没跑或绑不上的地方）是 tree-sitter 的启发式：
 
 | 分数 | 含义 | 详情条文字 |
 |---|---|---|
+| 1.0 | Roslyn 编译器语义；包含关系 | 确定（编译器 / 包含关系） |
+| 0.95 | 顺着 import / require / using 解析到了仓库里的具体定义 | 按 import 解析 |
+| 0.9 | 按接收者类型解析（字段、参数、局部变量、`this` / `self`、返回值类型）；接口到唯一实现 | 按类型解析 |
+| 0.7 | 全仓库只有一个同名定义；Roslyn 绑不上那一行时保留下来的启发式边也封顶在 0.7 | 名字唯一 |
+| 0.5 | 外部库调用（名字带包或类型，如 `external:gorm.Where`）；接口有多个实现时各一条 | 外部库或弱匹配 |
+| 0.3 | 多个候选分不清，每个候选各一条边，折进"N 个可能目标"胶囊 | 多候选之一 |
+
+0.3 的边是最大的噪声来源，入口时序图默认不走 0.4 以下的边。C# 项目建议开 Roslyn（默认 auto）：引用没还原、有编译错误的文件，Roslyn 绑不上的调用会退回启发式结果，不会整行丢掉。
+
+---|---|---|
 | 1.0 | 包含关系、import 解析到了具体文件 | 确定 |
 | 0.9 | 同一个文件里有且只有一个同名定义 | 同文件唯一 |
 | 0.7 | 在 import / using 范围内有且只有一个同名定义 | import 范围唯一 |
@@ -186,6 +207,7 @@ npm run package
 | ☐ **类型引用** | 默认关。打开后把参数类型、字段类型等 `references` 边也画出来 |
 | ☐ **测试代码** | 默认关。打开后把路径或限定名里带 `Tests` / `Test` / `Spec` 的测试方法也画出来。追源头时测试是最大的噪声，所以默认不画 |
 | ☐ **分发细节** | 默认关。打开后显示分发管道本身：对 `QueryAsync` / `SendAsync` 的调用和消息对象 `new` 的那条边。默认用一条橙色 dispatch 边代替它们 |
+| ☐ **跟随光标** | 默认关。勾上后编辑器光标移进哪个方法，调用图就以它为焦点，见 11.3 |
 | **⟳ 索引** | 对当前仓库做一次增量索引 |
 
 切换三个开关后，当前焦点会按新设置重新加载。
@@ -222,7 +244,7 @@ npm run package
 | `正在连接服务…` | 刚打开，正在连服务 |
 | `这个仓库还没有索引` + **建立索引** 按钮 | 点按钮开始索引 |
 | `正在建立索引` + 进度条 | 索引中，显示阶段和 `已完成/总数` |
-| `连不上 CodeAtlas 服务` | 服务不可用，见第 10 节 |
+| `连不上 CodeTrail Graph 服务` | 服务不可用，见第 14 节 |
 
 索引结束后覆盖层消失，右下角提示"索引完成：N 个符号，X 秒"。
 
@@ -234,15 +256,17 @@ npm run package
 
 ### 8.0 容器图（第一屏）
 
+**只有一个自己的容器时（比如单独打开一个前端仓库），第一屏直接进入它的「入口流程」**，并自动选中一个入口：在页面 / HTTP 路由里挑接口调用最多的那条流程（同样多取节点多的），右边一打开就是"页面 → 组件 → hook → 接口"的时序图。点面包屑「项目」回到容器图，之后不会再自动跳走。**一个容器都没有时（纯类库仓库），第一屏直接打开整库的组件 DSM**，并提示「未发现可部署的服务，显示模块依赖」。后端不在索引里时，hook 下面的接口调用画成灰蓝虚线的「接口」行，标"未对上后端"；检测到上级或同级目录里有 .NET 后端（根下有 .sln / .slnx）时会提示一次是否一起索引，同意后写入 `codeatlas.projects` 并全量重建，接口行就变成续接进后端控制器的紫色续接。
+
 回答"这个系统由哪几个进程组成、各碰什么外部系统"。全部来自静态发现，每个节点和每条边都能点出证据文件与行号：
 
 | 列 | 是什么 | 怎么认的 |
 |---|---|---|
 | 左：使用者 / 前端 | `architecture.yaml` 里声明的人；`package.json` 带 next / vite / react-scripts 等框架和 build / dev / start 脚本的前端应用 | 文件 |
-| 中：容器 | 非测试的可执行 .NET 项目：`Sdk.Web`、`Sdk.Worker`、`OutputType Exe`；成员 = 传递项目引用；端口来自 `launchSettings.json` 的 http 地址与 Dockerfile 的 `EXPOSE` / `ASPNETCORE_URLS` | csproj、Dockerfile、launchSettings |
+| 中：容器 | 非测试的可执行 .NET 项目：`Sdk.Web`、`Sdk.Worker`、`OutputType Exe`（旧式 csproj 与 `packages.config` 也读；同目录多个 csproj 只出一个容器）；成员 = 传递项目引用；端口来自 `launchSettings.json` 的 http 地址与 Dockerfile 的 `EXPOSE` / `ASPNETCORE_URLS`。另有 Go 模块（有 `main` 包）、Python 项目（框架或 `__main__` / console_scripts）、Node 服务（有 Dockerfile）与 Node 命令行（package.json 的 `bin`）、Java 的 Maven / Gradle 可执行模块（Spring Boot 或 `main`；Eureka 服务端、Spring Cloud Config 服务端分别标"服务注册中心""配置中心"） | csproj、Dockerfile、launchSettings、go.mod、pyproject、package.json、pom.xml / build.gradle、application.yml |
 | 右：外部系统 | 数据库 / 缓存 / 消息 / 存储 / 遥测（按 NuGet 包）、HTTP 与 gRPC 服务（`AddHttpClient`、`GrpcChannel.ForAddress`）、原生 / 厂商 SDK（本地程序集引用、`DllImport`、MetaTrader 包）、前端调用的后端 API（`fetch` / `axios` 的 URL 字面量按前两段路径聚合） | 包引用、DI 注册代码、源码 |
 
-**边的三档**（线的虚实）：按配置地址对上另一个容器的监听端口是 **0.7 实线**（例如 `MetaTraderManagerMT4Api:Url = http://localhost:5162/` 对上 MT4Proxy.Web 的 5162）；只知道客户端或包引用是 **0.5 虚线**，挂到外部系统；`architecture.yaml` 声明的边是 **1.0 点线**。消息消费（`IConsumer` / `ConsumerBuilder` / `Subscribe`）方向反过来：Kafka → 容器，橙色。
+**边的三档**（线的虚实）：按配置地址对上另一个容器的监听端口是 **0.7 实线**（例如 `PaymentGateway:Url = http://localhost:5162/` 对上 Payment.Web 的 5162）；只知道客户端或包引用是 **0.5 虚线**，挂到外部系统；`architecture.yaml` 声明的边是 **1.0 点线**。消息消费（`IConsumer` / `ConsumerBuilder` / `Subscribe`）方向反过来：Kafka → 容器，橙色。
 
 - 单击节点 / 边：底部详情条列证据（csproj 行、注册代码行、配置键与解析出的 URL）。
 - 双击容器：钻到它的命名空间地图（以成员项目的根命名空间为底；前端是目录）。面包屑的"项目"回到容器图。
@@ -264,12 +288,12 @@ npm run package
 
 ### 8.0.2 入口流程（容器内的第二个子标签）
 
-双击容器进入后，面包屑栏有两个子标签：**组件矩阵 | 入口流程**。入口流程回答"一个请求 / 事件 / 定时任务进来后走了哪些组件、到哪个外部系统为止"。
+双击容器进入后，面包屑栏有两个子标签：**组件矩阵 | 入口流程**。入口流程里面包屑只跟选中的入口；再点一次「入口流程」子标签回到入口清单。入口流程回答"一个请求 / 事件 / 定时任务进来后走了哪些组件、到哪个外部系统为止"。
 
-- **左栏是这个容器的全部入口**，按种类分组：HTTP 路由（控制器动作与 Minimal API，带方法与路由模板）、常驻服务（`BackgroundService` / `IHostedService`）、定时任务（Quartz `IJob`）、SignalR、分发处理器（MediatR / 自研分发的 Handler，按消息类型）、前端页面与前端 API 路由（Next.js 的 `app/**/page.tsx`、`app/api/**/route.ts`）。上面有搜索框。入口怎么认的：索引里的继承 / 实现边 + 声明上方的特性文本；Minimal API 把 `MapGroup("api/orders")` 的前缀（变量链或同一行链式）拼进路由，`MapGet("/x", Handler)` 写方法组时入口落在 Handler 方法上；测试项目不算。也认 gRPC 服务端（`MapGrpcService<T>()` 注册的服务的 override 方法，路由写成 `服务/方法`）、Hangfire（`RecurringJob.AddOrUpdate<T>` / `BackgroundJob.Enqueue<T>` 指向的方法，归"定时任务"）、MassTransit `IConsumer<T>`（归"分发处理器"）。列表里没有的框架要再加规则——是"没有"，不是"猜错"。
+- **左栏是这个容器的全部入口**（名字长时左右滚动；拖动左栏右边缘调宽度，宽度会记住），按种类分组：HTTP 路由（控制器动作与 Minimal API，带方法与路由模板）、常驻服务（`BackgroundService` / `IHostedService`）、定时任务（Quartz `IJob`）、SignalR、分发处理器（MediatR / 自研分发的 Handler，按消息类型）、前端页面与前端 API 路由（Next.js 的 `app/**/page.tsx`、`app/api/**/route.ts`）。上面有搜索框。入口怎么认的：索引里的继承 / 实现边 + 声明上方的特性文本；Minimal API 把 `MapGroup("api/orders")` 的前缀（变量链或同一行链式）拼进路由，`MapGet("/x", Handler)` 写方法组时入口落在 Handler 方法上；测试项目不算。也认 gRPC 服务端（`MapGrpcService<T>()` 注册的服务的 override 方法，路由写成 `服务/方法`）、Hangfire（`RecurringJob.AddOrUpdate<T>` / `BackgroundJob.Enqueue<T>` 指向的方法，归"定时任务"）、MassTransit `IConsumer<T>`（归"分发处理器"）。其他语言：Go（net/http、gorilla/mux、gin、echo、chi、gRPC）、Python（FastAPI、Flask、Django / DRF、Celery）、Java（Spring MVC、WebFlux 函数式路由、JAX-RS、gRPC `ImplBase`、`@Scheduled`、Kafka / Rabbit / JMS / Stream 监听、`@EventListener`）、Node（Express、Koa、Fastify、NestJS、gRPC `addService`）。**控制台程序**：`Main` 或顶级语句是"常驻服务"入口（`csharp.main` / `java.main`），手写 switch 分派的子命令顺着调用往下走；用命令行框架的按命令列成「命令行命令」一组（System.CommandLine、Spectre.Console.Cli、CommandLineParser、cobra、urfave/cli、click、typer、argparse、picocli、commander、yargs），路由写命令路径如 `remote add`。列表里没有的框架要再加规则——是"没有"，不是"猜错"。
 - **右侧是时序图**：列是 actor（入口所在项目在最左，其余按首次出现，外部系统在最右），行是调用，箭头从调用方列指向被调方列。走的是**运行时去向**：普通调用、接口调用到唯一实现的派生边、分派到 Handler（橙色虚线）。不走 references / inherits / implements，和 DSM 的编译期依赖正好相反，各自正确。
 - **折叠**：默认展开到深度 3，点一行展开 / 收起它下面的调用；每个节点最多展开 6 个分支，其余折成"还有 N 个"；相邻完全相同的子树折成 ×N；一个方法调的外部库方法合并成一个"N 个框架调用"节点。深度 12、总节点 300 封顶，超了会标"已截断"。
-- **跨容器续接**（紫色）：前端页面里 `fetch` / `axios` 的路径对上了某个容器的控制器路由，或 C# 方法里既调了 `HttpClient` 又出现了路径（字面量、`$"{remoteServiceBaseUrl}items/{id}"` 这种用本文件 `string` 字段拼的插值串、直接当参数的字段名）对上了别的容器的路由，时序图就接着画进对方容器的那个入口。对上的同时，容器图上这两个容器之间的边升到 0.9（实线），"API /api/xxx"占位外部节点在全部路径都对上后消失。路由对不上就停在"HTTP 调用"。
+- **跨容器续接**（紫色）：前端页面里 `fetch` / `axios` 的路径对上了某个容器的控制器路由，或 Java 的 RestTemplate / WebClient / `@FeignClient`（Spring Cloud Gateway 的路由表会被读出来，经网关的路径改写后再对目标服务），或 C# 方法里既调了 `HttpClient` 又出现了路径（字面量、`$"{remoteServiceBaseUrl}items/{id}"` 这种用本文件 `string` 字段拼的插值串、直接当参数的字段名）对上了别的容器的路由，时序图就接着画进对方容器的那个入口。对上的同时，容器图上这两个容器之间的边升到 0.9（实线），"API /api/xxx"占位外部节点在全部路径都对上后消失。路由对不上就停在"HTTP 调用"。
 - 点节点标签切到调用图并以它为焦点。
 - 节点显示成 `类型.方法`（一屏好几个 `Handle` 时分得清）。泛型包装命令（`mediator.Send(new IdentifiedCommand<CreateOrderCommand, bool>(…))`）只分派到类型实参对得上的那个 Handler 子类，再顺着基类转发到真正的 `CreateOrderCommandHandler`（需要 Roslyn）。
 - 命令行：`codeatlas arch <repo> --entries <容器键> [--kind http|grpc|…] [--q 文本]` 列入口；`--flow <符号 id> [--depth N]` 打印一条流程的树。
@@ -278,7 +302,7 @@ npm run package
 
 地图模式右侧有一张**叙述卡**（可收成一条竖边）：单击容器图里的容器、DSM 的行头、入口流程里的入口，卡片显示模型写的一段话（≤ 120 字）、关键点和风险。模型可以是本机的（默认 llama-server），也可以是联网服务，随时切换。
 
-- **选服务**：命令面板 **CodeAtlas: 选择 AI 服务**，预设有本地 llama-server、DeepSeek、通义千问（阿里云百炼）、OpenAI、Anthropic Claude、自定义；选联网服务后接着提示输入 API Key（命令 **CodeAtlas: 设置 AI API Key** / **清除 AI API Key**）。Key 存在 VS Code 的 SecretStorage（系统凭据库），按服务分别保存，不进 settings.json，只通过环境变量交给本机服务进程。协议两种：OpenAI 兼容（本地 llama-server 与绝大多数国内外服务）和 Anthropic Messages API。
+- **选服务**：命令面板 **CodeTrail Graph: 选择 AI 服务**，预设有本地 llama-server、DeepSeek、通义千问（阿里云百炼）、OpenAI、Anthropic Claude、自定义；选联网服务后接着提示输入 API Key（命令 **CodeTrail Graph: 设置 AI API Key** / **清除 AI API Key**）。Key 存在 VS Code 的 SecretStorage（系统凭据库），按服务分别保存，不进 settings.json，只通过环境变量交给本机服务进程。协议两种：OpenAI 兼容（本地 llama-server 与绝大多数国内外服务）和 Anthropic Messages API。
 - **速度**：本地 qwen3.6-27b 在这台机器上约 2–3 tok/s，一条 2–4 分钟，默认超时 300 秒；联网服务通常 5–20 秒一条，可把 `codeatlas.ai.concurrency` 调到 2–4 同时生成、`codeatlas.ai.timeoutSeconds` 降到 60。联网服务限流（HTTP 429）时按 Retry-After 退避再试；Key 错（401 / 403）直接提示，不白等重试。
 
 - **证据**：每条关键点后面的小标签是它引用的事实（容器节点、边、入口、符号、组件、格子）。点 `node:` 标签在容器图选中那个节点，点 `entry:` / `sym:` 切到调用图聚焦；灰色标"推断"的条目引用对不上输入事实，是模型自己推的，打个问号看。
@@ -323,72 +347,300 @@ npm run package
 
 ---
 
-## 9. 索引
+## 9. 调用大纲（侧边栏）
 
-### 9.1 什么时候自动索引
+复杂项目里网状的调用图不一定直观。想知道"**这个方法一步步做了什么**"时，用活动栏的 **CodeTrail Graph** 图标打开 **调用大纲**：光标在哪个方法里，它就按源码顺序列出这个方法调了什么，每一步还能继续展开，看下一层又做了什么。
+
+```
+OrdersApi.CreateOrderAsync                      OrdersApi.cs:38
+├─ 1  CreateOrderCommand               new · L42
+├─ 2  IMediator.Send                   框架 · L47
+│   └─ 1  CreateOrderCommandHandler.Handle      L47
+│       ├─ 1  OrderRepository.Add                L28
+│       ├─ 2  Order.AddOrderItem ×3   ↻ 循环内 · L35
+│       └─ 3  UnitOfWork.SaveChangesAsync        L41
+└─ 3  ILogger.LogInformation       框架 · ? 条件内 · L55
+```
+
+（示例用的是 eShop 风格的虚构代码。）
+
+### 9.1 每一行是什么
+
+- **序号**：这一层里的第几步，按调用在源码里出现的位置排。相邻的同一调用合并成一行，后面标 `×N`。
+- **名字**：`类型.方法`。图标表示种类：方法调用、构造（`new`）、分派到 Handler（如 `mediator.Send` 落到的处理器）、接口调用落到的实现、框架 / 第三方调用（灰色，带"框架"字样，不能展开）、多个候选（问号，展开看候选）。
+- **右侧说明**：调用所在的控制结构加行号：
+
+| 标记 | 含义 |
+|---|---|
+| `↻ 循环内` | 在 for / foreach / while 等循环里，可能执行多次 |
+| `? 条件内` | 在 if / switch / 三元表达式等分支里，不一定执行 |
+| `try 内` | 在 try 块里 |
+| `catch 内` | 在 catch 块里，只在出错时执行 |
+| `λ 回调` | 在 lambda / 回调里，什么时候执行取决于调用方 |
+| `↺ 递归` | 这个方法已经在展开路径上了，不再展开 |
+
+- **悬停提示**：完整限定名、定义所在文件:行、调用处、置信度。置信度低于 0.7 的注明"推测"（按名字猜的，不一定准，含义见第 6 节）。
+- 分派 / 接口实现 / 多候选的目标直接挂在那一步下面，不用再点。
+
+### 9.2 跟随与固定
+
+- **跟随**（默认）：光标停下 0.3 秒后，大纲换成光标所在的方法；同一个方法里移动不会重新加载。光标落在类体、字段等方法之外的位置时，显示"把光标放进一个方法"。只对支持的源文件生效，切到 Markdown、JSON 等文件时大纲保持不变。
+- **固定**：视图标题栏的图钉按钮。固定后大纲不再跟着光标变，方便一边看大纲一边在别的文件里跳转；再点一次恢复跟随。
+- 在大纲里点击跳转引起的光标移动不算"换方法"，你在编辑器里再点一下或打字之后才会重新跟随。
+- 大纲只在视图可见时工作。仓库里已经有索引库时，打开视图会自动拉起服务；还没有索引时显示"这个工作区还没有 CodeTrail Graph 索引"和 **建立索引** 按钮，不会静默建库。
+
+### 9.3 标题栏按钮
+
+| 按钮 | 作用 |
+|---|---|
+| 图钉 | 固定 / 跟随 |
+| 漏斗 | 隐藏 / 显示框架调用（日志、集合操作等）。隐藏后视图标题旁显示"不含框架调用"。这个选择会记住 |
+| 图谱 | 在 CodeTrail Graph 面板中打开当前方法（以它为焦点的调用图） |
+| 刷新 | 重新加载大纲（索引完成后会自动刷新） |
+
+### 9.4 单击与转到定义
+
+- **单击一步**：跳到这次调用发生的位置（当前所在方法里的那一行，光标落在调用名上），焦点留在大纲里，可以继续用键盘上下翻。文件改过还没重新索引时，按行号跳到行首。
+- **单击根节点**：跳到方法定义。
+- **转到定义**（行尾的按钮，或右键菜单）：打开被调方法的定义。框架调用没有源码，没有这个按钮。
+
+---
+
+## 10. 影响范围（侧边栏）
+
+调用大纲回答"这个方法做了什么"，**影响范围**回答反过来的问题："**改了它会影响谁**"。它和调用大纲在同一个 CodeTrail Graph 活动栏里（调用大纲下面），同样跟着光标走：光标在哪个方法里，就列出谁调用了它、沿调用方一路往上最终会走到哪些入口。
+
+```
+OrderService.CreateAsync                                  OrderService.cs:20
+├─ 受影响的入口（3）
+│   ├─ Ordering.API                                        2 个入口
+│   │   ├─ HTTP POST /api/orders                           深度 2
+│   │   └─ HTTP PUT /api/orders/{id}                       深度 3
+│   └─ Ordering.Worker                                     1 个入口
+│       └─ 定时任务 OrderCleanupJob                         深度 3
+└─ 直接调用方（3）
+    ├─ CreateOrderCommandHandler.Handle          经分派 · L28
+    │   └─ OrdersApi.CreateOrderAsync   HTTP POST /api/orders · L47
+    ├─ OrderSaga.Retry                    ×2 · ↻ 循环内 · L61
+    ├─ OrderController.Create                 经接口 · L35
+    └─ 被 4 个测试调用                              点击包含测试
+```
+
+（示例用的是 eShop 风格的虚构代码。）
+
+### 10.1 受影响的入口
+
+- 根下面的第一组。沿调用方一路往上能走到的全部入口（HTTP 路由、命令行命令、定时任务、常驻服务、SignalR、gRPC、分发处理器、前端页面等），**按容器分组**（只有一个容器时直接展开，多个时收起）。
+- 每个入口一行，如 `HTTP POST /api/orders`、`定时任务 OrderCleanupJob`、`命令 remote add`；右侧 `深度 N` 是往上走了几层到达（0 = 这个方法自己就是入口）。**单击**跳到入口方法的定义。
+- 服务按上限停止了向上搜索时，分组旁标"（可能不全）"。一个入口都走不到时显示"没有走到任何入口"——可能经反射 / 框架回调调用，也可能只被测试调用。
+
+### 10.2 直接调用方
+
+- 根下面的第二组「直接调用方（N）」。用分组而不是直接列在根下面：根下有入口和调用方两类东西，分组标题把两者分开并给出个数；往下展开的各层只有调用方，就直接列。
+- **每一行**：`类型.方法`，右侧说明依次是
+  - 调用方本身是入口时的入口（如 `HTTP POST /api/orders`，图标也换成入口的图标）；
+  - 调用方式：直接调用不写，`经接口`（调用方调的是接口 / 基类方法，实现落到这里）、`经分派`（如 `mediator.Send` 分发到这个 Handler）、`构造`（`new` 了这个类型）；
+  - 同一个调用方里调了多处时 `×N`；
+  - 第一处调用所在的控制结构（`↻ 循环内`、`? 条件内` 等，与调用大纲同一套，见 9.1）和行号 `L行`。
+- **展开**一个调用方：看谁又调用了它（只列调用方，不再列入口）。展开路径上已经出现过的方法再出现时标 `↺ 递归`，不再展开。
+- **悬停提示**：完整限定名、定义所在文件:行、各处调用的行号、调用方式、置信度（低于 0.7 注明"推测"，见第 6 节）、本身是哪些入口。
+- **多处调用**不再拆成子节点：展开一个调用方的含义是"再往上一层"，如果同时还列"各处调用"，两个方向混在一起反而难读；各处行号都在悬停提示里，单击跳第一处，要逐处看可以在编辑器里用"查找所有引用"。
+- 测试代码里的调用方默认不列出，只在最后一行显示「被 N 个测试调用」；**点它**等于打开"包含测试"。
+
+### 10.3 跟随与固定
+
+和调用大纲用同一套规则（见 9.2），并且两个视图**共用同一次解析**：光标移动后只问服务一次"光标在哪个方法里"，两个视图都拿这个结果，不会因为多开一个视图多发请求。
+
+- **固定各管各的**：固定调用大纲不影响影响范围，反之亦然。比如固定影响范围看着一个公共方法的调用方，同时让调用大纲继续跟着光标走。
+- 在任一个视图里点击跳转引起的光标移动，两个视图都不跟随；你在编辑器里再点一下或打字之后才恢复。
+- 视图不可见（收起或切到别的活动栏）时不发任何请求。
+
+### 10.4 标题栏按钮
+
+| 按钮 | 作用 |
+|---|---|
+| 图钉 | 固定 / 跟随（只影响这个视图） |
+| 烧杯 | 包含 / 排除测试代码里的调用方。包含时视图标题旁显示"含测试"。这个选择会记住 |
+| 图谱 | 在 CodeTrail Graph 面板中打开当前方法（以它为焦点的调用图）。面板目前不接受"方向"参数，打开后要往上追请点面板工具栏的 **↑ 到源头** |
+| 刷新 | 重新加载（索引完成后会自动刷新） |
+
+### 10.5 单击与转到定义
+
+- **单击调用方**：打开调用方所在文件，光标落在第一处调用的调用名上，焦点留在视图里。文件改过还没重新索引时，按行号跳到行首（与调用大纲相同）。
+- **单击入口**：跳到入口方法的定义。**单击根节点**：跳到当前方法的定义。
+- **转到定义**（行尾的按钮，或右键菜单）：打开调用方方法的定义处。
+
+
+---
+
+## 11. 快速跳转
+
+不打开面板、不切到侧边栏，在编辑器里直接跳到"谁调了它 / 它调了谁 / 会影响哪个入口"。
+
+### 11.1 方法上方的 CodeLens
+
+每个方法 / 函数 / 构造函数上方一行灰色小字，可以点：
+
+```
+入口 | 被 3 个方法调用 5 处 | 测试 2 | 调用 4 个 | 影响范围
+public async Task<IActionResult> CreateAsync(CreateOrderRequest request)
+```
+
+（示例是 eShop 风格的虚构代码。）
+
+| 项 | 什么时候出现 | 点它 |
+|---|---|---|
+| **入口** | 这个方法本身是入口（HTTP 路由、定时任务、命令、消息处理…） | 不能点 |
+| **被 N 处调用** | 总是出现。调用方个数和调用处数不同时写成 `被 3 个方法调用 5 处`；都是 0 时写 **没有调用方**（找死代码用；入口没有调用方是正常的，由框架调用）。不含测试 | 列出直接调用方（说明里是调用方式与各处行号，下面一行是文件），选一个跳到它的第一处调用 |
+| **测试 K** | 测试代码里有调用方时 | 列出全部调用方（含测试） |
+| **调用 M 个** | 总是出现。M 是调用大纲第一层的步骤数（含框架调用）；`调用 0 个` 不能点 | 列出这些步骤（文案同调用大纲），选一个跳到调用处；右侧按钮转到被调方的定义 |
+| **影响范围** | 总是出现 | 打开侧边栏「影响范围」，以这个方法为根并**固定**（不再跟着光标换）；点图钉取消固定后恢复跟随 |
+
+- **整个文件一次请求**，结果按文件缓存；编辑时不重新请求，只重新核对位置。**保存**这个文件、**索引完成**后自动刷新。
+- 文件在索引之后改过（服务判断内容对不上）时，调用计数那一项后面加 **（索引已过期）**，数字和行号可能不准；保存后会增量索引，完成后自动更新。
+- 文件**改了还没保存**、或索引已过期时，CodeLens 仍按索引里的行号放；如果那一行已经不像这个方法的声明（不包含方法名；声明上方的特性 / 注解 / 装饰器行除外），这个方法的 CodeLens 先不显示，免得挂在别的代码上方。保存并索引后恢复。
+- **什么时候显示**：和保存时增量索引同一条规则——只对本会话里已经用过 CodeTrail Graph 的文件夹，或仓库里已经有 `.codeatlas/index.db` 的文件夹。没有索引的仓库不会因为打开一个文件就拉起服务、建索引；服务起不来时什么都不显示。
+- 不想要：把设置 `codeatlas.codeLens.enabled` 设为 `false`（VS Code 自己的 `editor.codeLens` 会关掉所有扩展的 CodeLens）。
+
+### 11.2 转到调用方 / 被调方 / 受影响的入口
+
+三个命令以**光标所在的方法**为对象（与调用大纲、影响范围同一套"光标 → 当前方法"，光标还在同一行时不再问服务），弹出列表，选中即跳：
+
+| 命令 | Windows / Linux | macOS | 列出什么，跳到哪 |
+|---|---|---|---|
+| **CodeTrail Graph: 转到调用方…** | `Ctrl+Alt+H` | `Ctrl+Cmd+H` | 直接调用方（不含测试；列表提示里写测试调用方个数），跳到第一处调用；右侧按钮转到调用方定义 |
+| **CodeTrail Graph: 转到被调方…** | `Ctrl+Alt+J` | `Ctrl+Cmd+J` | 调用大纲第一层（含框架调用），跳到调用处；右侧按钮转到被调方定义 |
+| **CodeTrail Graph: 转到受影响的入口…** | `Ctrl+Alt+R` | `Ctrl+Cmd+R` | 往上能走到的入口，按层数从近到远，跳到入口方法 |
+
+- 快捷键只在编辑器有焦点、且是支持的源文件（`.ts` `.tsx` `.js` `.cs` `.go` `.py` `.java` 等）时生效，别的文件里同一组合键不受影响。
+- **为什么不是 `Ctrl+Alt+↑ / ↓`**：那是 VS Code 默认的"在上 / 下方添加光标"（Windows；macOS 是 `Cmd+Alt+↑ / ↓`），占了会让多光标失灵。`Ctrl+Alt+H / J / R` 在 VS Code 1.141 的 Windows / Linux / macOS 默认键位里都没有在编辑器里生效的绑定（`Ctrl+Alt+R` 只在终端、或焦点不在编辑器时另有用途）；`H` 与 VS Code 自带的调用层次结构 `Shift+Alt+H` 同一个字母，好记。macOS 用 `Ctrl+Cmd`，因为 `Cmd+Alt+H` 是系统的"隐藏其他"，`Cmd+Alt+[ / ]` 是折叠 / 展开。
+- 德语、法语、波兰语等键盘布局里 `Ctrl+Alt` 等于 `AltGr`；`H / J / R` 在这些常见布局里不产生字符，所以选了它们（避开了 `E`：`AltGr+E` 是 €）。和你的布局或别的扩展冲突时，在"键盘快捷方式"里搜 `codeatlas.goto` 改掉即可。
+- **能退回去**：跳转记进 VS Code 的前进 / 后退历史，`Alt+←`（macOS `Ctrl+-`）回到跳之前的位置；同一文件里相隔很近的跳转也会单独记一条。
+
+### 11.3 面板调用图「跟随光标」
+
+面板工具栏（调用图模式）里的 ☐ **跟随光标**：勾上后，编辑器里光标移进哪个方法，调用图就以它为焦点。
+
+- 光标停下约 0.4 秒才换（连续移动只换最后一次）；还在同一个方法里移动不会重画。
+- 光标在类体、注释等方法以外的地方时，图保持不变。
+- 在面板里双击节点打开源码时，由此引起的光标移动不跟随，图不会被换成刚打开的方法。
+- 只在调用图模式下生效；切到项目地图 / 模块关系时不打断那边的视图。默认不勾选，面板重新打开后要重新勾。
+
+---
+
+## 12. 模块关系（面板）
+
+想知道"**这个类在整个系统里处在什么位置、依赖了谁、被谁依赖**"时，用面板顶部的 **模块关系** 模式（「调用图 | 模块关系 | 项目地图」）。和调用图不同，这里以**类**为单位，方法之间的调用、构造、分派、继承、实现、类型引用，都汇总到类与类之间。
+
+**怎么打开**
+- 编辑器右键 → **在 CodeTrail Graph 模块关系中查看**：以光标所在方法所属的类为中心。
+- 侧边栏「调用大纲」「影响范围」标题栏的 **在模块关系中查看** 按钮：以当前根方法所属的类为中心。
+- 调用图里右键节点 → **在模块关系中查看**；或者调用图里选中一个节点后切到模块关系。
+- 面板顶部搜索框：在模块关系模式下搜一个符号，就以它为中心。
+
+**怎么读**
+
+| 元素 | 含义 |
+|---|---|
+| 框 | 组件（项目、命名空间段或前端目录，和组件矩阵 DSM 的分组同一套）。**从左到右按依赖顺序排**：被依赖的在左，最右边是"外部"（框架 / 第三方的基类和接口） |
+| 加粗的节点 | 中心类。默认画它直接相连的类（深度 1），工具栏可以切到深度 2 |
+| 实线 | 调用 / 构造；橙色虚线是分派（Mediator / 消息） |
+| 带空心三角的紫色虚线 | 继承 / 实现 |
+| 灰色点线 | 只有类型引用（字段类型、参数类型） |
+| 线的粗细 | 关系的多少 |
+| 红色描边的线 | **反向依赖**：左边（被依赖）的组件反过来依赖了右边的组件，通常是分层被打破的地方 |
+| 线上的文字 | 例如"调用 12 · 构造 2 · 实现"；只在连着中心的线、以及选中节点的线上显示 |
+
+**交互**
+- 单击一条线：底部详情条列出具体是哪些方法调了哪些方法（最多 5 条示例），点一条示例跳到代码。
+- 单击一个类：详情条显示它的限定名、所在组件、和中心的关系。
+- 双击一个类：以它为新中心。面包屑记着走过的中心，可以回退。
+- 右键一个类：在编辑器中打开 / 在调用图中查看 / 设为中心。
+- 节点超过 40 个时只保留与中心关系最强的那些，工具栏会提示"节点过多"。
+- 没有类的代码（Go、Python 的顶层函数、TS 的模块函数）以文件为单位。
+
+## 13. 索引
+
+### 13.1 什么时候自动索引
 
 | 场景 | 行为 |
 |---|---|
-| 首次在某仓库右键"在 CodeAtlas 中查看" | 提示建立索引，确认后全量建立 |
+| 首次在某仓库右键"在 CodeTrail Graph 中查看" | 提示建立索引，确认后全量建立 |
 | 索引库是旧版本解析规则建的 | 状态栏提示"索引格式已更新，正在全量重建…"，自动全量重建一次 |
 | 保存了 `.ts` `.tsx` `.mts` `.cts` `.js` `.jsx` `.mjs` `.cjs` `.cs` 文件 | 1.5 秒防抖后增量索引（只重新解析内容变了的文件）。索引进行中再保存，会在结束后再跑一次 |
 
-保存触发的增量索引**只对本会话里已经用过 CodeAtlas 的工作区文件夹生效**。扩展不会因为你保存了一个文件就静默拉起服务、往仓库里写索引。
+保存触发的增量索引**只对本会话里已经用过 CodeTrail Graph 的工作区文件夹生效**。扩展不会因为你保存了一个文件就静默拉起服务、往仓库里写索引。
 
 索引完成后，面板里的焦点会按新数据重新加载（增量索引会让符号 id 变化，扩展按 id → 原位置 → 限定名依次找回焦点）。
 
-### 9.2 手动索引
+### 13.2 手动索引
 
 | 方式 | 作用 |
 |---|---|
 | 面板工具栏 **⟳ 索引** | 增量 |
-| 命令面板 → **CodeAtlas: 索引工作区（增量）** | 增量 |
-| 命令面板 → **CodeAtlas: 索引工作区（全量重建）** | 全部重新解析。改了工具版本或感觉图不对劲时用 |
+| 命令面板 → **CodeTrail Graph: 索引工作区（增量）** | 增量 |
+| 命令面板 → **CodeTrail Graph: 索引工作区（全量重建）** | 全部重新解析。改了工具版本或感觉图不对劲时用 |
 
-### 9.3 索引库在哪
+### 13.3 索引库在哪
 
 `<仓库根目录>/.codeatlas/index.db`，SQLite 文件。**请把 `.codeatlas/` 加进那个仓库的 `.gitignore`**，工具不会替你改。
 
 命令行的 `--db` 参数在扩展里**不适用**：扩展启动服务时固定用仓库内的 `.codeatlas/index.db`。如果你用命令行把索引建在了别处，扩展看不到它。
 
-### 9.4 多根工作区
+### 13.4 多项目与多根工作区
 
-一个工作区文件夹对应一个服务进程和一个索引库。右键时按当前文件所属的文件夹选服务。
+一个服务、一个索引库可以同时覆盖好几个目录，前端里调用的接口才能续接进另一个仓库的后端控制器。
 
-### 9.5 自动跳过的内容
+- **嵌套仓库默认纳入**：带自己 `.git` 目录的子仓库（独立克隆，如 `shop-api/payment-gateway/`）与子模块一起索引，各自的 `.sln` 各跑一次 Roslyn。git worktree（`.git` 是指向 `…/worktrees/…` 的文件，如 `.claude/worktrees/*`）是本仓库的副本，总是跳过。设置 `codeatlas.includeNestedRepos: false` 关掉（服务以 `--no-nested` 启动）。
+- **多根工作区**：第一个文件夹是主根，其余文件夹自动作为外部项目一起索引，命令和面板都作用于主根的服务。
+- **仓库外的目录**：设置 `codeatlas.projects`（如只打开前端 `shop-web` 时写 `["../shop-api"]`），或仓库里的 `.codeatlas/config.json`：`{"projects": ["../shop-api"]}`；命令行 `index / serve / arch` 用可重复的 `--project <路径>`。
+- 外部目录的文件以相对主根的路径入库（`../shop-api/…`），目录互相包含时按真实路径去重。新加的外部目录要跑 Roslyn 就做一次全量重建。
 
-`node_modules`、`bin`、`obj`、`.git`、`dist`、`build`、`.vs`、`.idea`、`.codeatlas`，任何含有自己 `.git` 的子目录（worktree、子模块、嵌套仓库），以及大于 2MB 的文件。
+### 13.5 自动跳过的内容
+
+`node_modules`、`bin`、`obj`、`.git`、`dist`、`build`、`.vs`、`.idea`、`.codeatlas`，git worktree 副本（关掉 `includeNestedRepos` 时还有嵌套仓库与子模块），以及大于 2MB 的文件。
 
 ---
 
-## 10. 服务进程
+## 14. 服务进程
 
 扩展会自动管理一个本地服务进程（`codeatlas.exe serve <仓库>`），你通常不需要关心它。
 
 - **查找顺序**：扩展自带的 `server/` 目录 → 设置 `codeatlas.serverPath` → 系统 `PATH` 里的 `codeatlas.exe`。都找不到时弹一个带 **打开设置** 按钮的错误。
 - **启动超时**：20 秒。首次启动可能被杀毒软件扫描程序集拖慢（正常约 1 秒）。
-- **自动恢复**：请求失败时自动重启一次再试。再失败就停下，状态栏变成 `CodeAtlas · 服务不可用`，等你手动重启。
-- **手动重启**：命令面板 → **CodeAtlas: 重启服务**。
-- **日志**：输出面板（查看 → 输出）选 **CodeAtlas** 通道。服务的 stderr、每次索引的结果、请求失败的原因都在这里。
+- **自动恢复**：请求失败时自动重启一次再试。再失败就停下，状态栏变成 `CodeTrail Graph · 服务不可用`，等你手动重启。
+- **手动重启**：命令面板 → **CodeTrail Graph: 重启服务**。
+- **日志**：输出面板（查看 → 输出）选 **CodeTrail Graph** 通道。服务的 stderr、每次索引的结果、请求失败的原因都在这里。
 - **退出**：关闭 VS Code 或 Reload Window 时服务随之退出（看门狗：扩展宿主进程消失 10 秒后自行退出），不会留下残留进程。
 
 ---
 
-## 11. 命令一览
+## 15. 命令一览
 
-命令面板（`Ctrl+Shift+P`）里输入 `CodeAtlas`：
+命令面板（`Ctrl+Shift+P`）里输入 `CodeTrail Graph`：
 
 | 命令 | 作用 |
 |---|---|
-| **CodeAtlas: 在 CodeAtlas 中查看** | 以光标处符号为焦点打开面板。也在编辑器右键菜单里；快捷键 `Ctrl+Alt+G`（macOS `Cmd+Alt+G`） |
-| **CodeAtlas: 打开面板** | 只打开面板，不聚焦。点状态栏的 CodeAtlas 项效果相同 |
-| **CodeAtlas: 索引工作区（增量）** | 增量索引当前工作区文件夹 |
-| **CodeAtlas: 索引工作区（全量重建）** | 全量重建索引 |
-| **CodeAtlas: 重启服务** | 停掉并重新拉起服务进程 |
+| **CodeTrail Graph: 在 CodeTrail Graph 中查看** | 以光标处符号为焦点打开面板。也在编辑器右键菜单里；快捷键 `Ctrl+Alt+G`（macOS `Cmd+Alt+G`） |
+| **CodeTrail Graph: 在 CodeTrail Graph 模块关系中查看** | 以光标所在方法所属的类为中心，打开面板的模块关系模式。也在编辑器右键菜单里 |
+| **CodeTrail Graph: 打开面板** | 只打开面板，不聚焦。点状态栏的 CodeTrail Graph 项效果相同 |
+| **CodeTrail Graph: 索引工作区（增量）** | 增量索引当前工作区文件夹 |
+| **CodeTrail Graph: 索引工作区（全量重建）** | 全量重建索引 |
+| **CodeTrail Graph: 重启服务** | 停掉并重新拉起服务进程 |
+| **CodeTrail Graph: 固定当前方法 / 跟随光标** | 调用大纲的固定开关（同视图标题栏的图钉） |
+| **CodeTrail Graph: 隐藏 / 显示框架调用** | 调用大纲里是否列出框架 / 第三方调用 |
+| **CodeTrail Graph: 在 CodeTrail Graph 面板中打开** | 以调用大纲当前的方法为焦点打开面板 |
+| **CodeTrail Graph: 刷新调用大纲** | 重新加载调用大纲 |
+| **CodeTrail Graph: 固定影响范围的当前方法 / 影响范围跟随光标** | 影响范围的固定开关（同视图标题栏的图钉） |
+| **CodeTrail Graph: 包含 / 排除测试调用方** | 影响范围里是否列出测试代码里的调用方 |
+| **CodeTrail Graph: 刷新影响范围** | 重新加载影响范围 |
+| **CodeTrail Graph: 转到调用方…** | 列出光标所在方法的直接调用方，选中跳到调用处。`Ctrl+Alt+H`（macOS `Ctrl+Cmd+H`），见 11.2 |
+| **CodeTrail Graph: 转到被调方…** | 列出光标所在方法按顺序调用的方法，选中跳到调用处。`Ctrl+Alt+J`（macOS `Ctrl+Cmd+J`） |
+| **CodeTrail Graph: 转到受影响的入口…** | 列出改这个方法会影响的入口，选中跳到入口方法。`Ctrl+Alt+R`（macOS `Ctrl+Cmd+R`） |
 
 ---
 
-## 12. 设置项
+## 16. 设置项
 
 文件 → 首选项 → 设置，搜索 `codeatlas`：
 
@@ -396,18 +648,19 @@ npm run package
 |---|---|---|---|
 | `codeatlas.serverPath` | string | 空 | `codeatlas.exe` 的完整路径。留空则先用扩展自带的 `server/`，再找 `PATH`。只有你想用自己编译的服务时才需要填 |
 | `codeatlas.indexOnSave` | boolean | `true` | 保存支持的源文件后自动增量索引。关掉后只能手动索引 |
+| `codeatlas.codeLens.enabled` | boolean | `true` | 在方法上方显示 `被 N 处调用 · 调用 M 个 · 影响范围` 等 CodeLens，见 11.1 |
 
 ---
 
-## 13. 常见问题
+## 17. 常见问题
 
 **等待服务端口超时（20000ms）**
-首次启动服务时杀毒软件在扫描 `server/` 下的程序集。等几秒再右键一次即可。还不行就看输出面板 CodeAtlas 通道里 `[stderr]` 开头的行。
+首次启动服务时杀毒软件在扫描 `server/` 下的程序集。等几秒再右键一次即可。还不行就看输出面板 CodeTrail Graph 通道里 `[stderr]` 开头的行。
 
-**状态栏显示"CodeAtlas · 服务不可用"**
-命令面板 → **CodeAtlas: 重启服务**。重启后仍不可用，看输出面板 CodeAtlas 通道的错误。常见原因是本机没有 .NET 10 运行时（用 `dotnet --list-runtimes` 检查）。
+**状态栏显示"CodeTrail Graph · 服务不可用"**
+命令面板 → **CodeTrail Graph: 重启服务**。重启后仍不可用，看输出面板 CodeTrail Graph 通道的错误。常见原因是装错了平台的 VSIX（比如在 Apple 芯片的 Mac 上装了 darwin-x64 的包）。
 
-**右键菜单里没有"在 CodeAtlas 中查看"**
+**右键菜单里没有"在 CodeTrail Graph 中查看"**
 安装或更新后没有完全退出 VS Code。退出所有窗口再打开。另外这一项只在编辑器有焦点时出现，光标要在编辑器里。
 
 **提示"光标处没有已索引的符号"**
@@ -425,24 +678,25 @@ npm run package
 **自动向下展开在某个节点停了，提示"分支超过 6 个"**
 为了防止图爆炸，分支太多的节点不自动继续。双击那个节点手动展开一层，或右键 → 展开一层。
 
-**面板显示"连不上 CodeAtlas 服务"**
-服务进程挂了或还没起来。先等几秒，再用 **CodeAtlas: 重启服务**。
+**面板显示"连不上 CodeTrail Graph 服务"**
+服务进程挂了或还没起来。先等几秒，再用 **CodeTrail Graph: 重启服务**。
 
 **索引进度卡住 / 状态栏一直"索引中"**
-看输出面板 CodeAtlas 通道。索引失败时会有 `索引失败：…` 一行。用 **CodeAtlas: 索引工作区（全量重建）** 重来一次。
+看输出面板 CodeTrail Graph 通道。索引失败时会有 `索引失败：…` 一行。用 **CodeTrail Graph: 索引工作区（全量重建）** 重来一次。
 
 ---
 
-## 14. 目前不支持的
+## 18. 目前不支持的
 
-- Python / Go / Java（底座支持，还没写查询文件）。
+- Kotlin / Rust 等其他语言（底座支持，还没写查询文件）。Java 已支持（Maven / Gradle、Spring MVC / WebFlux / JAX-RS / gRPC / 定时任务 / 消息监听 / picocli），但 Gradle 版本目录、Kotlin、Lombok 生成的方法、按实参类型挑重载不支持。
+- 类型推断有边界：调用返回的泛型 `T`、lambda 参数、元组解构、Go 的多返回值第二个起、Python 未注解的参数推不出来，这些调用按名字近似解析（置信度 0.7 / 0.3）。
 - AI 解释、MCP（里程碑 4、5）。
 - Visual Studio 版（排在 VS Code 之后）。
-- 精确的 C# 语义：重载解析、泛型、扩展方法、接口方法到实现方法的边（里程碑 3，Roslyn）。
-- TSX 里的 JSX 组件引用（`<Box>`）。
-- tsconfig 的 `paths` 别名、JS 的 `require()`。
+- JS 的改名导出 `module.exports = { g: h }`、动态 `import()`、`withRouter` / `connect` 这类 HOC；`props.onX` 与箭头函数里的事件处理函数不标 event。
+- 前端接口路径作为参数透传进辅助函数、三元表达式、动态下标拼出来的写法（一个 1500 文件的前端里实测约 38 处）。
 - 事件总线、AOP、中间件管道等除 `Handler<T>` + `new T()` 之外的解耦链路。
-- macOS / Linux：VSIX 里只打包了 win-x64 的服务。
+- Alpine 等 musl 发行版没有打包。macOS 包是交叉发布的，没在真机上实测过；Linux x64 在没装 .NET 的 Ubuntu 24.04（WSL）上实测过。
+- Roslyn worker 需要 .NET 10 运行时：只装了 SDK 8 / 9 的机器上，C# 退回 tree-sitter 解析。
 - 列号按 UTF-8 字节算，含中文的行跳转时列会偏。
 
 更完整的验收数据和已知问题见 [docs/acceptance.md](acceptance.md)。

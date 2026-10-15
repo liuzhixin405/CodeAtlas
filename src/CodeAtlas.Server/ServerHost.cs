@@ -28,6 +28,13 @@ public static class ServerHost
 
         var app = builder.Build();
         app.UseCors();
+        // 索引是旧版本解析规则建的：服务一起来就全量重建。以前只有右键"在 CodeAtlas 中查看"才触发，
+        // 直接打开面板看项目地图的人会一直用着旧索引（新规则只体现在每次重算的容器图上，调用链还是旧的）
+        app.Lifetime.ApplicationStarted.Register(() =>
+        {
+            var index = app.Services.GetRequiredService<IndexService>();
+            if (index.Health() is { Files: > 0, NeedsRebuild: true }) index.TryStartIndex(full: true);
+        });
         if (!string.IsNullOrEmpty(options.Token))
         {
             // 只监听回环并不能阻止用户浏览器里的网页替用户发请求，所以用一次性 token 把调用方限定为扩展和它的页面。
@@ -89,11 +96,22 @@ public static class ServerHost
         app.MapPost("/api/arch/narrate/stop", (Narration.NarrationService n) => n.Stop());
         app.MapPost("/api/arch/narrate/resume", (Narration.NarrationService n) => n.Resume());
 
+        app.MapGet("/api/files/lens", (IndexService s, string path) => s.Lens(path));
+
         app.MapGet("/api/symbols/at", (IndexService s, string path, int line, int col) =>
             s.SymbolAt(path, line, col) is { } dto ? Results.Ok(dto) : Results.NotFound());
 
         app.MapGet("/api/symbols/{id:long}", (IndexService s, long id) =>
             s.GetSymbol(id) is { } dto ? Results.Ok(dto) : Results.NotFound());
+
+        app.MapGet("/api/symbols/{id:long}/outline", (IndexService s, long id, bool? externals, bool? tests) =>
+            s.Outline(id, new OutlineOptions(externals ?? true, tests ?? false)) is { } outline ? Results.Ok(outline) : Results.NotFound());
+
+        app.MapGet("/api/symbols/{id:long}/relations", (IndexService s, long id, int? depth, bool? tests) =>
+            s.Relations(id, new RelationsOptions(depth ?? 1, tests ?? false)) is { } relations ? Results.Ok(relations) : Results.NotFound());
+
+        app.MapGet("/api/symbols/{id:long}/impact", (IndexService s, long id, bool? entries, bool? tests) =>
+            s.Impact(id, new ImpactOptions(entries ?? true, tests ?? false)) is { } impact ? Results.Ok(impact) : Results.NotFound());
 
         app.MapGet("/api/symbols/{id:long}/neighbors", (IndexService s, long id, string? direction, string? kinds) =>
         {

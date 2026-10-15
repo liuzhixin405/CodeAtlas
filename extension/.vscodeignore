@@ -12,3 +12,4 @@ vitest.config.ts
 esbuild.mjs
 .gitignore
 **/*.pdb
+images/*.svg

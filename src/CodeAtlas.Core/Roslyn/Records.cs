@@ -28,9 +28,11 @@ public sealed record SymbolRec(
 
 /// <param name="ToIsExternal">目标不在仓库源码里（框架、第三方包），父进程记为 external 符号。</param>
 /// <param name="Via">null / handles / dispatch:T / conduit。</param>
+/// <param name="Pos">调用名在文件里的 UTF-16 字符偏移（0 起，与 Roslyn 的 SpanStart、VS Code 的 document.positionAt 一致）；null = 未知。</param>
+/// <param name="Ctx">调用所在控制结构，见 CodeAtlas.Core.Model.CallContext。</param>
 public sealed record EdgeRec(
     string FromQualifiedName, string ToQualifiedName, bool ToIsExternal, string Kind, double Confidence,
-    string Path, int Line, string? Via = null, int? EvidenceLine = null) : RoslynRecord;
+    string Path, int Line, string? Via = null, int? EvidenceLine = null, int? Pos = null, string? Ctx = null) : RoslynRecord;
 
 public sealed record DiRec(string InterfaceQualifiedName, string ImplQualifiedName, string Path, int Line, string Lifetime, bool Conditional) : RoslynRecord;
 

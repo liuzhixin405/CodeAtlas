@@ -12,7 +12,7 @@ internal static class ArchCommand
 
     public static int Run(ParsedArgs args, TextWriter stdout, TextWriter stderr)
     {
-        if (args.Positional.Count < 1) { stderr.WriteLine("用法：codeatlas arch <repo> [--db <path>] [--json] [--no-store] | --dsm <容器键> [--root <组件键>] | --entries <容器键> [--kind k] [--q 文本] | --flow <入口符号 id> [--depth N] | --narrate <container|component|flow> <键> [--force] [--facts] | --narrate-all [--flows N] [--force] [--ai-provider openai|anthropic] [--ai-endpoint <url>] [--ai-model <名>] [--ai-timeout <秒>] [--ai-concurrency N] [--ai-no-source] [--no-ai]"); return 2; }
+        if (args.Positional.Count < 1) { stderr.WriteLine("用法：codeatlas arch <repo> [--db <path>] [--json] [--no-store] [--project <外部根> …] [--no-nested] |--dsm <容器键> [--root <组件键>] | --entries <容器键> [--kind k] [--q 文本] | --flow <入口符号 id> [--depth N] | --narrate <container|component|flow> <键> [--force] [--facts] | --narrate-all [--flows N] [--force] [--ai-provider openai|anthropic] [--ai-endpoint <url>] [--ai-model <名>] [--ai-timeout <秒>] [--ai-concurrency N] [--ai-no-source] [--no-ai]"); return 2; }
         var repo = Path.GetFullPath(args.Positional[0]);
         if (!Directory.Exists(repo)) { stderr.WriteLine($"目录不存在：{repo}"); return 2; }
 
@@ -25,18 +25,20 @@ internal static class ArchCommand
         ArchModel model;
         ArchReport report;
         CodeAtlas.Server.PostProcessReport? post = null;
+        // 外部根与嵌套仓库要与 index 时一致（--project / --no-nested / .codeatlas/config.json），否则容器图与入库的文件对不上
+        var roots = CommonOptions.Roots(repo, args, stderr);
         if (args.Has("--no-store"))
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            model = ArchitectureScanner.Scan(repo);
+            model = ArchitectureScanner.Scan(roots);
             report = new ArchReport(model.Nodes.Count(n => n.Kind == ArchNodeKind.Container), model.Nodes.Count(n => n.Kind == ArchNodeKind.External), model.Edges.Count, model.Outbound.Count, 0, model.Conflicts.Count, sw.Elapsed);
         }
         else
         {
             using var db = IndexDatabase.Open(CommonOptions.DbPath(repo, args));
-            (model, report) = ArchitectureScanner.ScanAndStore(repo, db);
+            (model, report) = ArchitectureScanner.ScanAndStore(roots, db);
             // 写库时顺带识别入口、匹配路由并把对上的边升级：这样 arch 之后入口表总是新的
-            post = CodeAtlas.Server.ArchitecturePostProcess.Run(repo, db);
+            post = CodeAtlas.Server.ArchitecturePostProcess.Run(roots, db);
             model = ArchStorage.Read(db);
         }
 
@@ -146,7 +148,8 @@ internal static class ArchCommand
     private static int PrintEntries(string repo, string containerKey, ParsedArgs args, TextWriter stdout, TextWriter stderr)
     {
         using var db = IndexDatabase.Open(CommonOptions.DbPath(repo, args));
-        var container = ArchStorage.Read(db).Nodes.FirstOrDefault(n => n.Key == containerKey && n.Kind == ArchNodeKind.Container);
+        var container = ArchStorage.Read(db).Nodes.FirstOrDefault(n => n.Key == containerKey && n.Kind == ArchNodeKind.Container)
+                        ?? (containerKey == CodeAtlas.Server.DsmBuilder.RepoKey ? CodeAtlas.Server.DsmBuilder.RepoContainer(CommonOptions.Roots(repo, args, stderr)) : null);
         if (container is null) { stderr.WriteLine($"没有这个容器：{containerKey}（先跑 codeatlas index 或 codeatlas arch）"); return 2; }
         var (entries, _) = EntryStorage.Read(db);
         var reader = new IndexReader(db);
@@ -193,10 +196,12 @@ internal static class ArchCommand
         var (entries, matches) = EntryStorage.Read(db);
         var entry = entries.FirstOrDefault(e => e.SymbolId == symbolId);
         if (entry is null) { stderr.WriteLine($"没有这个入口：{symbolId}（用 --entries <容器键> 看入口清单）"); return 2; }
-        var containers = ArchStorage.Read(db).Nodes.Where(n => n.Kind == ArchNodeKind.Container).ToList();
+        var arch = ArchStorage.Read(db);
+        var containers = arch.Nodes.Where(n => n.Kind == ArchNodeKind.Container).ToList();
         var (symbols, edges) = CodeAtlas.Server.MapData.Load(new IndexReader(db));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var flow = CodeAtlas.Server.FlowBuilder.Build(symbols, edges, entry, containers, matches, entries, Math.Clamp(depth ?? CodeAtlas.Server.FlowBuilder.DefaultMaxDepth, 1, 20));
+        var flow = CodeAtlas.Server.FlowBuilder.Build(symbols, edges, entry, containers, matches, entries, Math.Clamp(depth ?? CodeAtlas.Server.FlowBuilder.DefaultMaxDepth, 1, 20),
+            outbound: arch.Outbound, externalNodes: arch.Nodes.Where(n => n.Kind == ArchNodeKind.External).ToList());
         if (args.Has("--json")) { stdout.WriteLine(JsonSerializer.Serialize(flow, Json)); return 0; }
 
         var containerName = containers.FirstOrDefault(c => c.Key == flow.ContainerKey)?.Name ?? flow.ContainerKey;
@@ -217,7 +222,7 @@ internal static class ArchCommand
         var count = n.Count > 1 ? $" ×{n.Count}" : "";
         var note = n.Note is null ? "" : $"  {n.Note}";
         var hidden = n.Kind == "more" ? $"（折叠 {n.Hidden} 个分支）" : "";
-        w.WriteLine($"{pad}{n.Label}  [{actor}]  {n.Kind}{via} {n.Confidence:F1}{count}{hidden}{note}");
+        w.WriteLine($"{pad}{n.Label}  [{actor}]  {n.Kind}{via} {n.Confidence:F2}{count}{hidden}{note}");
         foreach (var c in n.Children) PrintNode(c, indent + 1, actorLabels, w);
     }
 
@@ -227,7 +232,8 @@ internal static class ArchCommand
     private static int PrintDsm(string repo, string containerKey, string root, ParsedArgs args, TextWriter stdout, TextWriter stderr)
     {
         using var db = IndexDatabase.Open(CommonOptions.DbPath(repo, args));
-        var container = ArchStorage.Read(db).Nodes.FirstOrDefault(n => n.Key == containerKey && n.Kind == ArchNodeKind.Container);
+        var container = ArchStorage.Read(db).Nodes.FirstOrDefault(n => n.Key == containerKey && n.Kind == ArchNodeKind.Container)
+                        ?? (containerKey == CodeAtlas.Server.DsmBuilder.RepoKey ? CodeAtlas.Server.DsmBuilder.RepoContainer(CommonOptions.Roots(repo, args, stderr)) : null);
         if (container is null) { stderr.WriteLine($"没有这个容器：{containerKey}（先跑 codeatlas index 或 codeatlas arch）"); return 2; }
         var (symbols, edges) = CodeAtlas.Server.MapData.Load(new IndexReader(db));
         var git = GitStorage.Read(db);
@@ -264,7 +270,7 @@ internal static class ArchCommand
         foreach (var e in model.Edges)
         {
             var first = e.Evidence[0];
-            w.WriteLine($"  {names.GetValueOrDefault(e.FromKey, e.FromKey),-28} → {names.GetValueOrDefault(e.ToKey, e.ToKey),-28} {e.Protocol,-14} {e.Confidence:F1} {e.Source,-10} {first.File}{(first.Line is { } l ? ":" + l : "")}{(e.ConfigKey is null ? "" : "  配置 " + e.ConfigKey)}{(e.Url is null ? "" : "  " + e.Url)}");
+            w.WriteLine($"  {names.GetValueOrDefault(e.FromKey, e.FromKey),-28} → {names.GetValueOrDefault(e.ToKey, e.ToKey),-28} {e.Protocol,-14} {e.Confidence:F2} {e.Source,-10} {first.File}{(first.Line is { } l ? ":" + l : "")}{(e.ConfigKey is null ? "" : "  配置 " + e.ConfigKey)}{(e.Url is null ? "" : "  " + e.Url)}");
         }
         if (model.Conflicts.Count > 0)
         {

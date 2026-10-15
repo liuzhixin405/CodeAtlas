@@ -1,15 +1,19 @@
-# CodeAtlas for VS Code
+# CodeTrail Graph for VS Code
 
-点开一个符号，看它调了谁、被谁调、实现了什么，沿调用链向下走到底、向上追到入口。支持 TypeScript / TSX / JavaScript / C#。所有数据都在本机。
+点开一个符号，看它调了谁、被谁调、实现了什么，沿调用链向下走到底、向上追到入口。支持 TypeScript / TSX / JavaScript / C# / Go / Python / Java。所有数据都在本机。
 
-完整指南见仓库 `docs/vscode-extension-guide.md`。
+基于 [CodeAtlas](https://github.com/liuzhixin405/CodeAtlas) 的 VS Code 扩展。市场品牌为 **CodeTrail Graph**；为兼容已有工作区，命令 / 设置仍使用 `codeatlas.*`，索引目录仍为 `.codeatlas`，后端程序仍为 `codeatlas`。
+
+[完整使用指南](https://github.com/liuzhixin405/CodeAtlas/blob/main/docs/vscode-extension-guide.md) · [构建与发布指南](https://github.com/liuzhixin405/CodeAtlas/blob/main/docs/vscode-extension-publishing.md)
 
 ## 安装
 
-前提：Windows x64、VS Code ≥ 1.100、本机已安装 .NET 10 运行时（`dotnet --list-runtimes` 里要有 `Microsoft.NETCore.App 10.x`）。
+前提：VS Code ≥ 1.100；按系统装对应平台的包：Windows x64、Linux x64 / arm64、macOS x64 / arm64。**不需要装 .NET**，服务自带运行时。只有 C# 项目想要 Roslyn 精确语义时，才需要 .NET 10 SDK；没有时 C# 用 tree-sitter 解析，首次索引时提示一次。
+
+发布到 Marketplace 后，在扩展视图搜索 **CodeTrail Graph** 安装；完整扩展 ID 为 `<publisher>.codetrail-graph`，以实际发布者 ID 为准。离线安装示例（Windows x64）：
 
 ```bash
-code --install-extension codeatlas-0.1.0.vsix --force
+code --install-extension codetrail-graph-win32-x64-0.1.0.vsix --force
 ```
 
 装完**完全退出并重新打开 VS Code**。更新时也必须先完全退出，否则服务文件被占用，安装会报 `EPERM`。
@@ -17,8 +21,8 @@ code --install-extension codeatlas-0.1.0.vsix --force
 ## 三步上手
 
 1. 用 VS Code 打开一个仓库。
-2. 把光标放到方法名或类名上，右键 → **在 CodeAtlas 中查看**（或 `Ctrl+Alt+G`）。
-3. 首次会提示"这个工作区还没有 CodeAtlas 索引"，点 **建立索引**（ccs-backend 规模约 40 秒）。索引完成后面板在右侧打开并聚焦到该符号。
+2. 把光标放到方法名或类名上，右键 → **在 CodeTrail Graph 中查看**（或 `Ctrl+Alt+G`）。
+3. 首次会提示"这个工作区还没有 CodeTrail Graph 索引"，点 **建立索引**（四五千个文件的仓库约 40 秒）。索引完成后面板在右侧打开并聚焦到该符号。
 
 ## 功能一览
 
@@ -28,9 +32,30 @@ code --install-extension codeatlas-0.1.0.vsix --force
 - **右键节点**：设为焦点 / 展开一层 / 折叠邻居 / 从图中隐藏 / 在编辑器中打开。
 - **工具栏开关**（默认都关）：**类型引用**、**测试代码**、**分发细节**。
 - **搜索框**：按名字前缀搜，多个词用空格；**面包屑**：焦点历史。
+- **调用大纲**（活动栏 CodeTrail Graph 图标）：光标所在方法按源码顺序调了什么，逐层展开；标出循环内 / 条件内 / 回调里的调用，单击跳到调用处，可固定、可隐藏框架调用。详见 `docs/vscode-extension-guide.md` 第 9 节。
+- **影响范围**（同一活动栏，调用大纲下面）：反过来看"改它会影响谁"——光标所在方法的直接调用方（经接口 / 经分派 / 构造、×N、所在控制结构）逐层往上展开，以及最终走到的入口（按容器分组，如 `HTTP POST /api/orders`）；测试调用方默认只计数。与调用大纲共用一次光标解析，固定各管各的。详见第 10 节。
+- **快速跳转**：方法上方的 CodeLens `被 N 处调用 · 调用 M 个 · 影响范围`（`没有调用方` 帮助发现死代码），点开列出调用方 / 被调方并跳转；命令「转到调用方… / 转到被调方… / 转到受影响的入口…」（`Ctrl+Alt+H / J / R`，macOS `Ctrl+Cmd+H / J / R`），跳转可用 `Alt+←` 退回；面板调用图可勾「跟随光标」。设置 `codeatlas.codeLens.enabled` 可关掉 CodeLens。详见第 11 节。
+- **模块关系**：面板顶部「调用图 | 模块关系 | 项目地图」的第二种模式，以类为中心画类与类之间的依赖，按组件分框、从左到右按依赖顺序排，反向依赖标红；编辑器右键「在 CodeTrail Graph 模块关系中查看」或侧边栏标题栏按钮打开。详见使用指南第 12 节。
 - **项目地图**：按命名空间 / 目录聚合的模块图，节点大小按符号数，边粗细按依赖数，橙色边含分发；双击模块钻入，双击类型切回调用图。
-- **索引**：保存 `.ts/.tsx/.js/.jsx/.cs` 等文件后自动增量索引（设置 `codeatlas.indexOnSave`）；面板 **⟳ 索引** 按钮或命令面板"CodeAtlas: 索引工作区（增量 / 全量重建）"手动触发。索引库在 `<仓库>/.codeatlas/index.db`，**请加入 `.gitignore`**。
-- **服务**：由扩展自动管理，查找顺序 扩展自带 `server/` → 设置 `codeatlas.serverPath` → `PATH`。日志在输出面板 **CodeAtlas** 通道。
+- **索引**：保存 `.ts/.tsx/.js/.jsx/.cs` 等文件后自动增量索引（设置 `codeatlas.indexOnSave`）；面板 **⟳ 索引** 按钮或命令面板"CodeTrail Graph: 索引工作区（增量 / 全量重建）"手动触发。索引库在 `<仓库>/.codeatlas/index.db`，**请加入 `.gitignore`**。
+- **服务**：由扩展自动管理，查找顺序 扩展自带 `server/` → 设置 `codeatlas.serverPath` → `PATH`。日志在输出面板 **CodeTrail Graph** 通道。
+
+## 多项目
+
+一个服务、一个索引库可以同时覆盖好几个目录，前端里的 `fetch('/api/...')` 才能连到另一个仓库里的后端控制器，容器图、DSM、入口流程也都带上它们。
+
+- **嵌套仓库默认纳入**：工作区里带自己 `.git` 目录的子仓库（独立克隆，例如 `shop-api/payment-gateway/`）和子模块一起索引，各自的 `.sln` 也各跑一次 Roslyn。git worktree（`.git` 是指向 `…/worktrees/…` 的文件，比如 `.claude/worktrees/*`）是本仓库的副本，**总是跳过**，不会重复。不想要嵌套仓库时把 `codeatlas.includeNestedRepos` 设为 `false`（服务以 `--no-nested` 启动）。
+- **多根工作区**：第一个文件夹是主根，其余文件夹自动作为外部项目一起索引（不用另配）。命令和面板都作用于主根的服务；在任何一个文件夹里右键"在 CodeTrail Graph 中查看"都能定位。
+- **仓库外的目录**：设置 `codeatlas.projects`（字符串数组，相对第一个文件夹或绝对路径），例如只打开前端 `shop-web` 时写 `["../shop-api"]`。也可以写进仓库的 `.codeatlas/config.json`：`{"projects": ["../shop-api"]}`，命令行 `codeatlas index` 同样认。
+- **自动检测旁边的后端**：单独打开一个前端仓库（3 层内的 `package.json` 依赖里有 `next` / `react` / `vue` / `@angular/core` / `vite`，2 层内没有 `*.sln` / `*.slnx`），且没配 `codeatlas.projects`、`.codeatlas/config.json` 也没写、不是多根工作区时，第一次启动服务会看一眼上级目录（根下有 `*.sln` / `*.slnx` 就只提它）或同级目录（根下有解决方案的，最多 3 个），提示一次"是否一起索引"。选"一起索引"会把相对路径（如 `".."`）写进工作区设置 `codeatlas.projects`（单文件夹工作区即 `.vscode/settings.json`），服务重启并全量重建（含 Roslyn，约 2–3 分钟）；选"不用"或"一起索引"后本工作区不再询问，直接关掉通知则下次会话再问。
+- 外部目录的文件以**相对主根**的路径入库，例如 `../shop-api/Acme.Shop.Api/Controllers/FooController.cs`，容器键也是这样的路径。目录互相包含（主根是 `shop-api/web`、外部目录是 `shop-api`）时按真实路径去重，同一个文件只入库一次。
+- 外部目录暂时不存在（盘没挂、改了名）时输出面板提示一次，之前入库的文件保留；从设置里去掉它，下次索引才删。
+- 改 `codeatlas.projects`、`codeatlas.includeNestedRepos` 或增删工作区文件夹，服务自动重启并跑一次增量索引；新加的外部目录要跑 Roslyn 就点一次"索引工作区（全量重建）"。
+
+| 设置 | 默认 | 说明 |
+| --- | --- | --- |
+| `codeatlas.projects` | `[]` | 一起索引的其他目录（相对第一个文件夹或绝对路径） |
+| `codeatlas.includeNestedRepos` | `true` | 是否索引带独立 `.git` 的子仓库与子模块；worktree 总是跳过 |
 
 ## AI 叙述（本地或联网）
 
@@ -45,7 +70,7 @@ code --install-extension codeatlas-0.1.0.vsix --force
 
 ### 选服务
 
-命令面板 → **CodeAtlas: 选择 AI 服务**，从预设里挑一个，会一次写好协议、端点和模型（默认写到用户设置；如果当前工作区已经覆盖了这几项，就写到工作区设置）。预设里的模型名只是默认值，可在设置 `codeatlas.ai.model` 里改。
+命令面板 → **CodeTrail Graph: 选择 AI 服务**，从预设里挑一个，会一次写好协议、端点和模型（默认写到用户设置；如果当前工作区已经覆盖了这几项，就写到工作区设置）。预设里的模型名只是默认值，可在设置 `codeatlas.ai.model` 里改。
 
 | 预设 | 协议 | 端点 | 默认模型 |
 | --- | --- | --- | --- |
@@ -60,7 +85,7 @@ code --install-extension codeatlas-0.1.0.vsix --force
 
 ### 设 API Key
 
-联网预设选完如果还没有 key，会紧接着弹出密码输入框。之后也可以用 **CodeAtlas: 设置 AI API Key** / **CodeAtlas: 清除 AI API Key**。key 存在 **VS Code SecretStorage**（系统凭据库），**不进 settings.json**；按"协议 + 端点主机"分别保存，切换服务不用重输。启动服务时 key 只经环境变量 `CODEATLAS_AI_API_KEY` 传给服务进程，不出现在命令行参数和日志里（CI 等场景也可以直接在外部环境里设这个变量，扩展里没存 key 时沿用它）。叙述卡上没 key 会提示"未设置 API Key"，key 无效（HTTP 401/403）时卡上有 **设置 API Key** 按钮。
+联网预设选完如果还没有 key，会紧接着弹出密码输入框。之后也可以用 **CodeTrail Graph: 设置 AI API Key** / **CodeTrail Graph: 清除 AI API Key**。key 存在 **VS Code SecretStorage**（系统凭据库），**不进 settings.json**；按"协议 + 端点主机"分别保存，切换服务不用重输。启动服务时 key 只经环境变量 `CODEATLAS_AI_API_KEY` 传给服务进程，不出现在命令行参数和日志里（CI 等场景也可以直接在外部环境里设这个变量，扩展里没存 key 时沿用它）。叙述卡上没 key 会提示"未设置 API Key"，key 无效（HTTP 401/403）时卡上有 **设置 API Key** 按钮。
 
 ### 发送了什么
 
@@ -86,9 +111,9 @@ code --install-extension codeatlas-0.1.0.vsix --force
 ## 常见问题
 
 - **等待服务端口超时**：首次启动被杀毒扫描拖慢，等几秒再右键一次。
-- **服务不可用**：命令面板 → **CodeAtlas: 重启服务**；看输出面板 CodeAtlas 通道。确认已装 .NET 10 运行时。
+- **服务不可用**：命令面板 → **CodeTrail Graph: 重启服务**；看输出面板 CodeTrail Graph 通道。确认装的是本机平台的包。
 - **右键菜单里没有该项**：没有完全退出 VS Code，退出所有窗口再打开。
 - **链条在某处断了**：可能是未识别的解耦模式，请把方法名反馈给维护者。
 - **"N 个可能目标"里几十个候选**：tree-sitter 按名字解析的固有限制，Roslyn 版本（里程碑 3）会消除。
 
-目前不支持：Python / Go / Java、调用图里的 AI 解释、Visual Studio 版、JSX 组件引用、tsconfig `paths` 别名。
+目前不支持：Java 等其他语言、Visual Studio 版、Alpine 等 musl 发行版、JS 的 `require()`、作为属性传出去的事件处理函数。

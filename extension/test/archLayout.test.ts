@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ArchColWidth, ArchRowHeight, layerOf, layoutArch } from "../webview/archLayout";
+import { ArchColWidth, ArchRowHeight, layerOf, layoutArch, SubKindLabels } from "../webview/archLayout";
 import type { ArchDto, ArchNodeDto } from "../webview/types";
 
 function node(key: string, kind: string, subKind: string, over: Partial<ArchNodeDto> = {}): ArchNodeDto {
@@ -85,5 +85,14 @@ describe("layoutArch", () => {
     const b = layoutArch(shuffled);
     expect(a.nodes.map((n) => [n.data.id, n.position.x, n.position.y])).toEqual(b.nodes.map((n) => [n.data.id, n.position.x, n.position.y]));
     expect(a.edges.map((e) => e.data.id)).toEqual(b.edges.map((e) => e.data.id));
+  });
+});
+
+describe("SubKindLabels", () => {
+  it("covers every subKind the architecture layer emits (incl. Go / Python / Node services)", () => {
+    // 与 src/CodeAtlas.Core/Architecture 里出现的 SubKind 取值同步；漏一个页面就显示英文原名
+    const emitted = ["dotnet-web", "dotnet-worker", "dotnet-exe", "go-service", "python-service", "node-service", "java-service", "service-registry", "config-center", "frontend",
+      "database", "cache", "broker", "storage", "observability", "email", "identity", "http-service", "grpc-service", "native-sdk"];
+    expect(emitted.filter((k) => !(k in SubKindLabels))).toEqual([]);
   });
 });

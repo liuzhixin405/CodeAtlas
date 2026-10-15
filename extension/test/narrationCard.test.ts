@@ -149,10 +149,10 @@ describe("service line and API key hints", () => {
   it("unavailable without a key shows the command hint; 401/403 errors get the same command appended", () => {
     const u = dto({ status: "unavailable", error: "端点要求 API Key" });
     expect(describeStatus(u, status({ ...deepseek, hasApiKey: false }))).toBe(ApiKeyHint);
-    expect(ApiKeyHint).toBe("未设置 API Key（命令面板：CodeAtlas: 设置 AI API Key）");
+    expect(ApiKeyHint).toBe("未设置 API Key（命令面板：CodeTrail Graph: 设置 AI API Key）");
     expect(describeStatus(dto({ status: "unavailable", error: "API Key 无效或没有权限（HTTP 401）" }), status({ ...deepseek, hasApiKey: true })))
-      .toBe("API Key 无效或没有权限（HTTP 401）（命令面板：CodeAtlas: 设置 AI API Key）");
-    expect(describeStatus(dto({ status: "failed", error: "HTTP 403" }), status(deepseek))).toBe("生成失败：HTTP 403（命令面板：CodeAtlas: 设置 AI API Key）");
+      .toBe("API Key 无效或没有权限（HTTP 401）（命令面板：CodeTrail Graph: 设置 AI API Key）");
+    expect(describeStatus(dto({ status: "failed", error: "HTTP 403" }), status(deepseek))).toBe("生成失败：HTTP 403（命令面板：CodeTrail Graph: 设置 AI API Key）");
     // 连不上优先于缺 key
     expect(describeStatus(u, status({ ...deepseek, hasApiKey: false, reachable: false }))).toBe("端点连不上：https://api.deepseek.com/v1");
   });

@@ -2,8 +2,12 @@
 (invocation_expression function: (generic_name (identifier) @ref.calls))
 (invocation_expression function: (member_access_expression name: (identifier) @ref.calls))
 (invocation_expression function: (member_access_expression name: (generic_name (identifier) @ref.calls)))
+(invocation_expression function: (conditional_access_expression (member_binding_expression name: (identifier) @ref.calls)))
+(invocation_expression function: (conditional_access_expression (member_binding_expression name: (generic_name (identifier) @ref.calls))))
 (object_creation_expression type: (identifier) @ref.calls)
 (object_creation_expression type: (generic_name (identifier) @ref.calls))
+(object_creation_expression type: (qualified_name) @ref.calls)
+(implicit_object_creation_expression) @ref.calls
 (base_list (identifier) @ref.inherits)
 (base_list (generic_name (identifier) @ref.inherits))
 (base_list (generic_name (identifier) (type_argument_list . (identifier) @ref.handles)))

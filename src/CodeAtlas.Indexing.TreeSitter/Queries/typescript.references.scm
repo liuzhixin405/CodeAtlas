@@ -1,9 +1,23 @@
 (call_expression function: (identifier) @ref.calls)
 (call_expression function: (member_expression property: (property_identifier) @ref.calls))
+; this.#m()
+(call_expression function: (member_expression property: (private_property_identifier) @ref.calls))
 (new_expression constructor: (identifier) @ref.calls)
+; await f<T>(…) / await a.b<T>(…)：带类型实参时 tree-sitter 把 await 解析进了 function 位置
+(call_expression function: (await_expression (identifier) @ref.calls))
+(call_expression function: (await_expression (member_expression property: (property_identifier) @ref.calls)))
 (extends_clause value: (identifier) @ref.inherits)
 (implements_clause (type_identifier) @ref.implements)
+(implements_clause (generic_type name: (type_identifier) @ref.implements))
 (extends_type_clause type: (type_identifier) @ref.inherits)
 (type_annotation (type_identifier) @ref.references)
 (generic_type name: (type_identifier) @ref.references)
 (import_statement source: (string (string_fragment) @ref.imports))
+(export_statement source: (string (string_fragment) @ref.imports))
+; CommonJS：require('m') 是 import（require 这个调用本身由适配器丢掉）
+((call_expression function: (identifier) @_f arguments: (arguments . (string (string_fragment) @ref.imports))) (#eq? @_f "require"))
+; const X = memo(Y) / forwardRef(Y) / observer(Y)（可带 as …）：X 渲染 Y
+((program (lexical_declaration (variable_declarator value: (call_expression function: (_) @_w arguments: (arguments . (identifier) @ref.render .))))) (#match? @_w "^((React\\.)?(memo|forwardRef)|observer)$"))
+((program (export_statement (lexical_declaration (variable_declarator value: (call_expression function: (_) @_w arguments: (arguments . (identifier) @ref.render .)))))) (#match? @_w "^((React\\.)?(memo|forwardRef)|observer)$"))
+((program (lexical_declaration (variable_declarator value: (as_expression (call_expression function: (_) @_w arguments: (arguments . (identifier) @ref.render .)))))) (#match? @_w "^((React\\.)?(memo|forwardRef)|observer)$"))
+((program (export_statement (lexical_declaration (variable_declarator value: (as_expression (call_expression function: (_) @_w arguments: (arguments . (identifier) @ref.render .))))))) (#match? @_w "^((React\\.)?(memo|forwardRef)|observer)$"))

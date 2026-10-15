@@ -68,8 +68,8 @@ export function formatTime(iso: string | null): string {
 }
 
 /** 叙述卡上提示设置 key 的固定文案。 */
-export const ApiKeyHint = "未设置 API Key（命令面板：CodeAtlas: 设置 AI API Key）";
-const ApiKeyCommandHint = "（命令面板：CodeAtlas: 设置 AI API Key）";
+export const ApiKeyHint = "未设置 API Key（命令面板：CodeTrail Graph: 设置 AI API Key）";
+const ApiKeyCommandHint = "（命令面板：CodeTrail Graph: 设置 AI API Key）";
 
 /** 当前服务：「DeepSeek · deepseek-chat」；回环端点显示「本地 · 模型」，未知主机显示主机名。 */
 export function describeService(status: NarrationStatusDto | null): string {
@@ -380,7 +380,7 @@ export class NarrationCard {
       const keyBtn = document.createElement("button");
       keyBtn.className = "secondary nc-retry";
       keyBtn.textContent = "设置 API Key";
-      keyBtn.title = "运行「CodeAtlas: 设置 AI API Key」；保存后服务自动重启";
+      keyBtn.title = "运行「CodeTrail Graph: 设置 AI API Key」；保存后服务自动重启";
       keyBtn.onclick = () => this.cb.runCommand("codeatlas.ai.setApiKey");
       status.appendChild(keyBtn);
     }
@@ -487,7 +487,7 @@ export class NarrationCard {
       t.textContent = ApiKeyHint;
       const a = document.createElement("a");
       a.textContent = "设置";
-      a.title = "运行「CodeAtlas: 设置 AI API Key」";
+      a.title = "运行「CodeTrail Graph: 设置 AI API Key」";
       a.onclick = () => this.cb.runCommand("codeatlas.ai.setApiKey");
       hint.append(t, a);
       foot.appendChild(hint);

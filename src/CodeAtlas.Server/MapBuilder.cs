@@ -5,22 +5,33 @@ namespace CodeAtlas.Server;
 /// <summary>地图聚合用的轻量符号。行号与可见性给入口识别与流程用，聚合视图不看。</summary>
 public sealed record MapSymbol(long Id, SymbolKind Kind, string QualifiedName, string Path, long? ParentId, int StartLine = 0, int EndLine = 0, string? Visibility = null)
 {
-    /// <summary>短名：去掉 external: 前缀、参数列表、泛型参数，取最后一段。</summary>
+    /// <summary>
+    /// 短名：模块取文件名（page.tsx）；其余去掉 external: 前缀与脚本限定名的 "路径:" 前缀（路径里的 (group)、[param]、扩展名的点
+    /// 不能参与切分），再去掉参数列表、泛型参数，取最后一段。
+    /// </summary>
     public string Name
     {
         get
         {
+            if (Kind == SymbolKind.Module) return FileName(QualifiedName);
             var q = QualifiedName.StartsWith("external:", StringComparison.Ordinal) ? QualifiedName["external:".Length..] : QualifiedName;
+            var colon = q.IndexOf(':');
+            if (colon > 0 && IsScriptPath(q[..colon])) q = q[(colon + 1)..];
             var paren = q.IndexOf('(');
             if (paren >= 0) q = q[..paren];
-            var generic = q.IndexOf('<');
-            if (generic >= 0) q = q[..generic];
-            return MapBuilder.LastSegment(q);
+            // 泛型参数可能在中间：Roslyn 给泛型类成员的限定名是 Ns.Repo<T>.Find，从第一个 < 截断会得到类名
+            return MapBuilder.LastSegment(MapBuilder.StripGenericArgs(q));
         }
     }
+
+    private static readonly string[] ScriptExtensions = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"];
+
+    private static bool IsScriptPath(string path) => ScriptExtensions.Any(e => path.EndsWith(e, StringComparison.OrdinalIgnoreCase));
+
+    internal static string FileName(string path) => path.Contains('/') ? path[(path.LastIndexOf('/') + 1)..] : path;
 }
 
-/// <param name="Via">dispatches 边的来历：handles / dispatch:T / conduit；其他边为 null。命名空间地图不用，管道视图用。</param>
+/// <param name="Via">边的来历：dispatches 的 handles / dispatch:T，calls 的 conduit / impl / render（JSX 渲染组件）；普通边为 null。命名空间地图不用，管道视图与流程用。</param>
 public sealed record MapEdge(long FromId, long ToId, EdgeKind Kind, double Confidence = 1.0, string? Via = null);
 
 /// <param name="Key">分组键：命名空间（Acme.Api）、目录（src/app）或类型限定名。</param>
@@ -41,17 +52,56 @@ public static class MapBuilder
     private static readonly HashSet<EdgeKind> DependencyKinds = [EdgeKind.Calls, EdgeKind.Dispatches, EdgeKind.Implements, EdgeKind.Inherits, EdgeKind.References];
     private static readonly HashSet<SymbolKind> TypeKinds = [SymbolKind.Class, SymbolKind.Interface, SymbolKind.Struct, SymbolKind.Enum];
 
-    /// <summary>每个符号的分组键。external 不参与。</summary>
+    /// <summary>每个符号的分组键：C# 命名空间、Java 包、其余目录。external 不参与。</summary>
     public static Dictionary<long, string> GroupKeys(IReadOnlyList<MapSymbol> symbols)
     {
         var byId = symbols.ToDictionary(s => s.Id);
         var keys = new Dictionary<long, string>();
+        Dictionary<string, string>? javaFilePackages = null;
         foreach (var s in symbols)
         {
             if (s.Kind == SymbolKind.External) continue;
+            if (IsJava(s))
+            {
+                javaFilePackages ??= JavaFilePackages(symbols, byId);
+                keys[s.Id] = JavaPackageOf(s, byId) ?? javaFilePackages.GetValueOrDefault(s.Path) ?? JavaPackageFromPath(s.Path);
+                continue;
+            }
             keys[s.Id] = IsCSharp(s) ? NamespaceOf(s, byId) : DirectoryOf(s.Path);
         }
         return keys;
+    }
+
+    internal static bool IsJava(MapSymbol s) => s.Path.EndsWith(".java", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Java 符号的包：最外层类型的限定名（&lt;package&gt;.&lt;Type&gt;）去掉类型名；嵌套类、方法、字段都归外层类型的包。不在类型里（模块）→ null。</summary>
+    private static string? JavaPackageOf(MapSymbol s, Dictionary<long, MapSymbol> byId)
+    {
+        if (TypeAncestor(s, byId) is not { } type) return null;
+        var q = type.QualifiedName;
+        var cut = q.IndexOfAny(['<', '(']);
+        if (cut >= 0) q = q[..cut];
+        var dot = q.LastIndexOf('.');
+        return dot < 0 ? "" : q[..dot];
+    }
+
+    /// <summary>每个 .java 文件里类型的包（模块符号用）：取文件里第一个顶层类型的。</summary>
+    private static Dictionary<string, string> JavaFilePackages(IReadOnlyList<MapSymbol> symbols, Dictionary<long, MapSymbol> byId)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var s in symbols.Where(s => TypeKinds.Contains(s.Kind) && IsJava(s)).OrderBy(s => s.StartLine))
+            if (!map.ContainsKey(s.Path) && JavaPackageOf(s, byId) is { } p) map[s.Path] = p;
+        return map;
+    }
+
+    /// <summary>没有类型的 Java 文件（package-info.java）：src/main/java/ 之类的源码根（最后一个 /java/ 段）之后的目录按 '.' 连起来；找不到源码根退回目录。</summary>
+    private static string JavaPackageFromPath(string path)
+    {
+        var p = "/" + path.Replace('\\', '/');
+        var root = p.LastIndexOf("/java/", StringComparison.Ordinal);
+        if (root < 0) return DirectoryOf(path);
+        var rest = DirectoryOf(p[(root + "/java/".Length)..]);
+        return rest.Replace('/', '.');
     }
 
     public static MapDto Build(IReadOnlyList<MapSymbol> symbols, IReadOnlyList<MapEdge> edges, string root)
@@ -92,7 +142,7 @@ public static class MapBuilder
 
         var groups = new List<MapGroupDto>();
         foreach (var (key, g) in subGroups)
-            groups.Add(new MapGroupDto(key, LastSegment(key), g.Symbols.Count, g.Files.Count, g.HasChildren, null));
+            groups.Add(new MapGroupDto(key, KeyLabel(key), g.Symbols.Count, g.Files.Count, g.HasChildren, null));
         foreach (var (key, t) in typeNodes)
             groups.Add(new MapGroupDto(key, LastSegment(key), t.Symbols.Count, t.Files.Count, false, t.Type.Id));
         groups.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
@@ -138,7 +188,10 @@ public static class MapBuilder
         return i < 0 ? "" : p[..i];
     }
 
-    /// <summary>key 在 root 之下时，返回 root 下一层的键；否则 null。'.' 与 '/' 都算分隔符（C# 项目目录里可能放着前端目录）。</summary>
+    /// <summary>
+    /// key 在 root 之下时，返回 root 下一层的键；否则 null。'.' 与 '/' 都算分隔符（C# 项目目录里可能放着前端目录：Acme.Web/ClientApp）；
+    /// 但第一个 '/' 之后只按 '/' 切——那是目录名，Go / Python 的包目录名里可能有点（src/pkg/v1.2），不能切成 v1 下的 2。
+    /// </summary>
     internal static string? ChildKey(string root, string key)
     {
         if (key.Length == 0) return null;
@@ -149,18 +202,58 @@ public static class MapBuilder
         }
         if (!key.StartsWith(root, StringComparison.Ordinal) || key.Length <= root.Length) return null;
         var sepChar = key[root.Length];
-        if (sepChar != '.' && sepChar != '/') return null;
+        if (sepChar != '/' && (sepChar != '.' || !IsDotSeparator(key, root.Length))) return null;
         var next = FirstSeparator(key, root.Length + 1);
         return next < 0 ? key : key[..next];
     }
 
     private static int FirstSeparator(string key, int start)
     {
-        var dot = key.IndexOf('.', start);
         var slash = key.IndexOf('/', start);
-        if (dot < 0) return slash;
+        var dot = key.IndexOf('.', start);
+        if (dot < 0 || !IsDotSeparator(key, dot)) return slash;
         if (slash < 0) return dot;
         return Math.Min(dot, slash);
+    }
+
+    /// <summary>按 ChildKey 同一判据切段：'/' 总是分隔符，'.' 只在第一个 '/' 之前算。</summary>
+    internal static string[] KeySegments(string key)
+    {
+        if (key.Length == 0) return [];
+        var slash = key.IndexOf('/');
+        if (slash < 0) return key.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        var head = key[..slash].Split('.', StringSplitOptions.RemoveEmptyEntries);
+        var tail = key[(slash + 1)..].Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return [.. head, .. tail];
+    }
+
+    /// <summary>key[index] 处的 '.' 是否分隔符：在第一个 '/' 之前才是（命名空间 / 项目目录名），之后是目录名的一部分。</summary>
+    private static bool IsDotSeparator(string key, int index)
+    {
+        var slash = key.IndexOf('/');
+        return slash < 0 || index < slash;
+    }
+
+    /// <summary>组键的显示名：目录键（含 '/'）取最后一个目录名（v1.2 原样），命名空间取最后一段。</summary>
+    internal static string KeyLabel(string key)
+    {
+        var slash = key.LastIndexOf('/');
+        return slash < 0 ? LastSegment(key) : key[(slash + 1)..];
+    }
+
+    /// <summary>去掉所有成对的 &lt;…&gt;（可嵌套）：Ns.Repo&lt;T&gt;.Find → Ns.Repo.Find，Dictionary&lt;string, List&lt;int&gt;&gt; → Dictionary。</summary>
+    internal static string StripGenericArgs(string name)
+    {
+        if (name.IndexOf('<') < 0) return name;
+        var sb = new System.Text.StringBuilder(name.Length);
+        var depth = 0;
+        foreach (var c in name)
+        {
+            if (c == '<') depth++;
+            else if (c == '>' && depth > 0) depth--;
+            else if (depth == 0) sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     internal static string LastSegment(string key)

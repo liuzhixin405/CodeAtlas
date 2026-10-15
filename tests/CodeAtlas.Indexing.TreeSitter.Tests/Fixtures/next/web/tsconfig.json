@@ -1,0 +1,7 @@
+{
+  // JSONC：注释与尾逗号都要能读
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "paths": { "@/*": ["./src/*"], },
+  },
+}

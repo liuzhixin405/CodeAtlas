@@ -1,4 +1,4 @@
-using CodeAtlas.Core.Resolution;
+﻿using CodeAtlas.Core.Resolution;
 using CodeAtlas.Core.Storage;
 using CodeAtlas.Indexing.TreeSitter;
 using CodeAtlas.Indexing.TreeSitter.Adapters;
@@ -20,9 +20,11 @@ public sealed class ServerFixture : IAsyncLifetime
         Directory.CreateDirectory(Path.Combine(Repo, "src", "util"));
         File.WriteAllText(Path.Combine(Repo, "src", "util", "format.ts"), "export function helper(id: number): string { return String(id); }\n");
         File.WriteAllText(Path.Combine(Repo, "src", "svc.ts"), "import { helper } from './util/format';\nexport class Svc {\n  find(id: number): string { return helper(id); }\n}\n");
-        File.WriteAllText(Path.Combine(Repo, "src", "app.ts"), "import { Svc } from './svc';\nexport function main(): void { new Svc().find(1); fetch('x'); helper2(); }\n");
-        File.WriteAllText(Path.Combine(Repo, "src", "dup1.ts"), "export function helper2(): void {}\n");
-        File.WriteAllText(Path.Combine(Repo, "src", "dup2.ts"), "export function helper2(): void {}\n");
+        // util.helper2()：接收者类型未知、两个 import 进来的文件里都有 helper2 方法 → 多候选（各 0.3）。
+        // 裸调用 helper2() 没有 import 绑定，现在按全局函数算 external，不再按全仓同名去猜，所以多候选要靠 import 范围造出来
+        File.WriteAllText(Path.Combine(Repo, "src", "app.ts"), "import { Svc } from './svc'; import './dup1'; import './dup2';\nexport function main(): void { new Svc().find(1); fetch('x'); util.helper2(); }\n");
+        File.WriteAllText(Path.Combine(Repo, "src", "dup1.ts"), "export class Dup1 { helper2(): void {} }\n");
+        File.WriteAllText(Path.Combine(Repo, "src", "dup2.ts"), "export class Dup2 { helper2(): void {} }\n");
 
         using (var db = IndexDatabase.Open(DbPath))
         {

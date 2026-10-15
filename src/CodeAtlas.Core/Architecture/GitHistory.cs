@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using CodeAtlas.Core.Workspace;
 
 namespace CodeAtlas.Core.Architecture;
 
@@ -96,45 +97,41 @@ public static class GitHistory
         return new GitHistoryResult(stats, coupling, commits, skipped, null);
     }
 
-    /// <summary>在 root 与其下的嵌套仓库各跑一次 git log；git 不可用时返回 Error。</summary>
+    /// <summary>在 root 与其下的嵌套仓库各跑一次 git log；git 不可用时返回 Error。nestedRepoDirs 为 null 时自动找（跳过 worktree）。</summary>
     public static GitHistoryResult Run(string root, IEnumerable<string>? nestedRepoDirs = null, TimeSpan? timeout = null)
+    {
+        if (nestedRepoDirs is null) return Run(ProjectRoots.Single(root), timeout);
+        var targets = new List<(string Dir, string Prefix, bool IsMain)> { (root, "", true) };
+        foreach (var d in nestedRepoDirs) targets.Add((Path.Combine(root, d.Replace('/', Path.DirectorySeparatorChar)), d.TrimEnd('/') + "/", false));
+        return RunTargets(targets, timeout);
+    }
+
+    /// <summary>
+    /// 多根：主根、外部根与它们之下被纳入的嵌套仓库各跑一次 git log，路径加上相对主根的前缀（外部根是 ../other/）。
+    /// 主根拿不到历史时整体返回 Error；其他仓库失败只跳过。
+    /// </summary>
+    public static GitHistoryResult Run(ProjectRoots roots, TimeSpan? timeout = null) =>
+        RunTargets(roots.Repositories().Select(r => (r.FullPath, r.Prefix, IsMain: r.Prefix.Length == 0)).ToList(), timeout);
+
+    private static GitHistoryResult RunTargets(IReadOnlyList<(string Dir, string Prefix, bool IsMain)> targets, TimeSpan? timeout)
     {
         var all = new List<GitFileStats>();
         var coupling = new List<GitCoupling>();
         var commits = 0;
         var skipped = 0;
-        var targets = new List<(string Dir, string Prefix)> { (root, "") };
-        foreach (var d in nestedRepoDirs ?? FindNestedRepos(root)) targets.Add((Path.Combine(root, d.Replace('/', Path.DirectorySeparatorChar)), d.TrimEnd('/') + "/"));
-        foreach (var (dir, prefix) in targets)
+        foreach (var (dir, prefix, isMain) in targets)
         {
             var (output, error) = RunGit(dir, LogArguments, timeout ?? TimeSpan.FromMinutes(2));
-            if (error is not null) { if (prefix.Length == 0) return new GitHistoryResult([], [], 0, 0, error); continue; }
+            if (error is not null) { if (isMain) return new GitHistoryResult([], [], 0, 0, error); continue; }
             var r = Parse(output, prefix);
             all.AddRange(r.Files); coupling.AddRange(r.Coupling); commits += r.Commits; skipped += r.CommitsSkippedForCoupling;
         }
         return new GitHistoryResult(all, coupling, commits, skipped, null);
     }
 
-    /// <summary>root 下（不含 root 本身）含 .git 的目录，相对路径；跳过点目录与 node_modules 等。</summary>
-    public static List<string> FindNestedRepos(string root)
-    {
-        var found = new List<string>();
-        void Walk(string dir, int depth)
-        {
-            if (depth > 4) return;
-            IEnumerable<string> subs;
-            try { subs = Directory.EnumerateDirectories(dir); } catch (IOException) { return; } catch (UnauthorizedAccessException) { return; }
-            foreach (var sub in subs)
-            {
-                var name = Path.GetFileName(sub);
-                if (name.StartsWith('.') || ProjectInventory.IgnoredDirectories.Contains(name)) continue;
-                if (Directory.Exists(Path.Combine(sub, ".git")) || File.Exists(Path.Combine(sub, ".git"))) { found.Add(ProjectInventory.Rel(root, sub)); continue; }
-                Walk(sub, depth + 1);
-            }
-        }
-        Walk(root, 0);
-        return found;
-    }
+    /// <summary>root 下（不含 root 本身）被纳入的嵌套仓库（独立克隆 / 子模块，不含 worktree），相对路径；跳过点目录与 node_modules 等。</summary>
+    public static List<string> FindNestedRepos(string root) =>
+        ProjectRoots.Single(root).Repositories().Where(r => r.IsNested).Select(r => r.Prefix.TrimEnd('/')).ToList();
 
     private static (string Output, string? Error) RunGit(string dir, string args, TimeSpan timeout)
     {

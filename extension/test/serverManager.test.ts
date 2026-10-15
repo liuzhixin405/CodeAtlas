@@ -1,6 +1,9 @@
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { aiArgs, ApiKeyEnvVar, buildServeLaunch, parsePortLine, redactSecrets, waitForPortLine, type AiOptions } from "../src/serverManager";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import { aiArgs, ApiKeyEnvVar, buildServeLaunch, currentTarget, ensureExecutable, packageTargetMismatch, parsePortLine, projectArgs, redactSecrets, resolveProjects, ServerManager, waitForPortLine, type AiOptions, type ProcessLike } from "../src/serverManager";
 
 describe("aiArgs", () => {
   it("turns codeatlas.ai.* into serve flags", () => {
@@ -109,6 +112,72 @@ describe("buildServeLaunch", () => {
   });
 });
 
+describe("resolveProjects", () => {
+  it("other workspace folders first, then codeatlas.projects resolved against the primary folder", () => {
+    expect(resolveProjects("D:\\a\\ccs-ui", ["D:\\a\\backend"], ["../shared", "E:\\libs\\pay"], "win32")).toEqual([
+      "D:\\a\\backend", "D:\\a\\shared", "E:\\libs\\pay",
+    ]);
+  });
+
+  it("drops blanks, the primary itself and duplicates (case, slash direction and trailing separator ignored on Windows)", () => {
+    expect(resolveProjects("D:\\a\\ui", ["d:/A/backend/", "D:\\a\\ui"], ["  ", "../backend", "D:\\A\\BACKEND", ".", "..\\ui\\"], "win32")).toEqual(["d:\\A\\backend"]);
+  });
+
+  it("is case-sensitive on Linux", () => {
+    expect(resolveProjects("/w/ui", [], ["../Api", "../api", "/w/api/"], "linux")).toEqual(["/w/Api", "/w/api"]);
+  });
+});
+
+describe("projectArgs", () => {
+  it("one --project pair per root, --no-nested only when nested repos are off, nothing for null", () => {
+    expect(projectArgs(null)).toEqual([]);
+    expect(projectArgs({ projects: [], includeNested: true })).toEqual([]);
+    expect(projectArgs({ projects: ["D:\\a\\backend", "D:\\a\\shared"], includeNested: false })).toEqual([
+      "--project", "D:\\a\\backend", "--project", "D:\\a\\shared", "--no-nested",
+    ]);
+  });
+});
+
+describe("buildServeLaunch with projects", () => {
+  it("puts project flags before the AI flags and shows them in the log line", () => {
+    const l = buildServeLaunch("codeatlas.exe", "D:/a/ccs-ui", "tok-abcdef0123456789", 7, { enabled: false, endpoint: "", model: "" }, undefined, {},
+      { projects: ["D:/a/backend"], includeNested: false });
+    expect(l.args).toEqual([
+      "serve", "D:/a/ccs-ui", "--port", "0", "--parent-pid", "7", "--token", "tok-abcdef0123456789",
+      "--project", "D:/a/backend", "--no-nested", "--no-ai",
+    ]);
+    expect(l.logLine).toContain("--project D:/a/backend --no-nested --no-ai");
+  });
+
+  it("without project options the args are unchanged (old callers)", () => {
+    const l = buildServeLaunch("codeatlas.exe", "D:/repo", "tok-abcdef0123456789", 7, null, undefined, {});
+    expect(l.args).toEqual(["serve", "D:/repo", "--port", "0", "--parent-pid", "7", "--token", "tok-abcdef0123456789"]);
+  });
+});
+
+describe("ServerManager.stop", () => {
+  it("stops only that repo's process; the next ensure() spawns a fresh one", async () => {
+    const spawned: { root: string; stopped: boolean }[] = [];
+    const m = new ServerManager(() => "codeatlas.exe", { info: () => {}, error: () => {} }, (_exe, root) => {
+      const rec = { root, stopped: false };
+      spawned.push(rec);
+      const p: ProcessLike = {
+        get alive() { return !rec.stopped; },
+        get apiBase() { return rec.stopped ? null : `http://127.0.0.1:${spawned.indexOf(rec) + 1}`; },
+        start: () => Promise.resolve(`http://127.0.0.1:${spawned.indexOf(rec) + 1}`),
+        stop: () => { rec.stopped = true; },
+      };
+      return p;
+    });
+    await m.ensure("D:/a/old-primary");
+    await m.ensure("D:/a/other");
+    m.stop("D:/a/old-primary");
+    expect(spawned.map((s) => [s.root, s.stopped])).toEqual([["D:/a/old-primary", true], ["D:/a/other", false]]);
+    expect(m.repos()).toEqual(["D:/a/other"]);
+    expect(await m.ensure("D:/a/old-primary")).toBe("http://127.0.0.1:3");
+  });
+});
+
 describe("redactSecrets", () => {
   it("replaces every occurrence; ignores empty and very short values", () => {
     expect(redactSecrets("a sk-12345678 b sk-12345678", ["sk-12345678"])).toBe("a *** b ***");
@@ -156,5 +225,31 @@ describe("waitForPortLine", () => {
     const p = waitForPortLine(s, 1000);
     s.end("nothing useful\n");
     await expect(p).rejects.toThrow(/结束/);
+  });
+});
+
+describe("ensureExecutable", () => {
+  it("does nothing on Windows and never throws for a missing file", () => {
+    // 真正的 chmod 只有 Linux / macOS 上有意义，在 Linux 容器里实测（见 docs/acceptance.md）
+    expect(ensureExecutable("C:/nope/codeatlas.exe", "win32")).toBe(false);
+    expect(ensureExecutable("/definitely/missing/codeatlas", "linux")).toBe(false);
+  });
+});
+
+describe("packageTargetMismatch", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ca-target-"));
+  it("names the package to install when the bundled server is for another platform", () => {
+    writeFileSync(path.join(dir, "target.json"), JSON.stringify({ target: "darwin-x64" }));
+    // 用户实测：Windows 上装了 darwin-x64 的包，原来只报"找不到路径"
+    const msg = packageTargetMismatch(dir, "0.1.0", "win32", "x64");
+    expect(msg).toContain("macOS（Intel 芯片）（darwin-x64）");
+    expect(msg).toContain("Windows x64（win32-x64）");
+    expect(msg).toContain("codetrail-graph-win32-x64-0.1.0.vsix");
+  });
+  it("is null when the platform matches or there is no target.json (dev build)", () => {
+    writeFileSync(path.join(dir, "target.json"), JSON.stringify({ target: "linux-arm64" }));
+    expect(packageTargetMismatch(dir, "0.1.0", "linux", "arm64")).toBeNull();
+    expect(currentTarget("darwin", "arm64")).toBe("darwin-arm64");
+    expect(packageTargetMismatch(path.join(dir, "missing"), "0.1.0", "win32", "x64")).toBeNull();
   });
 });

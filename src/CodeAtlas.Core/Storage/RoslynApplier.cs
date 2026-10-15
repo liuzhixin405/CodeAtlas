@@ -11,14 +11,22 @@ namespace CodeAtlas.Core.Storage;
 /// <param name="Edges">写入的 Roslyn 边（含最终仍悬空的）。</param>
 /// <param name="EdgesDropped">起点在库里找不到而丢弃的边。</param>
 /// <param name="ImplementationEdges">接口调用 → 实现 的派生边（见 ImplementationLinker）。</param>
+/// <param name="Solutions">跑了几个解决方案（多项目索引时主根、嵌套仓库、外部根各一个）。</param>
+/// <param name="FailedSolutions">失败的解决方案及原因；其余解决方案的结果照常写回。</param>
+/// <param name="HeuristicKept">Roslyn 在那一行一条调用都没绑上（引用没还原、编译错误），保留下来的 tree-sitter 调用边。</param>
+/// <param name="HeuristicTypeEdgesKept">Roslyn 对某个类型一条继承 / 实现边都没给（基类型在没还原的包里，是错误类型），保留下来的 tree-sitter 继承 / 实现边。</param>
 public sealed record RoslynApplyReport(
-    int Files, int FilesSkipped, int SymbolsMerged, int SymbolsAdded, int Edges, int EdgesDropped, int DiRegistrations, int Errors, int ImplementationEdges = 0);
+    int Files, int FilesSkipped, int SymbolsMerged, int SymbolsAdded, int Edges, int EdgesDropped, int DiRegistrations, int Errors, int ImplementationEdges = 0,
+    int Solutions = 1, IReadOnlyList<string>? FailedSolutions = null, int HeuristicKept = 0, int HeuristicTypeEdgesKept = 0);
 
 /// <summary>
 /// 把 Roslyn worker 的记录流写回索引库，覆盖 tree-sitter 的启发式结果。
 /// 规则：
 /// <list type="bullet">
 /// <item>每个文件：删掉该文件里的 calls/references/inherits/implements/dispatches 边与 DI 行，contains/imports 保留；</item>
+/// <item>例外二：tree-sitter 的继承 / 实现边，若 Roslyn 对同一个类型同一种边（inherits 或 implements）一条都没给，保留下来——
+/// 包没还原时 Roslyn 认不出 ControllerBase 这类基类，删掉启发式边就认不出控制器入口；</item>
+/// <item>例外：tree-sitter 指向仓库内符号的调用边，若原置信度不低于 HeuristicKeptMin 且 Roslyn 在同一行一条 calls 都没给（语义模型绑不上），保留下来，置信度封顶 HeuristicKeptCap；</item>
 /// <item>符号先按 (start_line, start_col, kind) 合并，再按 (kind, name, start_line)，都不匹配则新插入；合并时更新限定名/签名/可见性并标为 roslyn；</item>
 /// <item>限定名变化时，指向该符号的所有边的 to_name 同步改写（例如 Ns.C.Find → Ns.C.Find(int)），其他文件的 tree-sitter 边继续挂在正确 id 上；</item>
 /// <item>边按限定名挂接：目标已知立即挂，仓库外目标记为 external，其他先悬空，Finish 时用全部已知符号再挂一次；</item>
@@ -29,6 +37,10 @@ public sealed record RoslynApplyReport(
 public sealed class RoslynApplier(IndexDatabase db) : IDisposable
 {
     private const string OverriddenEdgeKinds = "('calls','references','inherits','implements','dispatches')";
+    /// <summary>保留的启发式调用边置信度上限：Roslyn 绑不上说明类型信息缺失，按类型解析（0.9）的结论也不可信。</summary>
+    public const double HeuristicKeptCap = 0.7;
+    /// <summary>只保留原本就有把握的启发式边：多候选同名猜测（0.3）在引用没还原的测试项目里占绝大多数，几乎都是错的（如 Assert.Equal 猜成仓库里的 Equal）。</summary>
+    public const double HeuristicKeptMin = 0.7;
 
     private readonly IndexWriter _writer = new(db);
     private readonly IndexReader _reader = new(db);
@@ -37,9 +49,10 @@ public sealed class RoslynApplier(IndexDatabase db) : IDisposable
     private readonly Dictionary<string, long> _known = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _externals = new(StringComparer.Ordinal);
     private readonly List<DiRec> _di = [];
+    private readonly HashSet<string> _processedFiles = new(StringComparer.Ordinal);
 
     private IndexDatabase.Batch? _batch;
-    private SqliteCommand? _insertEdge, _updateSymbol, _renameEdges, _insertSymbol, _deleteEdges, _deleteDi, _stampFile;
+    private SqliteCommand? _insertEdge, _updateSymbol, _renameEdges, _insertSymbol, _deleteEdges, _deleteDi, _stampFile, _heuristicCalls, _insertHeuristic;
 
     // 当前文件
     private long? _fileId;
@@ -48,8 +61,11 @@ public sealed class RoslynApplier(IndexDatabase db) : IDisposable
     private Dictionary<(SymbolKind Kind, string Name, int Line), SymbolRecord> _byNameLine = new();
     private readonly HashSet<long> _matched = [];
     private long? _moduleId;
+    private readonly List<HeuristicEdge> _heuristic = [];
+    private readonly HashSet<int> _roslynCallLines = [];
+    private readonly HashSet<(long FromId, EdgeKind Kind)> _roslynTypeEdges = [];
 
-    private int _files, _filesSkipped, _merged, _added, _edges, _edgesDropped, _errors;
+    private int _files, _filesSkipped, _merged, _added, _edges, _edgesDropped, _errors, _kept, _typeKept;
     private bool _finished;
 
     public void Apply(RoslynRecord record)
@@ -80,15 +96,35 @@ public sealed class RoslynApplier(IndexDatabase db) : IDisposable
         DisposeCommands();
         _batch.Commit();
         _batch = null;
-        return new RoslynApplyReport(_files, _filesSkipped, _merged, _added, _edges, _edgesDropped, di, _errors, impl);
+        return new RoslynApplyReport(_files, _filesSkipped, _merged, _added, _edges, _edgesDropped, di, _errors, impl, HeuristicKept: _kept, HeuristicTypeEdgesKept: _typeKept);
     }
 
     private void BeginFile(string path)
     {
         FinishFile();
+        // 多个解决方案都包含同一个文件（跨仓库 ProjectReference）：第一次写回为准，后面的整文件跳过
+        if (!_processedFiles.Add(path)) return;
         var file = _reader.GetFile(path);
         if (file is null) { _filesSkipped++; return; }
         _fileId = file.Id;
+
+        // 删之前记下可能要放回去的 tree-sitter 边，FinishFile 时按 Roslyn 给了什么决定：
+        // 指向仓库内符号、有把握的调用边（按行），继承 / 实现边（按类型，目标可以是外部或悬空）
+        var heuristic = Prepare(ref _heuristicCalls, """
+            SELECT e.from_id, e.to_id, e.to_name, e.confidence, e.line, e.via, e.evidence_line, e.kind, e.pos, e.ctx
+            FROM edges e LEFT JOIN symbols s ON s.id = e.to_id
+            WHERE e.file_id = $f AND e.source <> 'roslyn'
+              AND ((e.kind = 'calls' AND s.kind IS NOT NULL AND s.kind <> 'external' AND e.confidence >= $min) OR e.kind IN ('inherits', 'implements'))
+            """, [("$f", file.Id), ("$min", HeuristicKeptMin)]);
+        using (var r = heuristic.ExecuteReader())
+        {
+            while (r.Read())
+            {
+                if (!DbNames.TryParseEdgeKind(r.GetString(7), out var kind)) continue;
+                _heuristic.Add(new HeuristicEdge(kind, r.GetInt64(0), r.IsDBNull(1) ? null : r.GetInt64(1), r.GetString(2), r.GetDouble(3), r.GetInt32(4),
+                    r.IsDBNull(5) ? null : r.GetString(5), r.IsDBNull(6) ? null : r.GetInt32(6), r.IsDBNull(8) ? null : r.GetInt32(8), r.IsDBNull(9) ? null : r.GetString(9)));
+            }
+        }
 
         Run(ref _deleteEdges, $"DELETE FROM edges WHERE file_id = $f AND kind IN {OverriddenEdgeKinds}", ("$f", file.Id));
         Run(ref _deleteDi, "DELETE FROM di_registrations WHERE file_id = $f", ("$f", file.Id));
@@ -108,6 +144,20 @@ public sealed class RoslynApplier(IndexDatabase db) : IDisposable
     private void FinishFile()
     {
         if (_fileId is not { } fileId) return;
+        foreach (var h in _heuristic)
+        {
+            if (h.Kind == EdgeKind.Calls ? _roslynCallLines.Contains(h.Line) : _roslynTypeEdges.Contains((h.FromId, h.Kind))) continue;
+            Run(ref _insertHeuristic, """
+                INSERT INTO edges (from_id, to_id, to_name, kind, source, confidence, file_id, line, via, evidence_line, pos, ctx)
+                VALUES ($from, $to, $toName, $kind, 'treesitter', $conf, $file, $line, $via, $ev, $pos, $ctx)
+                """,
+                ("$from", h.FromId), ("$to", h.ToId), ("$toName", h.ToName), ("$kind", DbNames.ToDb(h.Kind)), ("$conf", Math.Min(h.Confidence, HeuristicKeptCap)),
+                ("$file", fileId), ("$line", h.Line), ("$via", h.Via), ("$ev", h.EvidenceLine), ("$pos", h.Pos), ("$ctx", h.Ctx));
+            if (h.Kind == EdgeKind.Calls) _kept++; else _typeKept++;
+        }
+        _heuristic.Clear();
+        _roslynCallLines.Clear();
+        _roslynTypeEdges.Clear();
         Run(ref _stampFile, "UPDATE files SET roslyn_at = $now WHERE id = $f", ("$now", DateTimeOffset.UtcNow.ToString("O")), ("$f", fileId));
         _files++;
         _fileId = null;
@@ -196,17 +246,20 @@ public sealed class RoslynApplier(IndexDatabase db) : IDisposable
                 : null;
         }
 
-        InsertEdge(fromId, toId, toName, kind, rec.Confidence, _fileId!.Value, rec.Line, rec.Via, rec.EvidenceLine);
+        InsertEdge(fromId, toId, toName, kind, rec.Confidence, _fileId!.Value, rec.Line, rec.Via, rec.EvidenceLine, rec.Pos, rec.Ctx);
+        if (kind == EdgeKind.Calls) _roslynCallLines.Add(rec.Line);
+        else if (kind is EdgeKind.Inherits or EdgeKind.Implements) _roslynTypeEdges.Add((fromId, kind));
         _edges++;
     }
 
-    private void InsertEdge(long fromId, long? toId, string toName, EdgeKind kind, double confidence, long fileId, int line, string? via, int? evidenceLine) =>
+    private void InsertEdge(long fromId, long? toId, string toName, EdgeKind kind, double confidence, long fileId, int line, string? via, int? evidenceLine,
+        int? pos = null, string? ctx = null) =>
         Run(ref _insertEdge, """
-            INSERT INTO edges (from_id, to_id, to_name, kind, source, confidence, file_id, line, via, evidence_line)
-            VALUES ($from, $to, $toName, $kind, 'roslyn', $conf, $file, $line, $via, $ev)
+            INSERT INTO edges (from_id, to_id, to_name, kind, source, confidence, file_id, line, via, evidence_line, pos, ctx)
+            VALUES ($from, $to, $toName, $kind, 'roslyn', $conf, $file, $line, $via, $ev, $pos, $ctx)
             """,
             ("$from", fromId), ("$to", toId), ("$toName", toName), ("$kind", DbNames.ToDb(kind)), ("$conf", confidence),
-            ("$file", fileId), ("$line", line), ("$via", via), ("$ev", evidenceLine));
+            ("$file", fileId), ("$line", line), ("$via", via), ("$ev", evidenceLine), ("$pos", pos is >= 0 ? pos : null), ("$ctx", ctx));
 
     /// <summary>目标文件在后面才处理到的边，这里用全部已知符号补挂。</summary>
     private void ResolveDanglingRoslynEdges()
@@ -251,6 +304,8 @@ public sealed class RoslynApplier(IndexDatabase db) : IDisposable
 
     // ---- 预编译语句复用：几十万条记录逐条 CreateCommand 的开销占了写回时间的大头 ----
 
+    private sealed record HeuristicEdge(EdgeKind Kind, long FromId, long? ToId, string ToName, double Confidence, int Line, string? Via, int? EvidenceLine, int? Pos, string? Ctx);
+
     private SqliteCommand Prepare(ref SqliteCommand? slot, string sql, (string Name, object? Value)[] parameters)
     {
         if (slot is null)
@@ -270,8 +325,8 @@ public sealed class RoslynApplier(IndexDatabase db) : IDisposable
 
     private void DisposeCommands()
     {
-        foreach (var c in new[] { _insertEdge, _updateSymbol, _renameEdges, _insertSymbol, _deleteEdges, _deleteDi, _stampFile }) c?.Dispose();
-        _insertEdge = _updateSymbol = _renameEdges = _insertSymbol = _deleteEdges = _deleteDi = _stampFile = null;
+        foreach (var c in new[] { _insertEdge, _updateSymbol, _renameEdges, _insertSymbol, _deleteEdges, _deleteDi, _stampFile, _heuristicCalls, _insertHeuristic }) c?.Dispose();
+        _insertEdge = _updateSymbol = _renameEdges = _insertSymbol = _deleteEdges = _deleteDi = _stampFile = _heuristicCalls = _insertHeuristic = null;
     }
 
     public void Dispose()

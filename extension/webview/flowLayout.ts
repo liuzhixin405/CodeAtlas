@@ -17,6 +17,21 @@ export interface FlowRow {
   hasChildren: boolean;
   /** 有孩子但没展开。 */
   collapsed: boolean;
+  /** 边来历的样式（如 JSX 渲染边）；普通调用为 null。 */
+  via: ViaStyle | null;
+}
+
+/** 箭头按来历区分的样式：cls 加到行上，tag 显示在标签旁。 */
+export interface ViaStyle {
+  cls: string;
+  tag: string;
+}
+
+/** 只给调用箭头区分来历：via=render 是 JSX 里渲染组件（<X />），不是函数调用。hop 的 via 是协议，另有显示。 */
+export function viaStyle(node: FlowNodeDto): ViaStyle | null {
+  if (node.kind !== "call") return null;
+  if (node.via === "render") return { cls: "via-render", tag: "渲染" };
+  return null;
 }
 
 export interface FlowLayout {
@@ -75,7 +90,8 @@ export function layoutFlow(dto: FlowDto, expanded: Set<string>, preset: FlowPres
     // actor 不在列表里（不该发生）就画在父列上，免得整行丢掉
     const toCol = colOf.get(node.actor) ?? parentCol ?? 0;
     const fromCol = parentCol ?? toCol;
-    const hasChildren = node.children.length > 0;
+    // 未对上后端的接口调用（kind=http）是叶子：服务端不给孩子，万一给了也不展开
+    const hasChildren = node.kind !== "http" && node.children.length > 0;
     const open = isExpanded(node, id, expanded);
     rows.push({
       id, node, depth: node.depth, fromCol, toCol,
@@ -83,8 +99,9 @@ export function layoutFlow(dto: FlowDto, expanded: Set<string>, preset: FlowPres
       label: node.label + (node.count > 1 ? ` ×${node.count}` : ""),
       hasChildren,
       collapsed: hasChildren && !open,
+      via: viaStyle(node),
     });
-    if (open) node.children.forEach((c, i) => visit(c, `${id}.${i}`, toCol));
+    if (open && hasChildren) node.children.forEach((c, i) => visit(c, `${id}.${i}`, toCol));
   };
   visit(dto.root, "0", null);
   return { columns, rows };

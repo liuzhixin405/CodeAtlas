@@ -5,6 +5,7 @@ using CodeAtlas.Core.Hashing;
 using CodeAtlas.Core.Model;
 using CodeAtlas.Core.Resolution;
 using CodeAtlas.Core.Storage;
+using CodeAtlas.Core.Workspace;
 
 namespace CodeAtlas.Indexing.TreeSitter;
 
@@ -14,7 +15,15 @@ public sealed class TreeSitterIndexer(IndexDatabase db, IReadOnlyList<ILanguageA
 
     private sealed record ParseResult(ScannedFile File, ParsedFile? Parsed, string Hash, FileStatus Status, string? Error, bool Unchanged = false);
 
-    public async Task<IndexReport> IndexAsync(string root, IProgress<IndexProgress>? progress = null, CancellationToken ct = default)
+    /// <summary>单根索引：纳入嵌套的独立克隆与子模块，不读 .codeatlas/config.json（那是 CLI / 服务用 ProjectRoots.Load 做的事）。</summary>
+    public Task<IndexReport> IndexAsync(string root, IProgress<IndexProgress>? progress = null, CancellationToken ct = default) =>
+        IndexAsync(ProjectRoots.Single(root), progress, ct);
+
+    /// <summary>
+    /// 多根索引：主根 + 外部根的文件都以相对主根的路径入库。
+    /// 删除检测：库里有、这次没扫到的文件删掉——但不存在的外部根（盘没挂上、目录改名）下的文件保留，免得一次误配置清空它们。
+    /// </summary>
+    public async Task<IndexReport> IndexAsync(ProjectRoots roots, IProgress<IndexProgress>? progress = null, CancellationToken ct = default)
     {
         var stopwatch = Stopwatch.StartNew();
         var reader = new IndexReader(db);
@@ -25,12 +34,12 @@ public sealed class TreeSitterIndexer(IndexDatabase db, IReadOnlyList<ILanguageA
             .ToDictionary(x => x.Extension, x => x.LanguageId, StringComparer.OrdinalIgnoreCase);
 
         progress?.Report(new IndexProgress("scan", 0, 0, null));
-        var scanned = new RepositoryScanner(extensionToLanguage, _options.ExcludedDirectories).Scan(root).ToList();
+        var scanned = new RepositoryScanner(extensionToLanguage, _options.ExcludedDirectories).Scan(roots).ToList();
         var existing = reader.GetAllFiles().ToDictionary(f => f.Path, StringComparer.Ordinal);
 
-        // 1. 磁盘上已不存在的文件
+        // 1. 磁盘上已不存在的文件（不存在的外部根下的除外）
         var scannedPaths = scanned.Select(s => s.RelativePath).ToHashSet(StringComparer.Ordinal);
-        var removed = existing.Values.Where(f => !scannedPaths.Contains(f.Path)).ToList();
+        var removed = existing.Values.Where(f => !scannedPaths.Contains(f.Path) && !roots.IsUnderMissingRoot(f.Path)).ToList();
         if (removed.Count > 0)
         {
             using var batch = db.BeginBatch();
@@ -88,7 +97,8 @@ public sealed class TreeSitterIndexer(IndexDatabase db, IReadOnlyList<ILanguageA
                 var ids = writer.WriteSymbols(fileId, r.Parsed.Symbols, IndexSource.TreeSitter);
                 writer.WriteImports(fileId, r.Parsed.Imports);
                 foreach (var reference in r.Parsed.References)
-                    pending.Add(new PendingReference(ids[reference.FromIndex], fileId, r.File.RelativePath, r.File.Language, reference.Name, reference.Kind, reference.Line, reference.Via));
+                    pending.Add(new PendingReference(ids[reference.FromIndex], fileId, r.File.RelativePath, r.File.Language, reference.Name, reference.Kind, reference.Line, reference.Via, reference.Script,
+                        reference.Pos, reference.Context));
             }
             batch.Commit();
             written += chunk.Length;
@@ -99,7 +109,10 @@ public sealed class TreeSitterIndexer(IndexDatabase db, IReadOnlyList<ILanguageA
         progress?.Report(new IndexProgress("resolve", 0, pending.Count, null));
         using (var batch = db.BeginBatch())
         {
-            await resolver.ResolveAsync(new ResolveContext(db, pending), ct);
+            // tsconfig / jsconfig 的 paths 别名每次都按全部扫描到的文件重新找（增量时未变文件的配置也要算进来）
+            // go.mod 同理（Go 的 import 路径按最近的 go.mod 解析）
+            var goModules = GoModuleResolver.Discover(scanned.Where(f => f.Language == "go").Select(f => (f.RelativePath, f.FullPath)));
+            await resolver.ResolveAsync(new ResolveContext(db, pending, TsConfigReader.Discover(scanned)) { GoModules = goModules }, ct);
             writer.ReattachDanglingEdges();
             batch.Commit();
         }

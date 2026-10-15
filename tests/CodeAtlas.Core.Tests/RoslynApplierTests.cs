@@ -92,6 +92,155 @@ public class RoslynApplierTests
     }
 
     [Fact]
+    public void LineRoslynCouldNotBind_KeepsConfidentHeuristicRepoCall_CappedAt07_DropsExternalAndAmbiguousGuesses()
+    {
+        var (db, fileA, _, a, _) = Seed();
+        using (db)
+        {
+            // Roslyn 在第 5 行一条调用都没给（引用没还原时常见）：tree-sitter 指向仓库内 Other 的边保留，外部猜测和多候选猜测（0.3）照删
+            new IndexWriter(db).WriteEdges([new NewEdge(a[3], a[2], "Ns.C", EdgeKind.Calls, IndexSource.TreeSitter, 0.3, fileA, 5)]);
+            var report = ApplyAll(db,
+                new FileRec("A.cs"),
+                new SymbolRec("A.cs", "method", "Find", "Ns.C.Find(int)", "Item Find(int id)", 5, 5, 5, 40, "Ns.C", "public"),
+                new SymbolRec("A.cs", "method", "Other", "Ns.C.Other()", "void Other()", 7, 5, 7, 30, "Ns.C", "public"),
+                new EdgeRec("Ns.C.Other()", "Ns.C.Find(int)", false, "calls", 1.0, "A.cs", 7),
+                new DoneRec(1, 1, 0));
+
+            var outFind = new IndexReader(db).GetNeighbors(a[3], Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Calls });
+            var kept = Assert.Single(outFind);
+            Assert.Equal(a[4], kept.Other!.Id);
+            Assert.Equal(IndexSource.TreeSitter, kept.Edge.Source);
+            Assert.Equal(0.7, kept.Edge.Confidence, 3);   // 原来 0.9，封顶
+            Assert.Equal(5, kept.Edge.Line);
+            Assert.Equal(1, report.HeuristicKept);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void TypeWithoutRoslynInheritsEdge_KeepsHeuristicInherits_SoControllersStayEntries(bool roslynResolvesBase)
+    {
+        // Bing（包没还原）实测：Roslyn 认不出 ControllerBase 就不给 inherits，删掉启发式边后 121 个 HTTP 入口全丢
+        var (db, fileA, _, a, _) = Seed();
+        using (db)
+        {
+            new IndexWriter(db).WriteEdges([new NewEdge(a[2], null, "external:ControllerBase", EdgeKind.Inherits, IndexSource.TreeSitter, 0.5, fileA, 3)]);
+            List<RoslynRecord> records =
+            [
+                new FileRec("A.cs"),
+                new SymbolRec("A.cs", "class", "C", "Ns.C", "class C", 3, 1, 20, 2, "Ns", "public"),
+                new EdgeRec("Ns.C", "System.IDisposable", true, "implements", 1.0, "A.cs", 3),   // 另一种边不影响 inherits 的判断
+            ];
+            if (roslynResolvesBase) records.Add(new EdgeRec("Ns.C", "Microsoft.AspNetCore.Mvc.ControllerBase", true, "inherits", 1.0, "A.cs", 3));
+            records.Add(new DoneRec(1, 1, 0));
+            var report = ApplyAll(db, [.. records]);
+
+            var inherits = db.Query<string>("SELECT to_name || ' / ' || source FROM edges WHERE kind = 'inherits' AND from_id = $c", ("$c", a[2]));
+            if (roslynResolvesBase)
+            {
+                Assert.Equal(["external:Microsoft.AspNetCore.Mvc.ControllerBase / roslyn"], inherits);
+                Assert.Equal(0, report.HeuristicTypeEdgesKept);
+            }
+            else
+            {
+                Assert.Equal(["external:ControllerBase / treesitter"], inherits);
+                Assert.Equal(1, report.HeuristicTypeEdgesKept);
+            }
+        }
+    }
+
+    // ---- 调用大纲：edges.pos / edges.ctx ----
+
+    private static List<(string ToName, string Source, string? Via, long? Pos, string? Ctx)> CallsFrom(IndexDatabase db, long fromId)
+    {
+        var rows = new List<(string, string, string?, long?, string?)>();
+        using var cmd = db.CreateCommand("SELECT to_name, source, via, pos, ctx FROM edges WHERE kind = 'calls' AND from_id = $f ORDER BY id");
+        cmd.Parameters.AddWithValue("$f", fromId);
+        using var r = cmd.ExecuteReader();
+        while (r.Read())
+            rows.Add((r.GetString(0), r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2), r.IsDBNull(3) ? null : r.GetInt64(3), r.IsDBNull(4) ? null : r.GetString(4)));
+        return rows;
+    }
+
+    [Fact]
+    public void RoslynEdge_PosAndCtx_AreWrittenToTheIndex_UnknownPosStaysNull()
+    {
+        var (db, _, _, a, _) = Seed();
+        using (db)
+        {
+            ApplyAll(db,
+                new FileRec("A.cs"),
+                new SymbolRec("A.cs", "method", "Find", "Ns.C.Find(int)", "Item Find(int id)", 5, 5, 5, 40, "Ns.C", "public"),
+                new SymbolRec("A.cs", "method", "Other", "Ns.C.Other()", "void Other()", 7, 5, 7, 30, "Ns.C", "public"),
+                new EdgeRec("Ns.C.Find(int)", "Ns.C.Other()", false, "calls", 1.0, "A.cs", 5, Pos: 123, Ctx: CallContext.Loop),
+                new EdgeRec("Ns.C.Find(int)", "System.Console.WriteLine(string)", true, "calls", 1.0, "A.cs", 5, Pos: 150, Ctx: CallContext.Callback),
+                new EdgeRec("Ns.C.Find(int)", "Ns.C", false, "calls", 1.0, "A.cs", 5),   // 没有调用点：pos / ctx 为空
+                new DoneRec(1, 1, 0));
+
+            Assert.Equal(
+            [
+                ("Ns.C.Other()", "roslyn", null, 123L, CallContext.Loop),
+                ("external:System.Console.WriteLine(string)", "roslyn", null, 150L, CallContext.Callback),
+                ("Ns.C", "roslyn", null, null, null),
+            ], CallsFrom(db, a[3]));
+        }
+    }
+
+    [Fact]
+    public void KeptHeuristicCall_KeepsItsOriginalPosAndCtx()
+    {
+        var (db, fileA, _, a, _) = Seed();
+        using (db)
+        {
+            // Roslyn 在第 6 行没给调用：tree-sitter 那条保留，连同它的 pos / ctx
+            new IndexWriter(db).WriteEdges([new NewEdge(a[3], a[4], "Ns.C.Other", EdgeKind.Calls, IndexSource.TreeSitter, 0.9, fileA, 6, Pos: 77, Ctx: CallContext.Cond)]);
+            var report = ApplyAll(db,
+                new FileRec("A.cs"),
+                new SymbolRec("A.cs", "method", "Find", "Ns.C.Find(int)", "Item Find(int id)", 5, 5, 5, 40, "Ns.C", "public"),
+                new SymbolRec("A.cs", "method", "Other", "Ns.C.Other()", "void Other()", 7, 5, 7, 30, "Ns.C", "public"),
+                new EdgeRec("Ns.C.Find(int)", "Ns.C.Other()", false, "calls", 1.0, "A.cs", 5, Pos: 60, Ctx: null),
+                new DoneRec(1, 1, 0));
+
+            Assert.Equal(1, report.HeuristicKept);
+            var calls = CallsFrom(db, a[3]);
+            Assert.Contains(("Ns.C.Other()", "roslyn", null, 60L, null), calls);
+            var kept = Assert.Single(calls, c => c.Source == "treesitter");
+            Assert.Equal((77L, CallContext.Cond), (kept.Pos, kept.Ctx));    // 原 pos / ctx 原样放回
+            Assert.Equal(a[4], db.Scalar<long>("SELECT to_id FROM edges WHERE source = 'treesitter' AND kind = 'calls' AND from_id = $f", ("$f", a[3])));
+            Assert.Equal(2, calls.Count);
+        }
+    }
+
+    [Fact]
+    public void ImplementationEdge_DerivedFromAnInterfaceCall_InheritsPosAndCtx()
+    {
+        var (db, _, _, a, _) = Seed();
+        using (db)
+        {
+            var report = ApplyAll(db,
+                new FileRec("A.cs"),
+                new SymbolRec("A.cs", "namespace", "Ns", "Ns", "namespace Ns", 1, 1, 200, 1, null, null),
+                new SymbolRec("A.cs", "class", "C", "Ns.C", "class C", 3, 1, 20, 2, "Ns", "public"),
+                new SymbolRec("A.cs", "method", "Find", "Ns.C.Find(int)", "Item Find(int id)", 5, 5, 5, 40, "Ns.C", "public"),
+                new SymbolRec("A.cs", "method", "Other", "Ns.C.Other()", "void Other()", 7, 5, 7, 30, "Ns.C", "public"),
+                new SymbolRec("A.cs", "interface", "IRepo", "Ns.IRepo", "interface IRepo", 22, 1, 25, 2, "Ns", "public"),
+                new SymbolRec("A.cs", "method", "Find", "Ns.IRepo.Find(int)", "Item Find(int id)", 23, 5, 23, 30, "Ns.IRepo", "public"),
+                new EdgeRec("Ns.C", "Ns.IRepo", false, "implements", 1.0, "A.cs", 3),
+                new EdgeRec("Ns.C.Find(int)", "Ns.IRepo.Find(int)", false, "implements", 1.0, "A.cs", 5),
+                new EdgeRec("Ns.C.Other()", "Ns.IRepo.Find(int)", false, "calls", 1.0, "A.cs", 7, Pos: 210, Ctx: CallContext.Try),
+                new DoneRec(1, 1, 0));
+
+            Assert.Equal(1, report.ImplementationEdges);
+            Assert.Equal(
+            [
+                ("Ns.IRepo.Find(int)", "roslyn", null, 210L, CallContext.Try),
+                ("Ns.C.Find(int)", "roslyn", ImplementationLinker.Via, 210L, CallContext.Try),
+            ], CallsFrom(db, a[4]));
+        }
+    }
+
+    [Fact]
     public void UpsertFile_OnChangedFile_ClearsRoslynAt_SoItCountsAsStale()
     {
         var (db, fileA, _, _, _) = Seed();

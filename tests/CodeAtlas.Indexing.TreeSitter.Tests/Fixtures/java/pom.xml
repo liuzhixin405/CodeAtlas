@@ -1,0 +1,10 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.shop</groupId>
+  <artifactId>shop-parent</artifactId>
+  <packaging>pom</packaging>
+  <modules>
+    <module>common</module>
+    <module>app</module>
+  </modules>
+</project>

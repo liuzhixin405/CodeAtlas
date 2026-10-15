@@ -376,6 +376,43 @@ public class HeuristicEdgeResolverTests
     }
 
     [Fact]
+    public async Task Script_UnboundCall_IsExternal_NotRepoUniqueGuess_WhileLegacyReferenceStillGuesses()
+    {
+        using var f = new Fixture();
+        var (aFile, aIds) = f.File("src/a.ts", "typescript", (SymbolKind.Function, "main", null));
+        f.File("src/app/error.tsx", "tsx", (SymbolKind.Function, "Error", null));
+
+        await f.Resolve(
+            new PendingReference(aIds[1], aFile, "src/a.ts", "typescript", "Error", EdgeKind.Calls, 3, Script: new ScriptBinding(ScriptReceiver.None)),
+            new PendingReference(aIds[1], aFile, "src/a.ts", "typescript", "Error", EdgeKind.Calls, 4)); // 没有绑定信息：照旧按全仓唯一
+
+        var edges = f.EdgesFrom(aIds[1], EdgeKind.Calls).OrderBy(e => e.Confidence).ToList();
+        Assert.Equal(2, edges.Count);
+        Assert.Equal(("external:Error", 0.5), (edges[0].ToName, edges[0].Confidence));
+        Assert.Equal(("src/app/error.tsx:Error", 0.5), (edges[1].ToName, edges[1].Confidence));
+        Assert.NotEqual(edges[0].ToId, edges[1].ToId);
+    }
+
+    [Fact]
+    public async Task Script_NamedImportThroughTsconfigAlias_ResolvesToExport_095()
+    {
+        using var f = new Fixture();
+        var (aFile, aIds) = f.File("web/src/page.tsx", "tsx", (SymbolKind.Function, "Page", null));
+        var (_, hook) = f.File("web/src/hooks/useG.ts", "typescript", (SymbolKind.Function, "useG", null));
+        f.File("web/src/legacy/useG.ts", "typescript", (SymbolKind.Function, "useG", null));
+        var configs = new[] { new ScriptPathConfig("web", null, [new("@/*", new[] { "web/src/*" })]) };
+
+        await new HeuristicEdgeResolver().ResolveAsync(new ResolveContext(f.Db,
+        [
+            new PendingReference(aIds[1], aFile, "web/src/page.tsx", "tsx", "useG", EdgeKind.Calls, 3, Script: new ScriptBinding(ScriptReceiver.None, "@/hooks/useG", "useG")),
+            new PendingReference(aIds[0], aFile, "web/src/page.tsx", "tsx", "@/hooks/useG", EdgeKind.Imports, 1),
+        ], configs), CancellationToken.None);
+
+        Assert.Equal((hook[1], "web/src/hooks/useG.ts:useG", 0.95), f.EdgesFrom(aIds[1], EdgeKind.Calls).Single());
+        Assert.Equal((hook[0], "web/src/hooks/useG.ts", 1.0), f.EdgesFrom(aIds[0], EdgeKind.Imports).Single());
+    }
+
+    [Fact]
     public async Task Inherits_PrefersTypes_NotMethods()
     {
         using var f = new Fixture();

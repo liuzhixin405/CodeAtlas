@@ -9,13 +9,14 @@ internal static class IndexCommand
 {
     public static int Run(ParsedArgs args, TextWriter stdout, TextWriter stderr)
     {
-        if (args.Positional.Count < 1) { stderr.WriteLine("用法：codeatlas index <repo> [--db <path>] [--full] [--roslyn auto|on|off] [--sln <path>]"); return 2; }
+        if (args.Positional.Count < 1) { stderr.WriteLine("用法：codeatlas index <repo> [--db <path>] [--full] [--roslyn auto|on|off] [--sln <path>] [--project <外部根> …] [--no-nested]"); return 2; }
         var roslynMode = args.Value("--roslyn") ?? "auto";
         if (roslynMode is not ("auto" or "on" or "off")) { stderr.WriteLine($"--roslyn 只能是 auto / on / off，不是 {roslynMode}"); return 2; }
         var repo = Path.GetFullPath(args.Positional[0]);
         if (!Directory.Exists(repo)) { stderr.WriteLine($"目录不存在：{repo}"); return 2; }
 
         WarnIfNotIgnored(repo, stderr);
+        var roots = CommonOptions.Roots(repo, args, stderr);
 
         var adapters = CommonOptions.CreateAdapters();
         try
@@ -30,7 +31,7 @@ internal static class IndexCommand
                 if (p.Phase != lastPhase) { lastPhase = p.Phase; stderr.WriteLine($"[{p.Phase}]"); }
                 if (p.Phase == "parse" && (p.Done % 500 == 0 || p.Done == p.Total)) stderr.WriteLine($"  {p.Done}/{p.Total}");
             });
-            var report = indexer.IndexAsync(repo, progress).GetAwaiter().GetResult();
+            var report = indexer.IndexAsync(roots, progress).GetAwaiter().GetResult();
 
             stdout.WriteLine($"files: {report.FilesScanned}  parsed: {report.FilesParsed}  unchanged: {report.FilesUnchanged}  skipped: {report.FilesSkipped}  removed: {report.FilesRemoved}  failed: {report.FilesFailed}");
             stdout.WriteLine($"symbols: {report.TotalSymbols}  edges: {report.TotalEdges}  elapsed: {report.Elapsed.TotalSeconds:F1}s");
@@ -39,14 +40,14 @@ internal static class IndexCommand
 
             if (roslynMode != "off")
             {
-                var roslynExit = RunRoslyn(db, repo, args.Value("--sln"), roslynMode == "on", stdout, stderr);
+                var roslynExit = RunRoslyn(db, roots, args.Value("--sln"), roslynMode == "on", stdout, stderr);
                 if (roslynExit != 0) exit = roslynExit;
             }
 
             // 容器图事实：只读文件系统与源码文本，几秒钟；失败不影响索引结果
             try
             {
-                var (_, arch) = CodeAtlas.Core.Architecture.ArchitectureScanner.ScanAndStore(repo, db);
+                var (_, arch) = CodeAtlas.Core.Architecture.ArchitectureScanner.ScanAndStore(roots, db);
                 stdout.WriteLine($"arch: containers: {arch.Containers}  externals: {arch.Externals}  edges: {arch.Edges}  unmatched: {arch.OutboundUnmatched}  elapsed: {arch.Elapsed.TotalSeconds:F1}s");
             }
             catch (Exception ex) { stderr.WriteLine($"提示：容器图扫描失败：{ex.Message}"); }
@@ -56,7 +57,7 @@ internal static class IndexCommand
                 try
                 {
                     var sw = System.Diagnostics.Stopwatch.StartNew();
-                    var git = CodeAtlas.Core.Architecture.GitHistory.Run(repo);
+                    var git = CodeAtlas.Core.Architecture.GitHistory.Run(roots);
                     CodeAtlas.Core.Storage.GitStorage.Replace(db, git);
                     stdout.WriteLine(git.Error is null
                         ? $"git: commits: {git.Commits}  files: {git.Files.Count}  coupled-pairs: {git.Coupling.Count}  skipped-large: {git.CommitsSkippedForCoupling}  elapsed: {sw.Elapsed.TotalSeconds:F1}s"
@@ -68,7 +69,7 @@ internal static class IndexCommand
             // 入口识别与路由匹配：依赖上面写好的符号、边和容器；失败不影响索引结果
             try
             {
-                var post = CodeAtlas.Server.ArchitecturePostProcess.Run(repo, db);
+                var post = CodeAtlas.Server.ArchitecturePostProcess.Run(roots, db);
                 stdout.WriteLine(FormatEntries(post));
                 stdout.WriteLine(post.FormatRules());
             }
@@ -84,8 +85,11 @@ internal static class IndexCommand
     internal static string FormatEntries(CodeAtlas.Server.PostProcessReport post) =>
         $"entries: {post.Entries}  ({string.Join("  ", post.EntriesByKind.Select(kv => $"{kv.Key}: {kv.Value}"))})  route-matches: {post.Matches}  elapsed: {post.Elapsed.TotalSeconds:F1}s";
 
-    /// <summary>required 为 false（auto）时缺 worker / 解决方案只提示不报错。</summary>
-    private static int RunRoslyn(IndexDatabase db, string repo, string? slnArg, bool required, TextWriter stdout, TextWriter stderr)
+    /// <summary>
+    /// required 为 false（auto）时缺 worker / 解决方案只提示不报错。
+    /// 没给 --sln 时主根、外部根、被纳入的嵌套仓库各找一个解决方案，依次跑；部分失败打印原因、退出码 1，其余照常写回。
+    /// </summary>
+    private static int RunRoslyn(IndexDatabase db, CodeAtlas.Core.Workspace.ProjectRoots roots, string? slnArg, bool required, TextWriter stdout, TextWriter stderr)
     {
         var worker = RoslynRunner.FindWorker();
         if (worker is null)
@@ -93,22 +97,30 @@ internal static class IndexCommand
             stderr.WriteLine($"{(required ? "错误" : "提示")}：没有找到 {RoslynRunner.WorkerName}（应与 codeatlas 同目录，或用环境变量 {RoslynRunner.WorkerPathEnv} 指定），跳过 Roslyn 精确语义。");
             return required ? 1 : 0;
         }
-        var sln = slnArg is not null ? Path.GetFullPath(slnArg) : RoslynRunner.DiscoverSolution(repo);
-        if (sln is null || !File.Exists(sln))
+        IReadOnlyList<string> solutions = slnArg is not null ? [Path.GetFullPath(slnArg)] : RoslynRunner.DiscoverSolutions(roots);
+        var bad = solutions.Count == 0 ? null : solutions.FirstOrDefault(s => !File.Exists(s));
+        if (solutions.Count == 0 || bad is not null)
         {
-            stderr.WriteLine($"{(required ? "错误" : "提示")}：{(sln is null ? "仓库里没有找到 .sln/.slnx" : $"解决方案不存在：{sln}")}，跳过 Roslyn 精确语义。");
+            stderr.WriteLine($"{(required ? "错误" : "提示")}：{(bad is null ? "仓库里没有找到 .sln/.slnx" : $"解决方案不存在：{bad}")}，跳过 Roslyn 精确语义。");
             return required ? 1 : 0;
         }
 
-        stderr.WriteLine($"[roslyn] {sln}");
+        if (RoslynRunner.ProbeAsync(worker).GetAwaiter().GetResult() is { } unavailable)
+        {
+            stderr.WriteLine($"{(required ? "错误" : "提示")}：{unavailable}");
+            return required ? 1 : 0;
+        }
+        foreach (var sln in solutions) stderr.WriteLine($"[roslyn] {sln}");
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
-            var r = RoslynRunner.RunAndApplyAsync(db, worker, sln, repo,
+            var r = RoslynRunner.RunAndApplyAsync(db, worker, solutions, roots,
                 p => { if (p.Done % 200 == 0 || p.Done == p.Total) stderr.WriteLine($"  {p.Done}/{p.Total}"); },
                 line => stderr.WriteLine("  " + line), CancellationToken.None).GetAwaiter().GetResult();
-            stdout.WriteLine($"roslyn: files: {r.Files}  skipped: {r.FilesSkipped}  merged: {r.SymbolsMerged}  added: {r.SymbolsAdded}  edges: {r.Edges}  di: {r.DiRegistrations}  errors: {r.Errors}  elapsed: {sw.Elapsed.TotalSeconds:F1}s");
-            return 0;
+            var failed = r.FailedSolutions ?? [];
+            stdout.WriteLine($"roslyn: solutions: {r.Solutions - failed.Count}/{r.Solutions}  files: {r.Files}  skipped: {r.FilesSkipped}  merged: {r.SymbolsMerged}  added: {r.SymbolsAdded}  edges: {r.Edges}  di: {r.DiRegistrations}  errors: {r.Errors}  kept: {r.HeuristicKept}  kept-types: {r.HeuristicTypeEdgesKept}  elapsed: {sw.Elapsed.TotalSeconds:F1}s");
+            foreach (var f in failed) stderr.WriteLine($"错误：解决方案失败 {f}");
+            return failed.Count > 0 ? 1 : 0;
         }
         catch (RoslynWorkerException ex)
         {

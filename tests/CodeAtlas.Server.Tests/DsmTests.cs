@@ -3,7 +3,7 @@ using CodeAtlas.Core.Model;
 
 namespace CodeAtlas.Server.Tests;
 
-public class DsmTests
+public partial class DsmTests
 {
     private static MapSymbol Sym(long id, SymbolKind kind, string qname, string path, long? parent = null) => new(id, kind, qname, path, parent);
 

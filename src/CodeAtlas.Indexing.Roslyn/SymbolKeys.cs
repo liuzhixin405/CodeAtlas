@@ -1,4 +1,5 @@
 using CodeAtlas.Core.Roslyn;
+using CodeAtlas.Core.Workspace;
 using Microsoft.CodeAnalysis;
 
 namespace CodeAtlas.Indexing.Roslyn;
@@ -122,13 +123,27 @@ public static class SymbolKeys
         return p.Contains("/obj/", StringComparison.OrdinalIgnoreCase) || p.Contains("/bin/", StringComparison.OrdinalIgnoreCase);
     }
 
-    public static bool IsInRepo(ISymbol symbol, string repoRoot)
+    public static bool IsInRepo(ISymbol symbol, string repoRoot) => IsInRepo(symbol, [repoRoot]);
+
+    /// <summary>多根：定义落在任一根（主根 + 外部根）之下的源码里就算仓库内。</summary>
+    public static bool IsInRepo(ISymbol symbol, IReadOnlyList<string> repoRoots)
     {
         foreach (var loc in symbol.OriginalDefinition.Locations)
         {
             if (!loc.IsInSource) continue;
             var path = loc.SourceTree?.FilePath;
-            if (path is not null && path.StartsWith(repoRoot, StringComparison.OrdinalIgnoreCase) && !IsGeneratedPath(path)) return true;
+            if (path is not null && IsUnderAny(path, repoRoots) && !IsGeneratedPath(path)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>按目录边界判断（D:\a\ui 不包含 D:\a\ui-old\x.cs）；大小写按平台（Linux 上 /w/Repo 不包含 /w/repo/x.cs）。</summary>
+    public static bool IsUnderAny(string path, IReadOnlyList<string> roots)
+    {
+        foreach (var root in roots)
+        {
+            var withSep = root.EndsWith(Path.DirectorySeparatorChar) || root.EndsWith(Path.AltDirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
+            if (path.StartsWith(withSep, ProjectRoots.PathComparison)) return true;
         }
         return false;
     }

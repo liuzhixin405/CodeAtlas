@@ -50,18 +50,24 @@ public static partial class PipelineBuilder
     private const string HandlesVia = "handles";
     private const string DispatchViaPrefix = "dispatch:";
 
-    [GeneratedRegex(@"(^|[/.])(tests?|__tests__|spec|specs)([/.]|$)|\.(test|spec)\.[tj]sx?$|Tests?\.cs$", RegexOptions.IgnoreCase)]
+    // Go：*_test.go；Python：test_*.py / *_test.py / conftest.py
+    [GeneratedRegex(@"(^|[/.])(tests?|__tests__|spec|specs)([/.]|$)|\.(test|spec)\.[tj]sx?$|Tests?\.cs$|_test\.go$|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$", RegexOptions.IgnoreCase)]
     private static partial Regex TestPath();
 
     [GeneratedRegex(@"\.Tests?\.")]
     private static partial Regex TestQualifiedName();
+
+    // Java：src/test/java/** 已由上面的 test 段规则覆盖；文件名 *Test.java / *Tests.java / *IT.java / *TestCase.java。
+    // 单独一条区分大小写的规则、且后缀前须是小写字母或数字：Rabbit.java、Latest.java 不算（并进上面忽略大小写的那条会误伤它们）
+    [GeneratedRegex(@"[a-z0-9_](Test|Tests|IT|TestCase)\.java$")]
+    private static partial Regex JavaTestFile();
 
     [GeneratedRegex("Event|Notification|Consumer")]
     private static partial Regex EventInterface();
 
     /// <summary>与页面 isTestSymbol 同一条规则：路径或限定名里带 Tests/Test/Spec 段。</summary>
     public static bool IsTest(string path, string qualifiedName) =>
-        TestPath().IsMatch(path.Replace('\\', '/')) || TestQualifiedName().IsMatch(qualifiedName);
+        TestPath().IsMatch(path.Replace('\\', '/')) || TestQualifiedName().IsMatch(qualifiedName) || JavaTestFile().IsMatch(path);
 
     public static PipelineDto Build(IReadOnlyList<MapSymbol> symbols, IReadOnlyList<MapEdge> edges, IReadOnlyList<MapDi> di, string root)
     {
@@ -315,18 +321,15 @@ public static partial class PipelineBuilder
         return segs.Length <= depth ? key : Join(segs[..depth], SeparatorOf(key));
     }
 
-    private static string[] Segments(string key) => key.Length == 0 ? [] : key.Split(['.', '/'], StringSplitOptions.RemoveEmptyEntries);
+    // 目录名里的点（src/pkg/v1.2）不切，与 MapBuilder.ChildKey 同一判据
+    private static string[] Segments(string key) => MapBuilder.KeySegments(key);
 
     /// <summary>脚本按目录分组的键用 '/'，C# 命名空间用 '.'。</summary>
     private static char SeparatorOf(string key) => key.Contains('/') ? '/' : '.';
 
     private static string Join(string[] segments, char sep) => string.Join(sep, segments);
 
-    private static string StripGenerics(string name)
-    {
-        var i = name.IndexOf('<');
-        return i < 0 ? name : name[..i];
-    }
+    private static string StripGenerics(string name) => MapBuilder.StripGenericArgs(name);
 
     private static void Add<TKey, TValue>(Dictionary<TKey, HashSet<TValue>> dict, TKey key, TValue value) where TKey : notnull
     {

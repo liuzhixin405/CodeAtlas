@@ -43,7 +43,8 @@ public class TypeScriptAdapterTests
         Assert.Equal(SymbolKind.Field, byQ["src/svc.ts:Svc.count"].Kind);
         Assert.Equal(SymbolKind.Method, byQ["src/svc.ts:Svc.constructor"].Kind);
         Assert.Equal(SymbolKind.Method, byQ["src/svc.ts:Svc.find"].Kind);
-        Assert.Equal(SymbolKind.Method, byQ["src/svc.ts:Svc.total"].Kind);
+        // get total() 是 getter：按属性访问（svc.total），不是可调用的方法 → Property；没有同名 setter，符号总数不变
+        Assert.Equal(SymbolKind.Property, byQ["src/svc.ts:Svc.total"].Kind);
         Assert.Equal(SymbolKind.Function, byQ["src/svc.ts:top"].Kind);
         Assert.Equal(SymbolKind.Function, byQ["src/svc.ts:arrow"].Kind);
         Assert.Equal(SymbolKind.Function, byQ["src/svc.ts:fexpr"].Kind);

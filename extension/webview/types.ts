@@ -28,6 +28,163 @@ export interface NeighborDto {
   /** dispatches 边：handles（Handler 处理某类型）或 dispatch（调用点分发到 Handler） */
   via: string | null;
   evidenceLine: number | null;
+  /** 调用名在文件里的 UTF-16 字符偏移（0 起，与 Roslyn 的 SpanStart、VS Code 的 document.positionAt 一致）；旧索引为 null。 */
+  pos?: number | null;
+  /** 调用所在控制结构：loop / cond / try / catch / callback。 */
+  ctx?: OutlineCtx | null;
+}
+
+// ---- 快速跳转（GET /api/files/lens），与 src/CodeAtlas.Server/Dtos.cs 的 FileLensDto 对应 ----
+
+export interface SymbolLensDto {
+  /** 方法 / 函数 / 构造函数。 */
+  symbol: SymbolDto;
+  /** 直接调用方个数（去重，不含测试）。 */
+  callers: number;
+  /** 被调用的处数（不含测试）。 */
+  callSites: number;
+  testCallers: number;
+  /** 调用大纲第一层步骤数。 */
+  callees: number;
+  /** 本身是入口。 */
+  isEntry: boolean;
+}
+
+export interface FileLensDto {
+  path: string;
+  symbols: SymbolLensDto[];
+  /** 文件在索引之后改过，行号可能对不上。 */
+  stale: boolean;
+}
+
+// ---- 模块关系（GET /api/symbols/{id}/relations），与 src/CodeAtlas.Server/Dtos.cs 的 RelationsDto 对应 ----
+
+export type RelationKind = "call" | "new" | "dispatch" | "inherits" | "implements" | "reference";
+
+export interface RelationComponentDto {
+  /** 组件键（与 DSM 同一套）。 */
+  key: string;
+  label: string;
+  /** 依赖序（0 起）：被依赖的在前，版式从左到右按它排。 */
+  order: number;
+  containerKey: string | null;
+}
+
+export interface RelationNodeDto {
+  /** 单元：类 / 接口 / … / 模块。 */
+  unit: SymbolDto;
+  componentKey: string;
+  /** 0 = 中心，1 = 直接相连，2 = 再外一层。 */
+  distance: number;
+  /** 仓库外类型，放在"外部"组件。 */
+  external: boolean;
+}
+
+export interface RelationSampleDto {
+  fromLabel: string;
+  toLabel: string;
+  kind: RelationKind;
+  file: string;
+  line: number;
+  pos: number | null;
+  confidence: number;
+}
+
+export interface RelationEdgeDto {
+  /** From 依赖 To（单元符号 id）。 */
+  from: number;
+  to: number;
+  /** 各关系条数，只列 > 0 的。 */
+  kinds: Partial<Record<RelationKind, number>>;
+  weight: number;
+  /** 成员层面的示例，最多 5 条。 */
+  samples: RelationSampleDto[];
+}
+
+export interface RelationsDto {
+  focus: SymbolDto;
+  components: RelationComponentDto[];
+  nodes: RelationNodeDto[];
+  edges: RelationEdgeDto[];
+  truncated: boolean;
+}
+
+// ---- 影响范围（GET /api/symbols/{id}/impact），与 src/CodeAtlas.Server/Dtos.cs 的 ImpactDto 对应 ----
+
+export type ImpactCallerKind = "call" | "impl" | "dispatch" | "new" | "hop";
+
+export interface ImpactSiteDto {
+  line: number;
+  /** 调用名的 UTF-16 字符偏移；null 时跳到行首。 */
+  pos: number | null;
+  ctx: OutlineCtx | null;
+}
+
+export interface ImpactEntryDto {
+  entry: EntryDto;
+  containerKey: string;
+  containerName: string;
+  /** 往上走了几层到达（0 = 符号自己就是入口）。 */
+  depth: number;
+}
+
+export interface ImpactCallerDto {
+  /** call 直接调用 / impl 经接口 / dispatch 经分派 / new 构造 / hop 跨服务（前端 fetch、别的服务的客户端调用）。 */
+  kind: ImpactCallerKind;
+  /** 调用方显示名：类型.方法。 */
+  label: string;
+  caller: SymbolDto;
+  /** 调用方里每一处调用，按位置排。 */
+  sites: ImpactSiteDto[];
+  confidence: number;
+  /** 调用方自己还有调用方。 */
+  expandable: boolean;
+  /** 调用方本身是入口时的入口信息。 */
+  asEntry: ImpactEntryDto[];
+}
+
+export interface ImpactDto {
+  symbol: SymbolDto;
+  callers: ImpactCallerDto[];
+  /** entries=true 的根请求才有：往上能走到的全部入口。 */
+  entries: ImpactEntryDto[] | null;
+  entriesTruncated: boolean;
+  /** 测试代码里的直接调用方个数（tests=false 时只计数不列出）。 */
+  testCallers: number;
+  truncated: boolean;
+}
+
+// ---- 调用大纲（GET /api/symbols/{id}/outline），与 src/CodeAtlas.Server/Dtos.cs 的 OutlineDto 对应 ----
+
+export type OutlineCtx = "loop" | "cond" | "try" | "catch" | "callback";
+export type OutlineStepKind = "call" | "new" | "dispatch" | "impl" | "external" | "ambiguous";
+
+export interface OutlineStepDto {
+  /** 本层序号（1 起，按调用名的字符偏移排）。 */
+  order: number;
+  kind: OutlineStepKind;
+  /** 显示名：类型.方法。 */
+  label: string;
+  /** 被调符号；ambiguous 为 null。 */
+  target: SymbolDto | null;
+  /** 调用发生在当前方法里的行（单击跳到这里）。 */
+  line: number;
+  /** 调用名在文件里的 UTF-16 字符偏移（0 起，与 Roslyn 的 SpanStart、VS Code 的 document.positionAt 一致）；null 时跳到行首。 */
+  pos: number | null;
+  ctx: OutlineCtx | null;
+  confidence: number;
+  /** 能展开：展开时请求 target 的大纲。 */
+  expandable: boolean;
+  /** 相邻同一调用合并后的次数。 */
+  repeat: number;
+  /** 就地子项：dispatch 目标、impl 实现、ambiguous 候选。 */
+  children: OutlineStepDto[];
+}
+
+export interface OutlineDto {
+  symbol: SymbolDto;
+  steps: OutlineStepDto[];
+  truncated: boolean;
 }
 
 export interface HealthDto {
@@ -249,7 +406,7 @@ export interface DsmDto {
 
 export interface EntryDto {
   symbolId: number;
-  /** http / hosted / job / hub / handler / page / api-route */
+  /** http / hosted / command / job / hub / grpc / handler / page / api-route */
   kind: string;
   ruleId: string;
   route: string | null;
@@ -270,7 +427,11 @@ export interface FlowNodeDto {
   symbolId: number | null;
   label: string;
   qualifiedName: string;
-  kind: "entry" | "call" | "dispatch" | "hop" | "external-group" | "more" | "function";
+  /**
+   * http：前端 hook 里没对上后端路由的接口调用（label 如 "GET /api/v5/mt5/groups"，qualifiedName 是原始 URL，
+   * actor 指向 kind=external 的列，没有 symbolId 与 children，note 说明为什么没对上）。
+   */
+  kind: "entry" | "call" | "dispatch" | "hop" | "external-group" | "more" | "function" | "http";
   /** 所属 actor 的 key。 */
   actor: string;
   via: string | null;
@@ -321,6 +482,8 @@ export interface RoslynReportDto {
   elapsedSeconds: number;
   /** 没跑成的原因；成功为 null。 */
   error: string | null;
+  /** 本机缺 .NET 10 运行时或 SDK：C# 用 tree-sitter 的结果，其他语言不受影响。 */
+  unavailable?: boolean;
 }
 
 export interface IndexStatusDto {

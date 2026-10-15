@@ -14,9 +14,9 @@ public sealed class ImplementationLinker(IndexDatabase db)
     public int Link()
     {
         return db.Execute("""
-            INSERT INTO edges (from_id, to_id, to_name, kind, source, confidence, file_id, line, via, evidence_line)
+            INSERT INTO edges (from_id, to_id, to_name, kind, source, confidence, file_id, line, via, evidence_line, pos, ctx)
             SELECT c.from_id, impl.from_id, impl_sym.qualified_name, 'calls', c.source,
-                   CASE WHEN cnt.n = 1 THEN 0.9 ELSE 0.5 END, c.file_id, c.line, $via, c.line
+                   CASE WHEN cnt.n = 1 THEN 0.9 ELSE 0.5 END, c.file_id, c.line, $via, c.line, c.pos, c.ctx
             FROM edges c
             JOIN symbols t ON t.id = c.to_id
             JOIN symbols p ON p.id = t.parent_id AND p.kind = 'interface'

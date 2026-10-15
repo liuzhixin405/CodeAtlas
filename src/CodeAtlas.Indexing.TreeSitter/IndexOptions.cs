@@ -3,7 +3,9 @@ namespace CodeAtlas.Indexing.TreeSitter;
 public sealed record IndexOptions
 {
     public IReadOnlyList<string> ExcludedDirectories { get; init; } =
-        ["node_modules", "bin", "obj", ".git", "dist", "build", ".codeatlas", ".vs", ".idea"];
+        ["node_modules", "bin", "obj", ".git", "dist", "build", ".codeatlas", ".vs", ".idea",
+         "venv", ".venv", "__pycache__", "site-packages", // Python 虚拟环境与字节码缓存（migrations 保留）
+         "target", ".gradle", ".mvn"]; // Maven / Gradle 构建产物与工具目录（Gradle 的 build 已在上面）
     public long MaxFileBytes { get; init; } = 2_000_000;
     public int MaxParallelism { get; init; } = Environment.ProcessorCount;
     public bool Full { get; init; }

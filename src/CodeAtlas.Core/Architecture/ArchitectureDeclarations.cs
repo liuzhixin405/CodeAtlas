@@ -17,8 +17,14 @@ public sealed class ArchitectureDeclarations
     public sealed class LayerDecl { public string? Name { get; set; } public string? Namespace { get; set; } }
     /// <summary>单条规则："A.Application -> A.Infrastructure" 的写法，forbid / require 二选一。</summary>
     public sealed class RuleDecl { public string? Forbid { get; set; } public string? Require { get; set; } }
+    /// <summary>
+    /// 前端的转发代理（BFF / Next.js API 路由）：浏览器请求以 prefix 开头的路径，由代理转给后端；strip（默认 true）= 转发时去掉 prefix。
+    /// 静态识别不出的代理（转发交给库函数、nginx 反代）在这里声明，路由匹配时按它剥前缀。
+    /// </summary>
+    public sealed class ProxyDecl { public string? Prefix { get; set; } public bool Strip { get; set; } = true; }
     public sealed class Doc
     {
+        public List<ProxyDecl> Proxies { get; set; } = [];
         public List<NodeDecl> Containers { get; set; } = [];
         public List<NodeDecl> Externals { get; set; } = [];
         public List<NodeDecl> People { get; set; } = [];

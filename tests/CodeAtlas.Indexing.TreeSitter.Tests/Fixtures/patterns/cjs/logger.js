@@ -1,0 +1,1 @@
+exports.child = function (msg) { return msg; };

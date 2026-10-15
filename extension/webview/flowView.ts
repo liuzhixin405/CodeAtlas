@@ -4,6 +4,7 @@ import type { EntryDto, FlowDto, FlowNodeDto } from "./types";
 /** 入口种类的分组标题，也决定分组顺序。 */
 export const EntryKindLabels: Record<string, string> = {
   http: "HTTP 路由",
+  command: "命令行命令",
   hosted: "常驻服务",
   job: "定时任务",
   hub: "SignalR",
@@ -49,12 +50,46 @@ export function groupEntries(entries: EntryDto[]): Array<[string, EntryDto[]]> {
  * 入口流程视图：左边是入口清单（可筛选、按种类分组），右边是一张 CSS Grid 画的时序图。
  * 展开/折叠状态留在视图里，换入口时清掉。
  */
+/** 一条入口的身份：同一个符号上可能有几条入口（顶级语句里的多条路由、Main），只按符号比会一起高亮。 */
+export function entryKey(e: Pick<EntryDto, "symbolId" | "kind" | "route" | "httpMethod">): string {
+  return `${e.symbolId}|${e.kind}|${e.httpMethod ?? ""}|${e.route ?? ""}`;
+}
+
+export const MinListWidth = 180;
+export const DefaultListWidth = 300;
+const ListWidthKey = "codeatlas.flowListWidth";
+
+/** 入口列表宽度：不小于 MinListWidth，不超过面板的 60%（面板宽度未知时只管下限）。 */
+export function clampListWidth(px: number, containerWidth: number): number {
+  const max = containerWidth > 0 ? Math.max(MinListWidth, Math.floor(containerWidth * 0.6)) : Number.POSITIVE_INFINITY;
+  return Math.round(Math.min(Math.max(px, MinListWidth), max));
+}
+
+function applyListWidth(container: HTMLElement, px: number): void {
+  container.style.setProperty("--flow-list-width", `${px}px`);
+}
+
+/** 拖过的宽度记在本机（webview 的 localStorage 可能不可用，读写失败就用默认值）。 */
+function savedListWidth(): number {
+  try {
+    const v = Number(localStorage.getItem(ListWidthKey));
+    return Number.isFinite(v) && v >= MinListWidth ? v : DefaultListWidth;
+  } catch {
+    return DefaultListWidth;
+  }
+}
+
+function saveListWidth(px: number): void {
+  try { localStorage.setItem(ListWidthKey, String(Math.round(px))); } catch { /* 不记也能用 */ }
+}
+
 export class FlowView {
   private readonly search: HTMLInputElement;
   private readonly list: HTMLElement;
   private readonly diagram: HTMLElement;
   private entries: EntryDto[] = [];
-  private selected: number | null = null;
+  /** 选中的那一条入口（不是符号：顶级语句里的几条 Minimal API 路由与 Main 入口落在同一个符号上）。 */
+  private selected: string | null = null;
   private dto: FlowDto | null = null;
   private expanded = new Set<string>();
   /** 时序图版式预设，见 flowLayout.FlowPreset。 */
@@ -71,16 +106,33 @@ export class FlowView {
     this.search.oninput = () => this.renderList();
     this.list = document.createElement("div");
     this.list.className = "flow-entries";
-    left.append(this.search, this.list);
+    const resizer = document.createElement("div");
+    resizer.className = "flow-resizer";
+    resizer.title = "拖动调整入口列表宽度";
+    left.append(this.search, this.list, resizer);
     this.diagram = document.createElement("div");
     this.diagram.className = "flow-diagram";
     container.append(left, this.diagram);
+    applyListWidth(container, savedListWidth());
+    resizer.onpointerdown = (down) => {
+      down.preventDefault();
+      resizer.setPointerCapture(down.pointerId);
+      resizer.classList.add("dragging");
+      const startX = down.clientX;
+      const startWidth = left.getBoundingClientRect().width;
+      resizer.onpointermove = (move) => applyListWidth(container, clampListWidth(startWidth + move.clientX - startX, container.clientWidth));
+      resizer.onpointerup = () => {
+        resizer.onpointermove = resizer.onpointerup = null;
+        resizer.classList.remove("dragging");
+        saveListWidth(left.getBoundingClientRect().width);
+      };
+    };
     this.clearFlow();
   }
 
-  renderEntries(entries: EntryDto[], selected: number | null): void {
+  renderEntries(entries: EntryDto[], selected: EntryDto | null): void {
     this.entries = entries;
-    this.selected = selected;
+    this.selected = selected ? entryKey(selected) : null;
     this.renderList();
   }
 
@@ -123,7 +175,7 @@ export class FlowView {
       this.list.appendChild(head);
       for (const e of group) {
         const item = document.createElement("div");
-        item.className = "flow-entry" + (e.symbolId === this.selected ? " active" : "");
+        item.className = "flow-entry" + (entryKey(e) === this.selected ? " active" : "");
         item.title = `${e.qualifiedName}\n${e.file}:${e.line}`;
         const main = e.route ?? e.name;
         item.innerHTML = (e.httpMethod ? `<span class="method ${esc(e.httpMethod.toLowerCase())}">${esc(e.httpMethod)}</span>` : "") +
@@ -185,23 +237,28 @@ export class FlowView {
     const lo = Math.min(row.fromCol, row.toCol);
     const hi = Math.max(row.fromCol, row.toCol);
     const span = hi - lo + 1;
-    el.className = `flow-arrow ${row.direction} kind-${node.kind}` + (row.hasChildren ? " has-children" : "") + (row.collapsed ? " collapsed" : "") + (node.confidence < 0.7 ? " weak" : "");
+    el.className = `flow-arrow ${row.direction} kind-${node.kind}` + (row.hasChildren ? " has-children" : "") + (row.collapsed ? " collapsed" : "") + (node.confidence < 0.7 ? " weak" : "") + (row.via ? ` ${row.via.cls}` : "");
     el.style.gridRow = String(index + 1);
     el.style.gridColumn = `${lo + 1} / ${hi + 2}`;
     // 箭头要从起点列的中线画到终点列的中线：列等宽，所以两边各空半列
     if (row.direction === "self") el.style.paddingLeft = node.kind === "entry" ? "0" : "50%";
     else el.style.padding = `0 calc(50% / ${span})`;
-    el.title = [node.qualifiedName, node.via ? `via ${node.via}` : "", node.confidence < 1 ? `confidence ${node.confidence.toFixed(1)}` : "", row.collapsed ? `${node.children.length} 个孩子已折起` : "", node.hidden > 0 ? `还有 ${node.hidden} 个没下发` : ""].filter(Boolean).join("\n");
+    const isHttp = node.kind === "http";
+    el.title = [node.qualifiedName, isHttp && node.note ? node.note : "", node.via ? `via ${node.via}` : "", node.confidence < 1 ? `confidence ${node.confidence.toFixed(1)}` : "", row.collapsed ? `${node.children.length} 个孩子已折起` : "", node.hidden > 0 ? `还有 ${node.hidden} 个没下发` : ""].filter(Boolean).join("\n");
 
     const label = document.createElement("span");
     label.className = "flow-label";
     const text = node.kind === "more" ? `还有 ${node.count} 个` : row.label;
     label.innerHTML = (row.hasChildren ? `<span class="caret">${row.collapsed ? "▸" : "▾"}</span>` : "") +
+      // 没对上后端的接口调用：标签前一个「接口」小标记，行尾灰字说明原因
+      (isHttp ? `<span class="api-tag">接口</span>` : "") +
       `<span class="text">${esc(text)}</span>` +
       (node.via && node.kind === "hop" ? `<span class="via">${esc(node.via)}</span>` : "") +
+      (row.via ? `<span class="via">${esc(row.via.tag)}</span>` : "") +
       (row.collapsed ? `<span class="muted">(${node.children.length})</span>` : "") +
-      (node.kind === "hop" && node.note ? `<span class="note">${esc(node.note)}</span>` : "");
-    if (node.symbolId !== null) {
+      ((node.kind === "hop" || isHttp) && node.note ? `<span class="note">${esc(node.note)}</span>` : "");
+    // 接口调用没有符号，点了也不跳调用图
+    if (node.symbolId !== null && !isHttp) {
       label.classList.add("link");
       label.onclick = (e) => { e.stopPropagation(); this.cb.onNodeFocus(node); };
     }

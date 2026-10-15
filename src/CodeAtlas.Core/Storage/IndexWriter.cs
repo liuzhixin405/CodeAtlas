@@ -83,17 +83,18 @@ public sealed class IndexWriter(IndexDatabase db)
     public void WriteEdges(IEnumerable<NewEdge> edges)
     {
         using var cmd = db.CreateCommand("""
-            INSERT INTO edges (from_id, to_id, to_name, kind, source, confidence, file_id, line, via, evidence_line)
-            VALUES ($from, $to, $toName, $kind, $source, $conf, $file, $line, $via, $ev)
+            INSERT INTO edges (from_id, to_id, to_name, kind, source, confidence, file_id, line, via, evidence_line, pos, ctx)
+            VALUES ($from, $to, $toName, $kind, $source, $conf, $file, $line, $via, $ev, $pos, $ctx)
             """);
         var p = cmd.Parameters;
-        foreach (var n in new[] { "$from", "$to", "$toName", "$kind", "$source", "$conf", "$file", "$line", "$via", "$ev" }) p.AddWithValue(n, DBNull.Value);
+        foreach (var n in new[] { "$from", "$to", "$toName", "$kind", "$source", "$conf", "$file", "$line", "$via", "$ev", "$pos", "$ctx" }) p.AddWithValue(n, DBNull.Value);
         foreach (var e in edges)
         {
             p["$from"].Value = e.FromId; p["$to"].Value = (object?)e.ToId ?? DBNull.Value; p["$toName"].Value = e.ToName;
             p["$kind"].Value = DbNames.ToDb(e.Kind); p["$source"].Value = DbNames.ToDb(e.Source); p["$conf"].Value = e.Confidence;
             p["$file"].Value = e.FileId; p["$line"].Value = e.Line; p["$via"].Value = (object?)e.Via ?? DBNull.Value;
             p["$ev"].Value = (object?)e.EvidenceLine ?? DBNull.Value;
+            p["$pos"].Value = e.Pos is >= 0 ? e.Pos : DBNull.Value; p["$ctx"].Value = (object?)e.Ctx ?? DBNull.Value;
             cmd.ExecuteNonQuery();
         }
     }

@@ -3,7 +3,7 @@ using CodeAtlas.Core.Model;
 
 namespace CodeAtlas.Server.Tests;
 
-public class FlowBuilderTests
+public partial class FlowBuilderTests
 {
     private static MapSymbol Sym(long id, SymbolKind kind, string qname, string path, long? parent, int start = 1, int end = 1) => new(id, kind, qname, path, parent, start, end);
 
@@ -101,6 +101,71 @@ public class FlowBuilderTests
     }
 
     [Fact]
+    public void NodeBudget_IsSharedAcrossBranches_ADeepFirstBranchCannotStarveTheSecond()
+    {
+        // 入口 1 → A（链 A→A2→…→A40，很深）、B → B1（浅）。总名额 12：深度优先时 A 链吃光名额，B1 出不来
+        var symbols = new List<MapSymbol> { Sym(1, SymbolKind.Function, "Entry", "a/E.ts", null) };
+        var edges = new List<MapEdge> { new(1, 100, EdgeKind.Calls, 1.0), new(1, 200, EdgeKind.Calls, 1.0), new(200, 201, EdgeKind.Calls, 1.0) };
+        for (var i = 0; i <= 40; i++)
+        {
+            symbols.Add(Sym(100 + i, SymbolKind.Function, $"A{i}", "a/A.ts", null));
+            if (i < 40) edges.Add(new(100 + i, 101 + i, EdgeKind.Calls, 1.0));
+        }
+        symbols.Add(Sym(200, SymbolKind.Function, "B", "a/B.ts", null));
+        symbols.Add(Sym(201, SymbolKind.Function, "B1", "a/B.ts", null));
+        var containers = new List<ArchNode> { Container("app", "a") };
+        var entry = new EntryPoint(1, "app", "x", "http", "/e", "GET", "a/E.ts", 1);
+
+        var f = FlowBuilder.Build(symbols, edges, entry, containers, [], [entry], maxDepth: 50, maxNodes: 12);
+        var b = Assert.Single(f.Root.Children, c => c.Label == "B");
+        Assert.Equal("B1", Assert.Single(b.Children).Label);  // 浅分支完整展开
+        Assert.True(f.Truncated);                             // 深分支被截断并如实标出
+        Assert.True(f.Nodes <= 12, $"nodes={f.Nodes}");
+    }
+
+    [Fact]
+    public void NodeBudget_LeftoverFromShallowSiblings_GoesBackToTheDeepFirstBranch()
+    {
+        // 入口 → A（链 40 层）+ 五个叶子 L1..L5。名额 30：平均分时 A 只拿 29/6≈4；叶子各用 1 个，剩下的应补回 A
+        var symbols = new List<MapSymbol> { Sym(1, SymbolKind.Function, "Entry", "a/E.ts", null) };
+        var edges = new List<MapEdge> { new(1, 100, EdgeKind.Calls, 1.0) };
+        for (var i = 0; i <= 40; i++)
+        {
+            symbols.Add(Sym(100 + i, SymbolKind.Function, $"A{i:00}", "a/A.ts", null));
+            if (i < 40) edges.Add(new(100 + i, 101 + i, EdgeKind.Calls, 1.0));
+        }
+        for (var i = 1; i <= 5; i++) { symbols.Add(Sym(300 + i, SymbolKind.Function, $"L{i}", "a/L.ts", null)); edges.Add(new(1, 300 + i, EdgeKind.Calls, 1.0)); }
+        var containers = new List<ArchNode> { Container("app", "a") };
+        var entry = new EntryPoint(1, "app", "x", "http", "/e", "GET", "a/E.ts", 1);
+
+        var f = FlowBuilder.Build(symbols, edges, entry, containers, [], [entry], maxDepth: 50, fanout: 10, maxNodes: 30);
+        int Depth(FlowNodeDto n) => n.Children.Count == 0 ? 1 : 1 + n.Children.Max(Depth);
+        var a = Assert.Single(f.Root.Children, c => c.Label == "A00");
+        Assert.True(Depth(a) >= 20, $"A 链只展开了 {Depth(a)} 层");  // 1 + 5 个叶子 + A 链 ≈ 30
+        Assert.Equal(5, f.Root.Children.Count(c => c.Label.StartsWith('L')));
+        Assert.True(f.Nodes <= 30, $"nodes={f.Nodes}");
+        Assert.True(f.Truncated);
+    }
+
+    [Fact]
+    public void ExternalRootFiles_BelongToTheirOwnContainer_NotToARootLevelContainer()
+    {
+        // 主根是前端（成员路径 ""，项目就在主根），后端是 --project 加进来的外部根（路径 ../backend/…）
+        var symbols = new List<MapSymbol>
+        {
+            Sym(1, SymbolKind.Function, "Page", "src/app/page.tsx", null, 1, 5),
+            Sym(2, SymbolKind.Method, "Backend.Api.Ctl.Get()", "../backend/Api/Ctl.cs", null, 1, 5),
+        };
+        var edges = new List<MapEdge> { new(1, 2, EdgeKind.Calls, 1.0) };
+        var containers = new List<ArchNode> { Container("web", ""), Container("../backend/Api", "../backend/Api") };
+        var entry = new EntryPoint(1, "web", "frontend.route", "page", "/", null, "src/app/page.tsx", 1);
+        var f = FlowBuilder.Build(symbols, edges, entry, containers, [], [entry]);
+        var call = Assert.Single(f.Root.Children);
+        Assert.Equal("../backend/Api|../backend/Api", call.Actor); // 旧判据下成员 "" 吞掉一切，这里会是 "web|"
+        Assert.Equal("container", f.Actors.Single(a => a.Key == call.Actor).Kind);
+    }
+
+    [Fact]
     public void Flow_LimitsFanout_AndFoldsIdenticalSiblings()
     {
         // Log 调了 A、B、C：fanout=2 → A、B + "还有 1 个"
@@ -113,6 +178,124 @@ public class FlowBuilderTests
         var a = new FlowNodeDto(1, "x", "q", "call", "p", null, 1, 1, 1, [], 0, null);
         var folded = FlowBuilder.Fold([a, a, a with { Count = 1 }, new FlowNodeDto(2, "y", "r", "call", "p", null, 1, 1, 1, [], 0, null), a]);
         Assert.Equal(new[] { 3, 1, 1 }, folded.Select(n => n.Count));
+    }
+
+    // 前端：页面默认导出的组件 → JSX 渲染边 → 组件 → hook → 框架调用。路径里的 (main) 曾让短名切成空串、模块切成 "tsx"
+    private const string PagePath = "web/src/app/[lang]/(main)/groups/page.tsx";
+    private static readonly List<MapSymbol> WebSymbols =
+    [
+        new(100, SymbolKind.Module, PagePath, PagePath, null, 1, 30),
+        new(101, SymbolKind.Function, PagePath + ":GroupsPage", PagePath, 100, 15, 29, "export default"),
+        new(102, SymbolKind.Function, "web/src/components/MT5Group/MT5GroupTable.tsx:MT5GroupTable", "web/src/components/MT5Group/MT5GroupTable.tsx", null, 159, 900, "export default"),
+        new(103, SymbolKind.Function, "web/src/hooks/MT5/Group/useMT5Group.ts:useMT5GroupByServerId", "web/src/hooks/MT5/Group/useMT5Group.ts", null, 35, 70, "export"),
+        new(104, SymbolKind.External, "external:@mui/material.Stack", "<external>", null),
+        new(105, SymbolKind.External, "external:get", "<external>", null),
+    ];
+    private static readonly List<MapEdge> WebEdges =
+    [
+        new(101, 102, EdgeKind.Calls, 0.95, "render"),
+        new(101, 104, EdgeKind.Calls, 0.5, "render"),
+        new(102, 103, EdgeKind.Calls, 0.95),
+        new(103, 105, EdgeKind.Calls, 0.5),
+    ];
+    private static readonly List<ArchNode> WebContainers = [new("web", ArchNodeKind.Container, "frontend", "web", "web", ArchSource.Discovered, [], ["web"], [])];
+
+    [Fact]
+    public void Flow_FrontendPage_FromDefaultExport_FollowsRenderEdges_WithReadableLabels()
+    {
+        var entry = new EntryPoint(101, "web", "frontend.route", "page", "/{lang}/groups", null, PagePath, 15);
+        var f = FlowBuilder.Build(WebSymbols, WebEdges, entry, WebContainers, [], [entry]);
+
+        Assert.Equal(("GroupsPage", "entry"), (f.Root.Label, f.Root.Kind));
+        Assert.Equal(new[] { ("MT5GroupTable", "call", (string?)"render", 0.95), ("Stack", "external-group", null, 1.0) },
+            f.Root.Children.Select(c => (c.Label, c.Kind, c.Via, c.Confidence)));
+        var table = f.Root.Children[0];
+        var hook = Assert.Single(table.Children, c => c.Kind == "call");
+        Assert.Equal(("useMT5GroupByServerId", (string?)null, 0.95), (hook.Label, hook.Via, hook.Confidence));
+        Assert.Equal("get", Assert.Single(hook.Children).Label); // api.get 是框架调用
+        Assert.Equal("@mui/material", f.Actors.Single(a => a.Key == f.Root.Children[1].Actor).Label); // 外部按包名成列
+    }
+
+    // 单独打开前端时后端不在索引里：hook 里的接口调用是容器图规则识别的出口，没有 RouteMatch，原来时序图里什么都不画
+    private const string HookPath = "web/src/hooks/MT5/Group/useMT5Group.ts";
+    private const string ApiNodeKey = "external:http-service:api-api-v5";
+    private static readonly ArchNode ApiNode = new(ApiNodeKey, ArchNodeKind.External, "http-service", "API /api/v5", null, ArchSource.Discovered, [], [], []);
+    private static Outbound WebOut(int line, string url, string? clientName = "GET 经代理 /api/proxy-gateway", string container = "web") =>
+        new(container, "frontend-http", "http", clientName, null, url, HookPath, line, ApiNodeKey);
+    // hook 行范围 35..70：53、66 同一个接口（折成一条 ×2）；60 已对上路由（画成 hop，不重复）；80 在范围外；别的容器的出口不算
+    private static readonly List<Outbound> WebOutbound =
+    [
+        WebOut(53, "/api/proxy-gateway/api/v5/mt5/groups"),
+        WebOut(60, "/api/proxy-gateway/api/v5/mt5/servers"),
+        WebOut(66, "/api/proxy-gateway/api/v5/mt5/groups"),
+        WebOut(80, "/api/proxy-gateway/api/v5/mt5/far"),
+        WebOut(54, "/api/proxy-gateway/api/v5/mt5/other", container: "admin"),
+    ];
+    private static readonly List<RouteMatch> WebMatches = [new("web", HookPath, 60, "/api/v5/mt5/servers", 999, "backend")];
+
+    [Fact]
+    public void Flow_FrontendHttpCallWithoutRouteMatch_BecomesHttpNodeUnderTheHook()
+    {
+        var entry = new EntryPoint(101, "web", "frontend.route", "page", "/{lang}/groups", null, PagePath, 15);
+        var f = FlowBuilder.Build(WebSymbols, WebEdges, entry, WebContainers, WebMatches, [entry], outbound: WebOutbound, externalNodes: [ApiNode]);
+
+        var hook = Assert.Single(f.Root.Children[0].Children, c => c.Label == "useMT5GroupByServerId");
+        // 顺序：hop（对上路由的那条）→ http（没对上的）→ 框架调用组；第 60 行没有重复成 http，第 80 行与别的容器的不挂
+        Assert.Equal(new[] { ("HTTP /api/v5/mt5/servers", "hop"), ("GET /api/v5/mt5/groups", "http"), ("get", "external-group") },
+            hook.Children.Select(c => (c.Label, c.Kind)));
+        var http = hook.Children[1];
+        Assert.Equal(((long?)null, "/api/proxy-gateway/api/v5/mt5/groups", ApiNodeKey, 0.5, 2, 3, "未对上后端（后端不在索引里，或路由没匹配上）"),
+            (http.SymbolId, http.QualifiedName, http.Actor, http.Confidence, http.Count, http.Depth, http.Note));
+        Assert.Empty(http.Children);
+        var actor = Assert.Single(f.Actors, a => a.Key == ApiNodeKey);
+        Assert.Equal(("API /api/v5", "external"), (actor.Label, actor.Kind));
+    }
+
+    [Fact]
+    public void Flow_HttpNode_NoteSaysRouteMismatch_WhenAnotherDotnetContainerIsIndexed()
+    {
+        var entry = new EntryPoint(103, "web", "frontend.route", "page", "/x", null, HookPath, 35);
+        List<ArchNode> containers = [.. WebContainers, Container("backend", "backend")];
+        var f = FlowBuilder.Build(WebSymbols, WebEdges, entry, containers, [], [entry], outbound: [WebOut(53, "/api/proxy-gateway/api/v5/mt5/groups")], externalNodes: [ApiNode]);
+
+        var http = Assert.Single(f.Root.Children, c => c.Kind == "http");
+        Assert.Equal(("GET /api/v5/mt5/groups", 1, "未对上后端（路由没匹配上）"), (http.Label, http.Count, http.Note));
+    }
+
+    [Fact]
+    public void Flow_CSharpHttpClientOutbound_LabelUsesConfigKey_AndGoesToExternalColumnWithoutTarget()
+    {
+        // Handler.HandleAsync（3..20 行）第 10 行登记了 HttpClient "Billing"，地址来自配置键；没有匹配到外部节点
+        List<Outbound> outbound = [new("Acme.Api", "http-client", "http", "Billing", "Billing:Url", null, "Acme.App/H.cs", 10, null)];
+        var f = FlowBuilder.Build(Symbols, Edges, Entry, Containers, Matches, AllEntries, outbound: outbound);
+
+        var handler = f.Root.Children[0];
+        Assert.Equal(new[] { "OrderRepo.Save", "IOrderRepo.Save", "Log", "HTTP /api/billing/invoices", "HTTP Billing:Url" }, handler.Children.Select(c => c.Label));
+        var http = handler.Children[4];
+        Assert.Equal(("http", "Billing:Url", "ext|", 0.5, "未对上后端（路由没匹配上）"), (http.Kind, http.QualifiedName, http.Actor, http.Confidence, http.Note));
+        Assert.Equal("外部 / 框架", f.Actors.Single(a => a.Key == "ext|").Label);
+    }
+
+    [Fact]
+    public void Flow_HooksRankBeforeChildComponents_SoFanoutKeepsTheDataPath()
+    {
+        // 组件里先按限定名排的子组件（components/… < hooks/…）会把 hook 挤进"还有 N 个"；hook 排前面
+        List<MapSymbol> symbols = [.. WebSymbols, new(106, SymbolKind.Function, "web/src/components/MT5Group/MT5GroupTable.tsx:ActionButton", "web/src/components/MT5Group/MT5GroupTable.tsx", null, 100, 150)];
+        List<MapEdge> edges = [.. WebEdges, new(102, 106, EdgeKind.Calls, 0.9, "render")];
+        var entry = new EntryPoint(102, "web", "frontend.route", "page", "/x", null, "web/src/components/MT5Group/MT5GroupTable.tsx", 159);
+        var f = FlowBuilder.Build(symbols, edges, entry, WebContainers, [], [entry], fanout: 1);
+
+        Assert.Equal(new[] { "useMT5GroupByServerId", "还有 1 个" }, f.Root.Children.Select(c => c.Label));
+    }
+
+    [Fact]
+    public void Flow_ModuleFallbackEntry_ShowsFileName_AndChildFunctionName()
+    {
+        var entry = new EntryPoint(100, "web", "frontend.route", "page", "/{lang}/groups", null, PagePath, 1);
+        var f = FlowBuilder.Build(WebSymbols, WebEdges, entry, WebContainers, [], [entry]);
+
+        Assert.Equal("page.tsx", f.Root.Label);
+        Assert.Equal(("GroupsPage", "function"), (f.Root.Children[0].Label, f.Root.Children[0].Kind));
     }
 
     [Fact]

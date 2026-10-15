@@ -15,7 +15,8 @@ public sealed record DirectEdge(string ContainerKey, string ExternalKey, string 
 
 public sealed class RuleContext
 {
-    private static readonly Regex TestPath = new(@"(^|[/.])(tests?|__tests__|spec|specs)([/.]|$)|\.(test|spec)\.[tj]sx?$|Tests?\.cs$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    // Go 的 x_test.go、Python 的 test_x.py / x_test.py / conftest.py 也是测试文件
+    private static readonly Regex TestPath = new(@"(^|[/.])(tests?|__tests__|spec|specs)([/.]|$)|\.(test|spec)\.[tj]sx?$|Tests?\.cs$|_test\.go$|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private readonly Dictionary<string, string[]> _lines = new(StringComparer.Ordinal);
 
     public ProjectInventory Inventory { get; }
@@ -43,10 +44,23 @@ public sealed class RuleContext
     public string? ProjectDirOf(string rel) =>
         Inventory.Projects.Select(p => p.Dir).Where(d => Under(rel, d)).OrderByDescending(d => d.Length).FirstOrDefault();
 
-    public static bool Under(string rel, string dir) => dir.Length == 0 || rel == dir || rel.StartsWith(dir + "/", StringComparison.Ordinal);
+    /// <summary>
+    /// rel 是否在 dir 之下。dir 为 "" 表示主根：只含主根内的文件——外部根的文件（../other/…）不算，
+    /// 否则主根上的前端容器（package.json 在根）会把后端外部根整个吞进去。
+    /// </summary>
+    public static bool Under(string rel, string dir) =>
+        dir.Length == 0 ? !IsOutsideMain(rel) : rel == dir || rel.StartsWith(dir + "/", StringComparison.Ordinal);
+
+    /// <summary>相对主根的路径落在主根之外：外部根的 ../…，或跨盘时的绝对路径。</summary>
+    public static bool IsOutsideMain(string rel) =>
+        rel == ".." || rel.StartsWith("../", StringComparison.Ordinal) || System.IO.Path.IsPathRooted(rel);
 
     /// <summary>C# 源码文件，排除测试文件与 obj/bin（清单已排除目录）。</summary>
     public IEnumerable<string> CSharpFiles() => Inventory.SourceFiles.Where(f => f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) && !IsTestFile(f));
+
+    /// <summary>某扩展名的源码文件（如 ".go"、".py"），排除测试文件与 protoc 生成的桩代码。</summary>
+    public IEnumerable<string> SourceFilesOf(string extension) =>
+        Inventory.SourceFiles.Where(f => f.EndsWith(extension, StringComparison.OrdinalIgnoreCase) && !IsTestFile(f) && !ProjectInventory.IsGeneratedSource(f));
 
     public string[] Lines(string rel)
     {

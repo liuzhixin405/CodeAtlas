@@ -207,6 +207,308 @@
 4. obj/ bin/ 下的生成代码按仓库外处理（gRPC stub、AssemblyInfo）。
 5. 基类虚方法 → 重写 的派生边还没做（只处理接口）。
 
+## 影响范围 + 模块关系 + 快速跳转 — 2026-10-16
+- 起因：用户要的四个视角里，"一步步做了什么"已经用调用大纲做完，这次把另外三个也做了。三条要求依次是："继续把影响范围的反向树也做了"、"把模块关系那个视图也一起做了"、"快速跳转那个也一起做了"。
+- 主线先定数据格式（`ImpactDto`、`RelationsDto`、`FileLensDto`），然后六个代理并行：每个视角一个服务端、一个扩展。共享文件约定只加接线、逻辑放新文件。主线最后负责整合：
+  - 跨服务调用方 Kind=hop；
+  - 面板接线：`showRelations`、聚焦后 `chain:"in"`、`open` 消息带 pos；
+  - 编辑器右键与侧边栏按钮"在模块关系中查看"；
+  - 使用指南第 12 节。
+- **影响范围**（侧边栏视图 + `GET /api/symbols/{id}/impact` + `query --impact`）：
+  - 直接调用方分 call / impl / dispatch / new / hop 五种。hop 是别的容器经路由匹配调到这里，比如前端 fetch。
+  - 根请求附带往上能走到的全部入口（BFS，深度 15、节点 5000 封顶，0.5 以下的调用边不走）。
+  - 分派边例外：只用 tree-sitter 时分派边固定 0.4，按原规则 Handler 往上到不了 HTTP 入口。这是 Linux 复测时发现的，已改成分派边照走，并补了测试。
+- **模块关系**（面板第二种模式 + `GET /api/symbols/{id}/relations` + `query --relations`）：
+  - 以类为单位汇总调用、构造、分派、继承、实现、引用，按组件分框。
+  - 组件按依赖顺序从左到右，排序复用 DSM 抽出来的 `DsmBuilder.DependencyOrder`。编译期依赖定不了先后时，用运行时去向补。
+  - 反向依赖标红；深度 2、40 个节点封顶。
+- **快速跳转**：
+  - 方法上方显示 CodeLens"被 N 处调用 · 调用 M 个 · 影响范围"，数据来自 `GET /api/files/lens`，一次给整个文件。
+  - 三个命令：转到调用方 / 被调方 / 受影响的入口，快捷键 `Ctrl+Alt+H / J / R`（macOS `Ctrl+Cmd+…`）。
+    - 原想用 `Ctrl+Alt+↑/↓`，它和多光标冲突；`Shift+Alt+H` 被 VS Code 自带的调用层次占了；`Ctrl+Alt+E` 在 AltGr 布局下会打出 €。
+  - 跳转改用 `showTextDocument({ selection })`，能进导航历史，`Alt+←` 可以退回。
+  - 面板调用图加了"跟随光标"开关。
+- **三个视角的计数一致性**：CodeLens 的调用方数和影响范围、被调方数和调用大纲，都复用同一套规则代码。在 6 个产品文件上逐个核对，没有不一致。
+- **测试**：.NET 848 个（Server 290 / Core 175 / TreeSitter 262 / Roslyn 98 / Cli 23），vitest 338 个。各代理都把关键规则还原过，确认测试会变红。
+- **实测**（eShop）：
+  - 影响范围：`Order.AddOrderItem` 开 Roslyn 时找到 5 个入口，`POST /api/orders` 在深度 3；只用 tree-sitter 时在深度 2。
+  - 模块关系：`CreateOrderCommandHandler` 的组件顺序是 Ordering.Domain → Ordering.Infrastructure → Ordering.API → 外部。浏览器里用真实服务端数据确认了分框、反向依赖和外部框。
+  - Linux 上大纲、影响范围、模块关系三个命令的输出与 Windows 逐行一致（57 行，0 差异）。
+- **性能**（大库 10.6 万符号、88 万边）：
+
+  | 请求 | 耗时 |
+  |---|---|
+  | 影响范围 entries=true | 中位 5 ms，最慢 140–170 ms（热缓存）；冷缓存的第一次出现过 290 ms |
+  | 模块关系 depth=2 | 最慢 128 ms |
+  | CodeLens，200 个方法的文件 | 约 17 ms |
+- **回归**：场景 4 新增"影响范围追到 POST /api/orders""模块关系组件按依赖序"两项，共 38 项全部通过。场景 4 另外用 `-NoRoslyn` 跑了一遍，5 项全部通过。
+- **已知**：
+  - 模块关系图里线多时线上的标签会压住组件框的标题——已修（同日）：标题改成单独的节点，骑在框的上边线上，带不透明底色，层级在所有线与线上文字之上；框本身不再画字。
+  - 只用 tree-sitter 时，模块关系里会多出按名字猜错的组件（eShop 里多了 Basket.API）。
+  - 抽象类没法区分：签名里没有 abstract 修饰符。
+  - Blazor 的 `.razor` 文件不在索引里，WebApp 的页面入口追不到。
+- **只能在真实 VS Code 里验证的**：
+  - CodeLens 的位置，以及编辑后隐藏、保存后恢复；
+  - 三个快捷键在 macOS 上的实际效果，`Alt+←` 退回；
+  - 两个视图共用光标跟随的手感；
+  - 面板"跟随光标"与模块关系的跳转。
+
+## 调用大纲（侧边栏）— 2026-10-16
+- **起因**：用户说"复杂一点的项目，调用图不太直观"。
+- **追问后的结论**：
+  - 四个用途都要：一步步做了什么、改它会影响谁、快速跳转、模块关系。最想先解决的是"这个方法一步步做了什么"。
+  - 只列调用，按源码顺序，行尾标"循环内 / 条件内"。
+  - 做成 VS Code 原生的侧边栏树视图，跟随光标。
+  - 用户要求不写设计稿、直接写代码、拆成几个任务并行。
+- **现状问题**：在 eShop 的 `OrdersApi.CreateOrderAsync` 上看：
+  - 方法和类型（继承链）混在一张图里；
+  - 看不出先后顺序；
+  - 节点名字不带类名；
+  - "N 个框架调用"之类的占位节点多；
+  - 布局交叉。
+- **T0（主线）**：
+  - edges 新增 `pos`（调用名的 UTF-16 字符偏移）和 `ctx`（loop / cond / try / catch / callback）。
+  - 用字符偏移而不是列号，是因为多行链式调用的行号都记在链开头那一行，按（行，列）排会错。
+  - 解析器统一给每个引用产生的边盖上这两项，各语言分支不用各自处理。
+  - 适配器基类加了 `ContextOf` / `IsContextBoundary` / `ReferencePos` 三个钩子。
+  - 定好 `OutlineDto` 数据格式。索引版本升到 10。
+- **并行的五个任务**：
+  - T1：tree-sitter C# / TS / JS 的结构判断，以及所有语言共用的字符偏移。实测 TreeSitter.DotNet 的 `StartIndex` 本来就是 UTF-16 偏移，不用换算。
+  - T2：Go / Python / Java 的结构判断。
+  - T3：Roslyn `DocumentWalker` 给出偏移和结构。
+  - T4：`OutlineBuilder`、`GET /api/symbols/{id}/outline`、命令行 `query --outline`。
+  - T5：侧边栏「调用大纲」树视图，带跟随 / 固定、框架调用开关、递归检测。
+- **共同约定**：
+  - 结构只算"体"：条件头、循环头里的调用不算。
+  - 取最内层的那一个结构。
+  - 本身是独立符号的嵌套函数当边界，包括 C# 局部函数、TS 的 `const f = () =>`、Python 嵌套 def；它们体内的调用归它们自己，不标"回调"。
+  - `&&` / `||` 右侧不算条件。
+- **测试**：.NET 794 个（Server 238 / Core 175 / TreeSitter 262 / Roslyn 98 / Cli 21），vitest 231 个。每个代理都把关键规则还原过，确认测试会变红。
+- **实测**（eShop `CreateOrderCommandHandler.Handle`）：两种索引都按源码顺序列出 8 步，接口调用下挂唯一实现，`Order.AddOrderItem` 标 `[loop]`。
+  - 开 Roslyn：第 1 步是 `new OrderStartedIntegrationEvent`。
+  - 只用 tree-sitter：第 1 步被启发式当成分派到 `OrderStartedIntegrationEventHandler`。
+  - Linux 上的结果与 Windows 逐行一致。
+- **性能**：ccs-backend 真实库（10.6 万符号、88 万边），单次大纲请求中位 0.29 ms，95 分位 8 ms。ccs-ui 的索引耗时没有可测出的变化。
+- **回归**：场景 4 新增"调用大纲按源码顺序、标出循环内"一项。
+- **只能在真实 VS Code 里验证的**（侧边栏是原生控件，没法截图）：
+  - 活动栏图标的观感；
+  - 框架调用的文字会不会变灰；
+  - 单击可展开的条目会不会顺带展开；
+  - 欢迎内容会不会按状态切换；
+  - 固定 / 跟随按钮会不会正确切换；
+  - 跟随的手感；
+  - 跳转是否落在调用名上；
+  - 重启窗口后视图的状态；
+  - 多根工作区里的跳转。
+
+## 不再要求 .NET + 跨平台（Windows / Linux / macOS）— 2026-10-15（深夜）
+- 起因：用户问"假如用户只需要前端的代码地图，为什么还需要安装 .NET 10"，"其它语言的地图强制 .NET 10 肯定不合理"。
+- 做法：
+  - **服务自带运行时发布**：`publish.ps1 -Rid …` 用 `--self-contained true`，只保留用到的 7 个 tree-sitter 语法库。原来带 30 个，用不上的 23 个约 58 MB。
+  - **Roslyn worker 单独放**：放到 `roslyn/` 子目录，仍依赖本机 .NET 10。和服务同目录时会误用服务自带的 hostfxr。
+  - **跑 Roslyn 前先探测**：用 `codeatlas-roslyn --probe` 检查本机环境，缺运行时、缺 SDK 时给一句原因，C# 退回 tree-sitter，扩展只提示一次。仓库 `global.json` 要求的 SDK 本机没有时，也给一句原因，不打堆栈。
+  - **Linux / macOS 补可执行位**：在 Windows 上打的 VSIX 里没有 Unix 权限。扩展启动服务前、服务启动 worker 前都会自动补上。
+  - **每个平台一个 VSIX**：`package-all.ps1` 打出 win32-x64、linux-x64、linux-arm64、darwin-x64、darwin-arm64 五个包，用 `vsce --target`。
+- 跨平台排查（代理）：
+  - Roslyn 文档去重、仓库根判断：原来写死忽略大小写，改为按平台比较。
+  - 清单遍历：原来会跟进符号链接，Linux 上指回上级目录会无限递归，改为跳过。
+  - Dockerfile / appsettings：在 Linux 上找文件时不区分大小写，并按名字排序，与 NTFS 一致。
+  - `backendDetect`：同级目录判断按平台处理大小写。
+- 主线：`.SLN` 不分大小写也能找到，符号链接目录跳过。
+- **顺带发现、与平台无关的 bug**：在 Linux 上测 Roslyn 时发现，Bing 跑完 Roslyn 后 HTTP 入口从 121 个变成 0 个，Windows 上一样。上一轮回归的场景 14 只查了"不崩"，没查入口数，现已加上检查。查下来是三个原因叠在一起：
+  1. **继承边被删**：包没还原时，Roslyn 认不出 `ControllerBase`，不给 inherits 边，写回时又删了 tree-sitter 的继承边。修法：Roslyn 对某个类型的某种边（inherits / implements）一条都没给时，保留启发式边。修后 0 → 89。
+  2. **继承链只找 4 层**：Roslyn 会把只差泛型参数个数的同名基类分开，链就变深了（`TreesControllerBase` 到 `ControllerBase` 要走 5 层以上）。修法：改成最多找 8 层，并防止"自己继承自己"造成的环。
+  3. **泛型类成员的短名取错**：`Ns.Repo<T>.Find` 原来从第一个 `<` 截断，得到的是类名 `Repo`，入口识别就把这个方法当成构造函数滤掉了。修法：去掉所有成对的 `<…>`。同样的写法还在管道视图短名、命名空间推断里，一并改了。时序图里泛型类成员的标签以前也显示成类名。
+  - 修后：Bing 开 Roslyn 有 123 个 HTTP 入口，只用 tree-sitter 时是 121 个。每条修复都补了单测，并确认还原后测试变红。
+  - 另修：入口识别里 `AttributesAbove` 在文件比索引短时会下标越界（索引之后文件被改短就会触发）。
+
+### 实测：没装 .NET 的 Ubuntu 24.04（WSL，`wsl --import` 官方 cloud-images 镜像）
+- 部署方式模拟 VSIX：全部文件去掉可执行位，只给主程序加回；仓库复制进 Linux 自己的文件系统（区分大小写）。
+- 9 个仓库的 tree-sitter 结果与 Windows **逐项相同**：
+
+| 仓库 | 文件 / 符号 / 边 | 容器 / 外部 / 容器边 | 入口 / 跨服务匹配 |
+|---|---|---|---|
+| ccs-ui | 1577 / 27343 / 129635 | 1 / 3 / 3 | 60 / 0 |
+| ccs-backend | 7027 / 101838 / 770643 | 5 / 16 / 32 | 1880 / 412 |
+| microservices-demo | 59 / 3760 / 10129 | 12 / 9 / 34 | 44 / 20 |
+| petclinic-microservices | 84 / 915 / 1779 | 8 / 5 / 38 | 25 / 15 |
+| fastapi | 152 / 1880 / 5791 | 2 / 4 / 4 | 24 / 23 |
+| gin | 19 / 448 / 2484 | 1 / 1 / 1 | 21 / 0 |
+| django | 44 / 293 / 651 | 1 / 1 / 1 | 18 / 0 |
+| eShop | 567 / 5614 / 15111 | 12 / 8 / 38 | 111 / 28 |
+| Bing | 1976 / 19511 / 88120 | 5 / 1 / 2 | 132 / 0 |
+
+- 含 `.sln` 的仓库给出提示："没有找到 .NET 10 运行时，C# 精确语义（Roslyn）需要它（装 .NET 10 SDK 即可）。C# 改用 tree-sitter 解析（精度略低），其他语言不受影响。"
+- worker 的权限从 `-rw-r--r--` 被自动补成 `-rwxr-xr-x`。
+- `serve` 按扩展的参数启动：打出 `{"port":N}`，带令牌请求 `/api/health` 正常。
+- 看门狗：父进程退出后 12 秒内服务自动退出。
+- 大小写和符号链接：
+  - 只差大小写的 `Program.cs` / `program.cs` 都进了索引，两者之间的调用也连上了；
+  - 全大写的 `App.SLN` 能找到；
+  - 指回上级目录的符号链接没有挂死。
+- 之后在同一发行版里装了 Ubuntu 源的 `dotnet-sdk-10.0`（10.0.112）：
+  - Bing 的 Roslyn 能跑：1968 个文件写回，边 15985 条，错误 44 个。
+  - eShop 的 `global.json` 锁定 SDK 10.0.302，本机 10.0.112 不兼容，Roslyn 跳过，原因给成一句话，其余结果照常。
+
+### 最终复测（三个修复之后）
+- **Windows**：`scripts/regression.ps1` 14 个场景 **35 项全部通过**。场景 14 新增的"控制器入口不因 Roslyn 丢失"：123 个。
+- **单测**：.NET 575 个（Core 172 / Server 219 / TreeSitter 130 / Cli 20 / Roslyn 34），vitest 187 个。
+- **Linux**（重新部署，去掉可执行位）：9 个仓库的 tree-sitter 结果与 Windows 逐行相同。
+  - ccs-backend 在 Windows 上已经从 7027 个文件变成 7043 个（仓库本身有更新），所以重新复制后再对照。
+  - 开 Roslyn 时 Bing 有 123 个 HTTP 入口，与 Windows 一致；worker 的可执行位被自动补上。
+- **已知小问题**：在旧库上全量重建，会残留不再被引用的外部符号（ccs-backend 多了 16 个），不影响地图。两个平台都是这样。
+
+### 没有实测的
+- macOS 两个包是在 Windows 上交叉发布的，没在 Mac 上跑过。Apple 芯片要求二进制签名：.NET SDK 会给 apphost 做 ad-hoc 签名，NuGet 带的 tree-sitter / SQLite 原生库有没有签名没核实。
+- linux-arm64 没实测。Alpine 等 musl 发行版没有打包。
+- 没装 .NET 的 **Windows** 机器没实测。runtimeconfig 已确认是自带运行时（`includedFrameworks`），Linux 上的实测走的是同一套发布方式。
+
+## Java 支持 + 全部语言的缺口 + 控制台 / 旧版 .NET — 2026-10-15（夜）
+- 起因：用户问"C# 只是控制台项目，项目地图还有用吗？3.1 / 5 / 6 … 不同版本有效吗"，随后"有缺口的一起修了吧，所有已实现语言"。
+- 两波共九个代理并行：
+  - Java 三件套：索引（`JavaAdapter` + 按 package 限定名解析，`via=impl`）；架构层（Maven / Gradle 容器、Spring 依赖、Eureka / Config 服务端、网关路由、Feign / RestTemplate / WebClient 出口、Java gRPC）；入口与地图（Spring MVC / WebFlux / JAX-RS / gRPC / `@Scheduled` / 监听器 / main，网关穿透匹配，DSM 按 package）。
+  - TS/JS：CommonJS `require` / `exports`、`memo` / `forwardRef`、`onX={handler}` 记 `via=event`、`this.字段` 按类型、NestJS 构造注入。
+  - Go/Python：字段、链式、range、泛型、包名 ≠ 目录名、函数值；实例属性、局部变量、`import *`、pb2，外部调用带包名。
+  - C# tree-sitter：按接收者类型解析，重载按实参个数挑，`nameof` 不算调用，链式行号与 Roslyn 一致。
+  - CLI 框架入口（新 kind「命令行命令」）、Node 后端入口、纯类库仓库首屏改为 DSM。
+- 主线：
+  - `RoslynApplier` 增加兜底：Roslyn 某行一条调用都没绑上时，保留 ≥0.7 的启发式边，置信度封顶 0.7。
+  - 时序图排序：下一层才续接的调用（`chooseAd → getAd → gRPC`）排在普通调用前。
+  - 详情条的置信度文字按现行分档改写，显示两位小数。
+  - `.java` 纳入保存时增量。
+  - 索引版本升到 9。
+  - 回归脚本扩到 14 个场景。
+- 测试：.NET 552（Server 213 / Core 165 / TreeSitter 130 / Cli 20 / Roslyn 24），vitest 185，`tsc --noEmit` 0 错误。每个代理挑了修复，把实现还原后跑过测试，确认会变红。TS/JS 代理当时没能做这一步，由主线补做：还原构造注入解析和 `require` 绑定后，3 个测试变红。
+
+### 版本与项目形态（回答用户的问题，实测）
+| 项目 | 形态 | 结果 |
+|---|---|---|
+| CodeAtlas 自身 | net10 控制台（手写 switch 分派） | `src/CodeAtlas.Cli` 容器有 `Program.Main` 入口，流程走到各子命令的 `Run`。只用 tree-sitter 时，流程从修前停在 Main 一个节点，变为 38 个节点 |
+| Bing.NetCore | netcoreapp3.1 / netstandard2.x，110 个项目，同目录多 csproj，包未还原 | 修前容器扫描崩溃（重复键），修后 5 个容器。Roslyn 有 206 个错误，绑不上的调用保留启发式边 2097 条 |
+| Audit.NET | net462 → net10 多目标 | 4 个容器、7 个入口；Roslyn 错误 347，其余照常写回 |
+| WebTrader.Server.MT5 迁移备份 | .NET Framework 4.7.2 旧式 csproj + packages.config | 修前 27 个垃圾"原生 SDK"节点（System.* 与强名称全串），修后 3 个真实外部系统 |
+
+C# tree-sitter 精度，以 Roslyn 为答案，按（文件, 行）对齐 calls 边：
+
+| 仓库 | 修前 | 修后 |
+|---|---|---|
+| CodeAtlas | 67.2% | 99.4% |
+| ccs-backend | 34.6% | 97.8% |
+| Bing | 35.8% | 94.9% |
+
+仓库内边数下降，主要是去掉了 0.3 的多候选误连；与 Roslyn 一致的边数上升。
+
+### 回归（`scripts/regression.ps1`，Roslyn auto，34 项全部通过）
+| 场景 | 检查 | 实测 |
+|---|---|---|
+| 1 ccs-backend | 索引 / 批量建组 / mt4proxy 入口 / 组管理页 / 续接进后端 | 7027 文件 186s；73 节点到 SendAndReadDataAsync；76 个入口；343 节点；9 个 hop 到 Mt5GroupController |
+| 2 mt4proxy | 控制器 → P23 | 54 节点 |
+| 3 mt5-event-publisher | Job / Kafka | 3 个 job，常驻服务流程到 Kafka 14 处 |
+| 4 eShop | 路由匹配 / 分派 | 28；只分派到 CreateOrderIdentifiedCommandHandler |
+| 5 ccs-ui 单独 | 出口 / 组管理页 / 接口行 | 389；189 节点；GET /api/v5/mt5/groups |
+| 6 ccs-ui + 后端 | 5 个容器 / 组管理页 / 续接 | 5；343 节点；9 个 hop |
+| 7 Online Boutique | 容器 / gRPC / 商品目录续接 / **Java 广告服务续接** / **Node gRPC 入口** | 12 个（含 adservice）；0.9 的 grpc 边 14 条；54 节点；AdServiceImpl 2 个节点；PaymentService/Charge |
+| 8 FastAPI | 路由匹配 / 前缀 | 23；23 个 `/api/v1/*` |
+| 9 gin | 入口 / 流程 | 20；38 节点 |
+| 10 Django | 入口 / 流程 | 17；7 节点 |
+| 11 spring-petclinic | Spring MVC 入口 / 控制器 → Repository | 17；`GET /owners/{ownerId}` 到 `findById` |
+| 12 petclinic-microservices | 容器与匹配 / 网关续接 | 8 个容器、route-matches 15；`/api/gateway/owners/{ownerId}` 22 节点，2 个 hop 到 OwnerResource |
+| 13 CodeAtlas 控制台 | Main → 子命令 | 到 `IndexCommand.Run` |
+| 14 Bing（3.1） | 容器扫描 / Roslyn 兜底 | 5 个容器；保留 2097 条 |
+
+第一次跑有 2 项不通过，都是新加的检查：
+- "首页续接进 Java 广告服务"：查明是时序图排序问题。`chooseAd` 自己不续接，被扇出上限 6 折进了"还有 8 个"。改了排序并补了单测，还原排序后单测变红。
+- "Node gRPC 入口"：是检查脚本的问题。PowerShell 5.1 的 `if` 表达式会把单元素数组拆开，单个 PSCustomObject 没有 `.Count`。工具输出本身正确。
+
+### 已知
+- Java：
+  - 不支持 Gradle 版本目录、Kotlin、Lombok 生成的方法；重载只按个数挑。
+  - 接口上写映射注解的控制器不认。
+  - 静态前端没有单独成容器，所以 petclinic 的边是"网关 → 服务"一段。
+- TS/JS：不支持改名导出、动态 `import()`、`withRouter` / `connect` 这类 HOC；`props.onX` 不标 event。
+- Go：只推第一个返回值，不推 type switch 变量。
+- Python：不推别的文件里赋值的实例属性和 `@property` 返回类型，不支持 `.pyi`。
+- C#：元组解构、lambda 参数、泛型返回 `T`、`global using` 别名推不出来。外部调用名改成了 `external:<类型>.方法`，时序图里外部参与者按类型分列。
+- CLI 框架只有 System.CommandLine（scip-dotnet）和 yargs（appmap-js）做过真实项目验证，其余是夹具验证。
+- 时序图节点数：回归里出现了 343 / 462 节点的流程，超过默认封顶 300。原因未核实，推测是脚本遍历把"还有 N 个"、框架调用组这类占位节点也算了进去，而封顶只算展开的符号。
+
+## Go 与 Python 支持 — 2026-10-15（晚）
+- 四个代理并行：Go 索引（`GoAdapter` + go.mod / import 解析，同包跨文件、别名 / 点导入、局部变量与 `NewXxx()` 返回值的类型）、Python 索引（`PythonAdapter` + 包根推断、相对导入、`self` 沿基类、类属性别名 `serializer_class = X`）、架构层（Go 模块 / Python 项目 / Node 服务成为容器；go.mod、requirements / pyproject 依赖映射外部系统；Go / Python 的 HTTP 与 gRPC 出口；**跨语言 gRPC 按服务名连线**——客户端桩 `NewXxxClient` / `XxxStub` / `XxxClient` 对服务端注册 `RegisterXxxServer` / `add_XxxServicer_to_server` / `MapGrpcService<T>`）、入口与地图（net/http · gorilla/mux · gin · echo · chi · gRPC 服务端 · main；FastAPI 含 `APIRouter` / `include_router` 前缀链与常量 · Flask · Django urls / DRF router · Celery · `__main__`；gRPC 调用按 `Service/Method` 续接进对端服务；DSM 按包目录）。主线：统一语言注册表 `LanguageAdapters.Create()`、保存时索引加 `.go` / `.py`、页面新容器类型中文名（加了覆盖测试）、文档、回归新增 4 个场景。
+- 验收项目（GitHub 公开示例，浅克隆到 `D:\github\reference`，只解析不运行）：GoogleCloudPlatform/microservices-demo（Online Boutique，Go + Python + C# + Node，gRPC）、fastapi/full-stack-fastapi-template（FastAPI + React）、gothinkster/golang-gin-realworld-example-app、gothinkster/django-realworld-example-app。
+- 测试：.NET 421（Core 126 / TreeSitter 81 / Server 170 / Cli 20 / Roslyn 24），vitest 180。
+
+| 场景 | 检查 | 结果 | 实测 |
+|---|---|---|---|
+| 7 Online Boutique | 多语言容器 | 通过 | 11 个（Go 4、Python 4、Node 2、C# 1；Java 的 adservice 不支持），索引 9s |
+| 7 | gRPC 按服务名连线 | 通过 | 0.9 的 grpc 边 13 条（frontend → AdService 因 Java 不支持降为 0.5） |
+| 7 | Go 首页 → gRPC 续接 | 通过 | `/cart/checkout`：`placeOrderHandler`（Go）→ `RecommendationService/ListRecommendations`（Python）→ `ProductCatalogService/ListProducts`（Go）→ `loadCatalogFromAlloyDB` |
+| 8 FastAPI 模板 | 前端 → 后端路由匹配 | 通过 | 23，容器边 0.9 |
+| 8 | 入口带前缀 | 通过 | 23 个全部 `/api/v1/*`（`settings.API_V1_STR` 常量已解析） |
+| 9 gin RealWorld | 路由入口 | 通过 | 20（跨函数传 group 的前缀也拼上了，如 `/api/articles/:slug/comments/:id`） |
+| 9 | handler 流程 | 通过 | `POST /api/articles` 38 节点 |
+| 10 Django RealWorld | urls / DRF 入口 | 通过 | 17 |
+| 10 | 视图流程 | 通过 | `POST /api/articles` 7 节点（走到 `ArticleSerializer`） |
+
+场景 1–6（.NET / 前端 / 多项目）同一构建全部通过，结果与上一轮一致。回归第一次跑时场景 10 报"没认出容器"，查明是检查脚本把 JSON 里的枚举数值 0 当成了字符串比较，工具本身输出正确；修脚本后重跑通过。
+
+### 已知
+- Go：不推断 struct 字段、方法返回值、range 变量的类型；函数值当参数（`router.POST("", h)`）不产生调用边（入口规则直接扫注册语句）；包名与目录名不一致且没写别名的 import 认不出。
+- Python：`from x import *`、局部变量 / 实例属性类型、运行时生成的 protobuf 类不解析；Django ORM `Model.objects.*` 记为外部调用。
+- 不支持 Java（adservice）；Node 服务有容器但没有符号，续接到它们时停在 hop。k8s / compose 清单里的端口与环境变量值没读。
+
+## 前端第一屏 + 旧索引自动重建 — 2026-10-15（下午）
+- 用户装上新 VSIX 后，单独打开 ccs-ui 项目地图"还是光秃秃"。查用户本机索引（`ccs-ui/.codeatlas/index.db`，9:30 旧插件建的）：组管理页流程仍是 `page.tsx → GroupsPage` 2 个节点。**根因是我的疏漏**：TS 解析规则变了却没升索引格式版本（仍是 7），新插件认为旧索引可用，只重算了容器图（出口 389），调用链没重建；而且"版本过旧自动重建"只在右键"在 CodeAtlas 中查看"时触发，直接开面板看地图的人永远用旧索引。
+- 修：索引版本 7 → 8；服务启动时自己检查，旧版本就全量重建（`StartupRebuildTests`，去掉修复会红）。用用户那份旧索引的副本实测：服务起来自动重建 1577 个文件，`needsRebuild` 变 false。
+- 同一问题用户第二次提出，按流程先确认目标行为：用户选"只有一个自己的容器时第一屏直接进入入口流程"、"检测到旁边的后端时提示一次是否一起索引"。实现：`firstScreen.ts`（唯一容器 → 自动进入口流程；默认入口挑接口调用最多的流程——第一版按路由最短选到了登录页、没有任何接口调用，改了）、`backendDetect.ts`（上级目录根下有 sln 就只提上级）、时序图新增 kind `http`（hook 里没对上后端的接口调用，灰蓝虚线、"接口"标记、标签贴调用方一端）。
+- 浏览器实测（用户旧索引副本 → 自动重建后）：点"项目地图"直接进入入口流程，默认选中 `roles-management/role-groups/{id}`（90 节点、9 个接口调用：`POST /api/v5/roles/role-groups`、`DELETE …/${id}`、`GET /api/v5/roles` …）；组管理页 hook 下列出 `GET /api/v5/mt4/groups`、`GET /api/v5/mt5/groups` 等。
+- 测试：.NET 327，vitest 179。回归 16 项全过（新增"hook 下显示接口调用"）。
+- 已知：自动检测提示、写 `.vscode/settings.json` 后全量重建这条只做了单测与对真实目录的检测，没在真实 VS Code 里点过。
+
+## 前端调用链 + 前端接口识别 + 多项目索引 + 交付回归 — 2026-10-15
+- 起因：用户单独打开 ccs-ui，项目地图只有 1 个前端容器 + 4 个"API"占位框，组管理页的入口流程 2 个节点。用户问"单独打开任何项目都出问题还算合格的插件吗"。补测设计稿要求的四个项目单独打开：C# 后端都合格，前端不合格；5c 验收时漏测了 ccs-ui（当时它没有符号就当已知限制带过了）。
+- 三个代理并行：
+  - **前端调用链**：JSX 组件引用算 `calls` + `via = render`（只认首字母大写的标签，含 `<X.Y/>` 与作为 prop 传入的元素；npm 包组件记为 external `包.名字`）；TS / TSX / JS 调用按 import 绑定解析（相对路径、tsconfig `paths` / `baseUrl` / `extends`、`index.*`、桶文件最多 3 层），解析不到的不再按全仓同名猜；Next.js 页面入口改为默认导出的组件，App Router `route.ts` 按导出的方法各一个入口；修掉"tsx"与空名字标签。
+  - **前端接口识别**：`TsConstantResolver` 解析 `API_ROUTES.X.Y` 嵌套对象、模板字符串与跨文件常量；认 `useApi()` / `createXxx()` 返回的客户端上的 `.get/.post/.put/.patch/.delete`（判据是工厂函数体用到 fetch / axios，`map.get` 不误判）；拼上 axios `baseURL`；从 Next API 路由里的转发代码自动认出代理前缀 `/api/proxy-gateway`（也可在 `architecture.yaml` 的 `proxies:` 声明），匹配后端路由前剥掉。
+  - **多项目**：嵌套仓库（独立克隆与子模块）默认纳入，worktree 总是跳过；每个仓库的 `.sln` 各跑一次 Roslyn；`--project <路径>`（可重复）与 `.codeatlas/config.json` 的 `projects` 接入外部根，文件以相对主根的 `../…` 入库并按真实路径去重；扩展把多根工作区其余文件夹、设置 `codeatlas.projects` 传给服务，`codeatlas.includeNestedRepos` 控制嵌套仓库。
+- 主线集成：时序图归属判断改用与容器规则同一判据（成员路径为空的主根容器不吞 `../` 文件）；**节点名额改为按子树分配**——合并前后端后，组管理页的 MT4 分支续接进后端把 300 个名额吃光、MT5 分支整支没了；改为兄弟分支平均分、前三层再把浅分支用剩的补给被截断的分支；置信度统一两位小数（0.95 不再显示成 1.0 冒充 Roslyn 精确）。新增 `scripts/regression.ps1`（六个场景 15 项检查）与 `scripts/pack-source.ps1`。
+- 测试：.NET 323（Core 101 / TreeSitter 48 / Server 130 / Cli 20 / Roslyn 24），vitest 150。新增用例都先确认在旧实现上会红（名额分配两条、外部根归属一条用临时还原验证过）。
+
+### ccs-ui 单独打开（tree-sitter）
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 识别出的后端接口调用 | 7 | 389（经代理 376；仍解析不出 38 处：参数透传、三元、动态下标等） |
+| 组管理页流程节点 | 2（`tsx` → 空名字） | 181：`GroupsPage` → 渲染 `MT5GroupTable` / `MT4GroupTable` / … → `useMT5GroupByServerId` |
+| 按名字瞎猜的 0.3 多候选边 | 8196 | 142 |
+
+### 前端续接进后端（ccs-ui 与 ccs-backend 在同一个索引里）
+`GroupsPage → MT4GroupTable（渲染）→ useMT4Group → HTTP /api/v5/mt4/groups → Mt4GroupController.ListGroups → ListMt4GroupsHandler.HandleAsync（分派）→ MT4GroupService.GetAllGroupAsync`；MT5 一支同样续接到 `Mt5GroupController`。两种打开方式都成立：打开 ccs-backend（嵌套仓库自动纳入），或打开 ccs-ui + `--project ccs-backend`。路由匹配 414 处。
+
+### 交付回归（`scripts/regression.ps1`，Roslyn 开）
+| 场景 | 检查 | 结果 | 实测 |
+|---|---|---|---|
+| 1 ccs-backend（含嵌套仓库） | 索引 | 通过 | 6785 文件，173s |
+| 1 | MT5 批量建组流程 | 通过 | 73 节点，走到 `SendAndReadDataAsync` |
+| 1 | 嵌套仓库 mt4proxy 有入口 | 通过 | http 76 |
+| 1 | 组管理页 → 组件 → hook | 通过 | 305 节点 |
+| 1 | 前端续接进后端控制器 | 通过 | hop 9 个，含 `Mt5GroupController` |
+| 2 mt4proxy 单独 | 控制器 → Service → P23 | 通过 | 54 节点，13s |
+| 3 mt5-event-publisher 单独 | Quartz Job 入口 | 通过 | 3 个，18s |
+| 3 | 有入口流程走到 Kafka 生产 | 通过 | `StatusEventPublisher` 24 节点，Kafka 14 |
+| 4 eShop | 跨服务路由匹配 | 通过 | 28，27s |
+| 4 | 下单只分派到对应 Handler | 通过 | `CreateOrderIdentifiedCommandHandler` |
+| 5 ccs-ui 单独 | 前端接口调用识别 | 通过 | 389，9s |
+| 5 | 组管理页 → 组件 → hook | 通过 | 181 节点，根 `GroupsPage` |
+| 6 ccs-ui + `--project ccs-backend` | 前后端五个容器 | 通过 | 5，165s |
+| 6 | 组管理页 → 组件 → hook | 通过 | 305 节点 |
+| 6 | 前端续接进后端控制器 | 通过 | hop 9 个，含 `Mt5GroupController` |
+
+共 15 项，不通过 0 项。设计稿原写"mt5-event-publisher 一条 Job 流程以 Kafka 收尾"，核实后不成立：Jobs 目录里没有 Kafka，生产 Kafka 的是常驻服务 `StatusEventPublisher`（→ `KafkaService.PublishMessage` → Confluent），检查改成"有入口流程走到 Kafka 生产"。
+
+### 已知
+- 组件到事件处理函数（`onClick={handleX}`）这段还连不上；`api.get` 本身显示为外部调用，续接由路由匹配挂在 hook 上。
+- 外部根的容器键带 `../` 前缀；索引不记住根，命令行 `arch` 要给同样的 `--project`（或用 config.json）。
+- 只打包 win-x64 服务。
+
 ## AI 叙述：联网服务 + 本地保留 + 持久缓存 — 2026-10-14
 - 用户反馈："本地 AI 太慢且经常失败，要支持联网 AI"，随后补充"不要把本地移除"、"做个缓存，对照 git 版本或别的判断过期，本地慢但能拿到结果"。
 - **两种协议，本地仍是默认**：OpenAI 兼容（本地 llama-server、DeepSeek、通义、OpenAI 等，有 Key 时带 Bearer；只有回环端点才发 llama-server 专用的关思考开关；端点不认 `response_format` 时自动去掉重发）与 Anthropic Messages API（`x-api-key` + `anthropic-version`）。401 / 403 直接提示 Key 问题不重试；429 按 Retry-After 退避最多 3 次；并发可配（`--ai-concurrency`，本地 1）；`--ai-no-source` 不发入口源码。API Key 只走环境变量 `CODEATLAS_AI_API_KEY`，扩展里存 VS Code SecretStorage，`ToString` 与日志都打码。

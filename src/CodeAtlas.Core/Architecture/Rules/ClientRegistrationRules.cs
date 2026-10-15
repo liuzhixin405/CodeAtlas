@@ -264,65 +264,541 @@ public sealed class LocalAssemblyRule : IDiscoveryRule
     }
 }
 
-/// <summary>前端的 fetch / axios 调用：取 URL 的路径部分，按前两段路径聚成一个"后端 API"外部系统（5c 再按路由对到具体容器）。</summary>
+
+/// <summary>
+/// 前端的 HTTP 调用 → 出口。认三种写法：fetch(url, { method })、axios.get/post/…(url)、HTTP 客户端变量上的 .get/.post/.put/.patch/.delete(url, …)；
+/// 后两种的接收者也可以是括号表达式 (options.client ?? client)，第一个实参也可以是带 url 属性的对象（openapi 生成的客户端）。
+/// 客户端变量的判据（宁可漏，不把 map.get(key) 当 HTTP）：由 useXxx() / createXxx() 之类的工厂初始化，且工厂所在文件（或它调用的导入函数，往下两层）
+/// 用了 fetch( / axios；或 axios.create(…)；或变量名本身是 api / http / request / *client。
+/// URL 实参交给 <see cref="TsConstantResolver"/> 展开常量；工厂链上 axios.create({ baseURL }) 的前缀拼在前面。
+/// 路径以前端代理前缀开头（Next.js 里用剩余段 [...x] 转发请求的 API 路由，或 architecture.yaml 的 proxies）就在 ClientName 记"经代理 前缀"，
+/// 路由匹配时剥掉。调本应用自己（非代理）的 API 路由不算出口。占位外部系统按剥前缀后的前两段路径聚合，证据只列前 20 条路径加一条汇总。
+/// </summary>
 public sealed class FrontendHttpRule : IDiscoveryRule
 {
     public string Id => "frontend-http";
-    public string Description => "fetch / axios / http 客户端调用的 URL 字面量";
+    public string Description => "fetch / axios / HTTP 客户端（含 useXxx() / createXxx() 包装）的调用，URL 经常量解析，识别前端代理前缀";
 
-    private static readonly Regex Call = new(@"\b(?:fetch|axios\.(?:get|post|put|delete|patch|request)|\w*[cC]lient\.(?:get|post|put|delete|patch))\s*\(\s*([""'`])(.*?)\1", RegexOptions.Compiled);
+    private const string ProxyMark = " 经代理 ";
+    private const int EvidencePaths = 20;
+    private const int FactoryDepth = 2;
+    private static readonly HashSet<string> Verbs = new(StringComparer.Ordinal) { "get", "post", "put", "patch", "delete" };
+    private static readonly HashSet<string> ClientVariableNames = new(StringComparer.Ordinal) { "api", "http", "request" };
+    private static readonly HashSet<string> PathIdentifiers = new(StringComparer.Ordinal) { "nextUrl", "pathname", "params", "query" };
+    private static readonly Regex AppRoute = new(@"^(?:src/)?app/(?<p>(?:[^/]+/)*)route\.(?:ts|tsx|js|jsx|mts)$", RegexOptions.Compiled);
+    private static readonly Regex PagesApi = new(@"^(?:src/)?pages/(?<p>api(?:/[^/]+)*)\.(?:ts|tsx|js|jsx)$", RegexOptions.Compiled);
+    private static readonly Regex CatchAll = new(@"^\[\[?\.\.\.(?<n>[\w$]+)\]\]?$", RegexOptions.Compiled);
+
+    /// <summary>认出是 HTTP 调用、但 URL 解析不出路径（或调的是本应用自己的 API 路由）的地方。</summary>
+    public sealed record UnresolvedCall(string ContainerKey, string File, int Line, string Reason);
+    /// <param name="Evidence">代理路由文件，或声明它的 architecture.yaml。</param>
+    public sealed record Proxy(string ContainerKey, string Prefix, string Evidence);
+
+    /// <summary>最近一次 Apply 的解析失败明细（诊断用，不进模型）。</summary>
+    public List<UnresolvedCall> Unresolved { get; } = [];
+    /// <summary>最近一次 Apply 识别 / 声明的代理前缀。</summary>
+    public List<Proxy> Proxies { get; } = [];
+
+    private sealed record Site(int Line, string Method, TsVal Value, string? Base);
+    private sealed record Call(string File, int Line, string Method, string Url, string? Proxy, string BusinessPath);
+    private sealed record ApiRoute(string[] Template, string File, bool IsProxy, string Prefix);
+    private readonly Dictionary<(string File, int Depth), (bool Http, HashSet<string> Bases)> _httpModules = new();
 
     public void Apply(RuleContext ctx)
     {
+        Unresolved.Clear();
+        Proxies.Clear();
+        _httpModules.Clear();
+        var resolver = TsConstantResolver.ForInventory(ctx.Inventory);
+        var declared = (ArchitectureDeclarations.Load(ctx.Inventory.Root)?.Document.Proxies ?? [])
+            .Where(p => p.Strip && !string.IsNullOrWhiteSpace(p.Prefix) && p.Prefix.Trim().Trim('/').Length > 0)
+            .Select(p => "/" + p.Prefix!.Trim().Trim('/')).Distinct(StringComparer.Ordinal).ToList();
         foreach (var c in ctx.Containers.Where(c => c.SubKind == "frontend"))
         {
-            foreach (var file in ctx.Inventory.SourceFiles)
+            var root = c.Path ?? "";
+            // 只要 TS / JS：清单里还有 .cs / .go / .py（前端目录在仓库根时会把它们都圈进来）
+            var files = ctx.Inventory.SourceFiles.Where(f => RuleContext.Under(f, root) && !RuleContext.IsTestFile(f)
+                && PolyText.LangOf(f) == SourceLang.JavaScript && !f.EndsWith(".d.ts", StringComparison.OrdinalIgnoreCase)).ToList();
+            var routes = ApiRoutes(resolver, root, files);
+            foreach (var r in routes.Where(r => r.IsProxy)) Proxies.Add(new Proxy(c.Key, r.Prefix, r.File));
+            foreach (var d in declared)
+                if (!Proxies.Any(p => p.ContainerKey == c.Key && p.Prefix == d)) Proxies.Add(new Proxy(c.Key, d, ArchitectureDeclarations.RelativePath));
+            var prefixes = Proxies.Where(p => p.ContainerKey == c.Key).OrderByDescending(p => p.Prefix.Length).ToList();
+            var own = routes.Where(r => !r.IsProxy).ToList();
+
+            var calls = new List<Call>();
+            foreach (var file in files)
             {
-                if (!RuleContext.Under(file, c.Path ?? "") || RuleContext.IsTestFile(file) || file.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)) continue;
-                var lines = ctx.Lines(file);
-                for (var i = 0; i < lines.Length; i++)
-                {
-                    foreach (Match m in Call.Matches(lines[i]))
-                    {
-                        var raw = m.Groups[2].Value;
-                        var path = PathOf(raw);
-                        if (path is null) continue;
-                        if (path.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-                        {
-                            if (!Uri.TryCreate(path, UriKind.Absolute, out var u)) continue;
-                            var ekey = ctx.External("http-service", u.Host, new Evidence(file, i + 1, raw));
-                            ctx.Outbound.Add(new Outbound(c.Key, Id, "http", null, null, path, file, i + 1, ekey));
-                            continue;
-                        }
-                        var group = Group(path);
-                        var key = ctx.External("http-service", "API " + group, new Evidence(file, i + 1, raw));
-                        ctx.Outbound.Add(new Outbound(c.Key, Id, "http", null, null, path, file, i + 1, key));
-                    }
-                }
+                var m = resolver.Module(file);
+                if (m is null) continue;
+                foreach (var site in Sites(resolver, m))
+                    if (Classify(c.Key, file, site, prefixes, own) is { } call) calls.Add(call);
             }
+            Register(ctx, c.Key, calls, prefixes);
         }
     }
 
-    /// <summary>`${base}/api/v5/orders` → /api/v5/orders；"/api/v5/users" 原样；纯变量或拼不出路径 → null。</summary>
+    // ───── 调用处 ─────
+
+    private IEnumerable<Site> Sites(TsConstantResolver resolver, TsModule m)
+    {
+        var t = m.Tokens;
+        for (var i = 0; i < t.Count; i++)
+        {
+            // (options?.client ?? client).get<…>({ url: '/api/v1/items/' })：openapi 生成客户端（@hey-api/openapi-ts）的写法。
+            // 接收者是括号表达式（不是函数调用的结果），取括号里最后一个标识符判断是不是 HTTP 客户端
+            if (t[i].Kind == TsTokKind.Punct && t[i].Text == ")" && m.IsPunct(i + 1, ".") && m.IsIdent(i + 2) && Verbs.Contains(t[i + 2].Text) && m.IsIdent(i - 1)
+                && IsParenthesizedExpression(m, i))
+            {
+                var pOpen = i + 3;
+                if (m.IsPunct(pOpen, "<")) pOpen = SkipGeneric(m, pOpen);
+                if (m.IsPunct(pOpen, "(") && IsHttpClient(resolver, m, i - 1, m.IsPunct(i - 2, ".") || m.IsPunct(i - 2, "?."), out var parenBase))
+                {
+                    var (pArg, _) = Args(m, pOpen);
+                    yield return new Site(m.LineOf(t[i].Offset), t[i + 2].Text.ToUpperInvariant(), UrlArg(resolver, m, pArg), parenBase);
+                }
+                continue;
+            }
+            if (t[i].Kind != TsTokKind.Ident) continue;
+            var name = t[i].Text;
+            var memberOf = m.IsPunct(i - 1, ".") || m.IsPunct(i - 1, "?.");
+            // fetch(url, { method })；window.fetch / globalThis.fetch 也算
+            if (name == "fetch" && m.IsPunct(i + 1, "(") && (!memberOf || m.IsIdent(i - 2, "window") || m.IsIdent(i - 2, "globalThis")))
+            {
+                var (a0, a1) = Args(m, i + 1);
+                yield return new Site(m.LineOf(t[i].Offset), FetchMethod(m, a1) ?? "GET", resolver.EvalTokens(m, a0.Start, a0.End), null);
+                continue;
+            }
+            if (!m.IsPunct(i + 1, ".") || !m.IsIdent(i + 2)) continue;
+            var verb = t[i + 2].Text;
+            var isAxios = name == "axios" && !memberOf;
+            if (!Verbs.Contains(verb) && !(isAxios && verb == "request")) continue;
+            var open = i + 3;
+            if (m.IsPunct(open, "<")) open = SkipGeneric(m, open);
+            if (!m.IsPunct(open, "(")) continue;
+            string? baseUrl = null;
+            if (!isAxios && !IsHttpClient(resolver, m, i, memberOf, out baseUrl)) continue;
+            var (arg0, _) = Args(m, open);
+            yield return new Site(m.LineOf(t[i].Offset), verb == "request" ? "GET" : verb.ToUpperInvariant(), UrlArg(resolver, m, arg0), baseUrl);
+        }
+    }
+
+    /// <summary>
+    /// 第一个实参的取值：对象字面量 { url: …, … } 且 url 能解析成字符串时取 url 属性（openapi 生成客户端、axios.request 的配置对象）；
+    /// 其余照旧对整个实参求值（解析不了的对象字面量仍报"不是字符串: 对象字面量"）。
+    /// </summary>
+    private static TsVal UrlArg(TsConstantResolver resolver, TsModule m, (int Start, int End) arg)
+    {
+        if (m.IsPunct(arg.Start, "{"))
+        {
+            var depth = 0;
+            for (var i = arg.Start; i < arg.End; i++)
+            {
+                var tok = m.Tokens[i];
+                if (tok.Kind == TsTokKind.Punct && tok.Text is "{" or "(" or "[") depth++;
+                else if (tok.Kind == TsTokKind.Punct && tok.Text is "}" or ")" or "]") depth--;
+                else if (depth == 1 && m.IsIdent(i, "url") && m.IsPunct(i + 1, ":") && (m.IsPunct(i - 1, "{") || m.IsPunct(i - 1, ",")))
+                {
+                    var value = resolver.EvalTokens(m, i + 2, ArgEnd(m, i + 2));
+                    if (TsConstantResolver.ToResolution(value).Value is not null) return value;
+                    break;
+                }
+            }
+        }
+        return resolver.EvalTokens(m, arg.Start, arg.End);
+    }
+
+    /// <summary>tokens[close] 是 ")"：它配对的 "(" 前面不是标识符 / ")" / "]"（那是函数调用），即一个括号表达式。</summary>
+    private static bool IsParenthesizedExpression(TsModule m, int close)
+    {
+        var depth = 0;
+        for (var i = close; i >= 0; i--)
+        {
+            var tok = m.Tokens[i];
+            if (tok.Kind != TsTokKind.Punct) continue;
+            if (tok.Text == ")") depth++;
+            else if (tok.Text == "(" && --depth == 0)
+                return !(m.IsIdent(i - 1) || m.IsPunct(i - 1, ")") || m.IsPunct(i - 1, "]") || m.IsPunct(i - 1, "?.")) || m.IsIdent(i - 1, "return") || m.IsIdent(i - 1, "await");
+            else if (tok.Text is ";" or "{" or "}") return false;
+        }
+        return false;
+    }
+
+    /// <summary>tokens[i] 是 .get/.post… 的接收者：判断它是不是 HTTP 客户端，顺带拿到工厂链上的 baseURL。</summary>
+    private bool IsHttpClient(TsConstantResolver resolver, TsModule m, int i, bool memberOf, out string? baseUrl)
+    {
+        baseUrl = null;
+        var name = m.Tokens[i].Text;
+        var byName = ClientVariableNames.Contains(name) || name.EndsWith("client", StringComparison.OrdinalIgnoreCase);
+        if (memberOf) return byName; // this.http.get / this.client.get：只认名字
+        var decl = resolver.FindDecl(m, name, m.Tokens[i].Offset);
+        if (decl is { TokenIndex: >= 0 })
+        {
+            var j = decl.TokenIndex;
+            if (m.IsIdent(j, "await")) j++;
+            if (m.IsIdent(j, "axios") && m.IsPunct(j + 1, ".") && m.IsIdent(j + 2, "create") && m.IsPunct(j + 3, "("))
+            {
+                var close = TsParser.MatchClose(m.Tokens, j + 3);
+                baseUrl = SingleBase(BaseUrls(resolver, m, j + 3, close < 0 ? m.Tokens.Count : close));
+                return true;
+            }
+            if (m.IsIdent(j) && m.IsPunct(j + 1, "("))
+            {
+                var (http, b) = FactoryHttp(resolver, m, m.Tokens[j].Text);
+                if (http) { baseUrl = b; return true; }
+            }
+        }
+        else if (decl is null && resolver.ImportTarget(m, name).Target is { } imported)
+        {
+            // import api from "@/lib/api"：导入的就是客户端实例。只看那个文件自己（不往下跟），免得把导入了 API hook 的工具模块当客户端
+            var info = HttpModule(resolver, imported, FactoryDepth);
+            if (info.Http) { baseUrl = SingleBase(info.Bases); return true; }
+        }
+        return byName;
+    }
+
+    /// <summary>
+    /// 工厂函数 fn（在 m 里被调用）是否返回 HTTP 客户端。只看 fn 自己的声明范围（导入的跟到定义处，含桶文件再导出）：
+    /// 范围里直接出现 fetch( / axios；或调用 / new 了导入的函数，且那个模块发 HTTP（再往下跟 FactoryDepth 层）；
+    /// 或调用了同文件的函数 / 类，且这个文件本身直接用了 fetch( / axios。组件文件里的 useMemo(() => new Map()) 这类不会被当成客户端。
+    /// </summary>
+    private (bool Http, string? Base) FactoryHttp(TsConstantResolver resolver, TsModule m, string fn)
+    {
+        (TsModule Module, TsDecl Decl)? found;
+        if (m.Imports.TryGetValue(fn, out var imp))
+            found = resolver.ImportTarget(m, fn).Target is { } target ? resolver.ExportDecl(target, imp.Imported) : null;
+        else
+            found = resolver.FindDecl(m, fn, int.MaxValue) is { } d ? (m, d) : null;
+        if (found is not { } f) return (false, null);
+        var home = f.Module;
+        var (start, end) = home.DeclRange(f.Decl);
+        var http = false;
+        var callsLocal = false;
+        var bases = new HashSet<string>(BaseUrls(resolver, home, start, end), StringComparer.Ordinal);
+        var t = home.Tokens;
+        for (var i = start + 1; i < end; i++)
+        {
+            if (t[i].Kind != TsTokKind.Ident) continue;
+            var name = t[i].Text;
+            var memberOf = home.IsPunct(i - 1, ".") || home.IsPunct(i - 1, "?.");
+            if (name == "axios" || (name == "fetch" && home.IsPunct(i + 1, "(") && !memberOf)) { http = true; continue; }
+            if (memberOf || !(home.IsPunct(i + 1, "(") || home.IsIdent(i - 1, "new"))) continue;
+            if (home.Imports.ContainsKey(name))
+            {
+                if (resolver.ImportTarget(home, name).Target is not { } target || target.File == home.File) continue;
+                var sub = HttpModule(resolver, target, 1);
+                http |= sub.Http;
+                bases.UnionWith(sub.Bases);
+            }
+            else if (home.Decls.Any(d => d.Name == name)) callsLocal = true; // new Map()、Promise() 这类全局不算
+        }
+        if (callsLocal)
+        {
+            var direct = HttpModule(resolver, home, FactoryDepth);
+            if (direct.Http) { http = true; bases.UnionWith(direct.Bases); }
+        }
+        return (http, http ? SingleBase(bases) : null);
+    }
+
+    /// <summary>模块是否发 HTTP（出现 fetch( 或 axios），以及其中 baseURL: … 的取值；跟着它调用的导入函数再往下 FactoryDepth 层。</summary>
+    private (bool Http, HashSet<string> Bases) HttpModule(TsConstantResolver resolver, TsModule m, int depth)
+    {
+        if (_httpModules.TryGetValue((m.File, depth), out var cached)) return cached;
+        var bases = new HashSet<string>(StringComparer.Ordinal);
+        _httpModules[(m.File, depth)] = (false, bases); // 循环导入保护
+        var http = false;
+        var called = new HashSet<string>(StringComparer.Ordinal);
+        var t = m.Tokens;
+        for (var i = 0; i < t.Count; i++)
+        {
+            if (t[i].Kind != TsTokKind.Ident) continue;
+            var memberOf = m.IsPunct(i - 1, ".") || m.IsPunct(i - 1, "?.");
+            if (t[i].Text == "axios" || (t[i].Text == "fetch" && m.IsPunct(i + 1, "(") && !memberOf)) http = true;
+            if (t[i].Text == "baseURL" && m.IsPunct(i + 1, ":"))
+            {
+                var end = ArgEnd(m, i + 2);
+                if (TsConstantResolver.ToResolution(resolver.EvalTokens(m, i + 2, end)).Value is { } b && (b.StartsWith('/') || IsAbsolute(b))) bases.Add(b);
+            }
+            if (!memberOf && m.IsPunct(i + 1, "(") && m.Imports.ContainsKey(t[i].Text)) called.Add(t[i].Text);
+        }
+        if (depth < FactoryDepth)
+            foreach (var fn in called)
+            {
+                if (resolver.ImportTarget(m, fn).Target is not { } target || target.File == m.File) continue;
+                var sub = HttpModule(resolver, target, depth + 1);
+                http |= sub.Http;
+                bases.UnionWith(sub.Bases);
+            }
+        return _httpModules[(m.File, depth)] = (http, bases);
+    }
+
+    private static IEnumerable<string> BaseUrls(TsConstantResolver resolver, TsModule m, int from, int to)
+    {
+        for (var i = from; i < to; i++)
+            if (m.IsIdent(i, "baseURL") && m.IsPunct(i + 1, ":")
+                && TsConstantResolver.ToResolution(resolver.EvalTokens(m, i + 2, ArgEnd(m, i + 2))).Value is { } b && (b.StartsWith('/') || IsAbsolute(b)))
+                yield return b;
+    }
+
+    /// <summary>多个不同的 baseURL 不猜。</summary>
+    private static string? SingleBase(IEnumerable<string> bases)
+    {
+        var distinct = bases.Distinct(StringComparer.Ordinal).Take(2).ToList();
+        return distinct.Count == 1 ? distinct[0] : null;
+    }
+
+    /// <summary>open 是 "(" 的下标：第一、第二个实参的 token 范围（同层逗号分隔）。实参可以跨行。</summary>
+    private static ((int Start, int End) First, (int Start, int End) Second) Args(TsModule m, int open)
+    {
+        var first = ArgEnd(m, open + 1);
+        var second = m.IsPunct(first, ",") ? (first + 1, ArgEnd(m, first + 1)) : (first, first);
+        return ((open + 1, first), second);
+    }
+
+    /// <summary>从 start 起到同层的 , ) ] } 为止（不含）。</summary>
+    private static int ArgEnd(TsModule m, int start)
+    {
+        var d = 0;
+        var t = m.Tokens;
+        for (var i = start; i < t.Count; i++)
+        {
+            if (t[i].Kind != TsTokKind.Punct) continue;
+            var p = t[i].Text;
+            if (p is "(" or "[" or "{") d++;
+            else if (p is ")" or "]" or "}") { if (d == 0) return i; d--; }
+            else if (d == 0 && p is "," or ";") return i;
+        }
+        return t.Count;
+    }
+
+    /// <summary>fetch 第二个实参里的 method: "POST"。</summary>
+    private static string? FetchMethod(TsModule m, (int Start, int End) options)
+    {
+        for (var i = options.Start; i < options.End; i++)
+            if (m.IsIdent(i, "method") && m.IsPunct(i + 1, ":") && i + 2 < m.Tokens.Count && m.Tokens[i + 2].Kind == TsTokKind.Str)
+                return m.Tokens[i + 2].Text.ToUpperInvariant();
+        return null;
+    }
+
+    /// <summary>open 是泛型实参的 "&lt;"：返回配对 "&gt;" 之后的下标；配不上返回 open（调用方再看是不是 "("）。</summary>
+    private static int SkipGeneric(TsModule m, int open)
+    {
+        var d = 0;
+        for (var i = open; i < m.Tokens.Count; i++)
+        {
+            var t = m.Tokens[i];
+            if (t.Kind != TsTokKind.Punct) continue;
+            if (t.Text == "<") d++;
+            else if (t.Text == ">") { d--; if (d == 0) return i + 1; }
+            else if (t.Text is ";" or "{" or "}" or "=>") return open;
+        }
+        return open;
+    }
+
+    private Call? Classify(string containerKey, string file, Site site, IReadOnlyList<Proxy> proxies, IReadOnlyList<ApiRoute> own)
+    {
+        var res = TsConstantResolver.ToResolution(site.Value);
+        if (res.Value is null) { Unresolved.Add(new UnresolvedCall(containerKey, file, site.Line, res.Failure ?? "无法解析")); return null; }
+        var raw = res.Value;
+        if (site.Base is not null && !IsAbsolute(raw) && !raw.StartsWith("${", StringComparison.Ordinal)) raw = site.Base.TrimEnd('/') + "/" + raw.TrimStart('/');
+        var path = PathOf(raw);
+        if (path is null)
+        {
+            Unresolved.Add(new UnresolvedCall(containerKey, file, site.Line, (OnlyHoles(raw) ? "运行时变量: " : "不是路径: ") + raw));
+            return null;
+        }
+        if (IsAbsolute(path)) return new Call(file, site.Line, site.Method, path, null, path);
+        var proxy = proxies.FirstOrDefault(p => path == p.Prefix || path.StartsWith(p.Prefix + "/", StringComparison.Ordinal))?.Prefix;
+        if (proxy is null && own.Any(r => RouteMatches(r.Template, path)))
+        {
+            Unresolved.Add(new UnresolvedCall(containerKey, file, site.Line, "本应用 API 路由: " + path));
+            return null;
+        }
+        var business = proxy is null ? path : path.Length == proxy.Length ? "/" : path[proxy.Length..];
+        return new Call(file, site.Line, site.Method, path, proxy, business);
+    }
+
+    // ───── 登记 ─────
+
+    private void Register(RuleContext ctx, string containerKey, List<Call> calls, IReadOnlyList<Proxy> proxies)
+    {
+        foreach (var call in calls)
+        {
+            string key;
+            if (IsAbsolute(call.Url))
+            {
+                if (!Uri.TryCreate(call.Url, UriKind.Absolute, out var u)) continue;
+                key = ctx.External("http-service", u.Host, new Evidence(call.File, call.Line, call.Url));
+            }
+            else key = $"external:http-service:{RuleContext.Slug("API " + Group(call.BusinessPath))}";
+            ctx.Outbound.Add(new Outbound(containerKey, Id, "http", FormatCall(call.Method, call.Proxy), null, call.Url, call.File, call.Line, key));
+        }
+        // 占位外部系统：每个 API 根一个节点；证据按路径聚合（次数降序）列前 20 条，再加一条汇总（业务段分布、经哪个代理）
+        foreach (var g in calls.Where(c => !IsAbsolute(c.Url)).GroupBy(c => Group(c.BusinessPath)))
+        {
+            var name = "API " + g.Key;
+            var byPath = g.GroupBy(c => (c.BusinessPath, c.Method))
+                .OrderByDescending(x => x.Count()).ThenBy(x => x.Key.BusinessPath, StringComparer.Ordinal).ThenBy(x => x.Key.Method, StringComparer.Ordinal).ToList();
+            foreach (var p in byPath.Take(EvidencePaths))
+            {
+                var first = p.First();
+                ctx.External("http-service", name, new Evidence(first.File, first.Line, $"{p.Key.Method} {p.Key.BusinessPath}（{p.Count()} 处）"));
+            }
+            var paths = g.Select(c => c.BusinessPath).Distinct(StringComparer.Ordinal).Count();
+            var segs = g.GroupBy(c => BusinessSegment(c.BusinessPath)).OrderByDescending(s => s.Count()).ThenBy(s => s.Key, StringComparer.Ordinal).ToList();
+            var note = $"共 {g.Count()} 处调用、{paths} 条路径{(byPath.Count > EvidencePaths ? $"（证据列前 {EvidencePaths} 条）" : "")}；按业务段："
+                       + string.Join("、", segs.Take(10).Select(s => $"{s.Key} {s.Count()}")) + (segs.Count > 10 ? $" 等 {segs.Count} 段" : "");
+            foreach (var p in g.Where(c => c.Proxy is not null).GroupBy(c => c.Proxy!).OrderBy(p => p.Key, StringComparer.Ordinal))
+                note += $"；经 {p.Key} 代理 {p.Count()} 处";
+            var usedProxy = g.FirstOrDefault(c => c.Proxy is not null)?.Proxy;
+            var summaryFile = usedProxy is not null ? proxies.First(p => p.Prefix == usedProxy).Evidence : g.First().File;
+            ctx.External("http-service", name, new Evidence(summaryFile, null, note));
+        }
+    }
+
+    // ───── Next.js API 路由与代理识别 ─────
+
+    /// <summary>
+    /// 容器里的 Next.js API 路由（app/**/route.ts、pages/api/**）。最后一段是剩余段 [...x] / [[...x]]、且文件里有出站调用（fetch( / axios / .request(）
+    /// 并用到请求路径（nextUrl / pathname / params / query / req.url / 剩余段参数名）的，算代理，前缀 = 去掉剩余段的路由路径。
+    /// </summary>
+    private static List<ApiRoute> ApiRoutes(TsConstantResolver resolver, string root, List<string> files)
+    {
+        var list = new List<ApiRoute>();
+        foreach (var f in files)
+        {
+            var rel = root.Length == 0 ? f : f[(root.Length + 1)..];
+            string[] segs;
+            var app = AppRoute.Match(rel);
+            if (app.Success)
+                segs = app.Groups["p"].Value.Split('/', StringSplitOptions.RemoveEmptyEntries)
+                    .Where(s => !(s.StartsWith('(') && s.EndsWith(')')) && !s.StartsWith('@')).ToArray(); // 路由组 (x)、并行路由 @x 不进路径
+            else
+            {
+                var pages = PagesApi.Match(rel);
+                if (!pages.Success) continue;
+                segs = pages.Groups["p"].Value.Split('/');
+                if (segs[^1] == "index") segs = segs[..^1];
+            }
+            var isProxy = false;
+            var prefix = "/" + string.Join('/', segs);
+            if (segs.Length >= 2 && CatchAll.Match(segs[^1]) is { Success: true } ca && resolver.Module(f) is { } m && Forwards(m, ca.Groups["n"].Value))
+            {
+                isProxy = true;
+                prefix = "/" + string.Join('/', segs[..^1]);
+            }
+            list.Add(new ApiRoute(segs, f, isProxy, prefix));
+        }
+        return list;
+    }
+
+    private static bool Forwards(TsModule m, string restParam)
+    {
+        bool outgoing = false, usesPath = false;
+        var t = m.Tokens;
+        for (var i = 0; i < t.Count; i++)
+        {
+            if (t[i].Kind != TsTokKind.Ident) continue;
+            var name = t[i].Text;
+            var memberOf = m.IsPunct(i - 1, ".") || m.IsPunct(i - 1, "?.");
+            if (name == "axios" || (name == "fetch" && m.IsPunct(i + 1, "(")) || (name == "request" && memberOf && m.IsPunct(i + 1, "("))) outgoing = true;
+            if (PathIdentifiers.Contains(name) || name == restParam || (name == "url" && memberOf)) usesPath = true;
+        }
+        return outgoing && usesPath;
+    }
+
+    /// <summary>Next 路由段模板对具体路径：[x] 任意一段，[...x] 其余至少一段，[[...x]] 其余可为空；路径里的 ${…} 段匹配任意段。</summary>
+    private static bool RouteMatches(string[] template, string path)
+    {
+        var p = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        for (var k = 0; k < template.Length; k++)
+        {
+            var seg = template[k];
+            if (CatchAll.IsMatch(seg)) return seg.StartsWith("[[", StringComparison.Ordinal) ? p.Length >= k : p.Length > k;
+            if (k >= p.Length) return false;
+            if (seg.StartsWith('[') || p[k].Contains("${", StringComparison.Ordinal)) continue;
+            if (!string.Equals(seg, p[k], StringComparison.OrdinalIgnoreCase)) return false;
+        }
+        return template.Length == p.Length;
+    }
+
+    // ───── 公共小工具（RouteLinker、EdgeMatcher 也用） ─────
+
+    /// <summary>出口的 ClientName：方法，经代理时再加" 经代理 前缀"。库里没有单独的方法 / 代理列，借这一列存。</summary>
+    public static string FormatCall(string method, string? proxyPrefix) => proxyPrefix is null ? method : method + ProxyMark + proxyPrefix;
+
+    /// <summary><see cref="FormatCall"/> 的逆：(方法, 代理前缀)；旧库里的前端出口 ClientName 为 null → (null, null)。</summary>
+    public static (string? Method, string? ProxyPrefix) ParseCall(string? clientName)
+    {
+        if (string.IsNullOrEmpty(clientName)) return (null, null);
+        var i = clientName.IndexOf(ProxyMark, StringComparison.Ordinal);
+        return i < 0 ? (clientName, null) : (clientName[..i], clientName[(i + ProxyMark.Length)..]);
+    }
+
+    /// <summary>后端看到的路径：经代理（且 Url 以该前缀开头）就剥掉前缀。</summary>
+    public static string BackendPath(string url, string? proxyPrefix)
+    {
+        if (proxyPrefix is null) return url;
+        if (url == proxyPrefix) return "/";
+        return url.StartsWith(proxyPrefix + "/", StringComparison.Ordinal) ? url[proxyPrefix.Length..] : url;
+    }
+
+    /// <summary>
+    /// 展开后的 URL → 路径：绝对 URL 原样；开头的 ${…}（不知道的主机 / 基地址）去掉；去掉查询串与片段；中间的 ${id} 保留（路由匹配时当任意段）。
+    /// `${base}/api/v5/orders/${id}` → /api/v5/orders/${id}；"/api/v5/users" 原样；纯变量或不是 / 开头 → null。
+    /// </summary>
     public static string? PathOf(string raw)
     {
-        if (raw.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || raw.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return raw;
+        if (IsAbsolute(raw)) return raw;
         var s = raw;
-        if (s.Contains("${", StringComparison.Ordinal))
+        while (s.StartsWith("${", StringComparison.Ordinal))
         {
-            var close = s.LastIndexOf('}');
+            var close = HoleEnd(s);
             if (close < 0) return null;
             s = s[(close + 1)..];
         }
         if (!s.StartsWith('/')) return null;
-        var q = s.IndexOf('?');
+        var q = s.IndexOfAny(['?', '#']);
         return q >= 0 ? s[..q] : s;
     }
 
-    /// <summary>前两段路径：/api/v5/orders → /api/v5；/graphql → /graphql。</summary>
+    /// <summary>整段都是 ${…}（`${url}`、`${base}${path}`）：运行时才知道的地址。</summary>
+    private static bool OnlyHoles(string raw)
+    {
+        var s = raw;
+        while (s.StartsWith("${", StringComparison.Ordinal))
+        {
+            var close = HoleEnd(s);
+            if (close < 0) return false;
+            s = s[(close + 1)..];
+        }
+        return s.Length == 0 && raw.Length > 0;
+    }
+
+    private static int HoleEnd(string s)
+    {
+        var d = 0;
+        for (var i = 1; i < s.Length; i++)
+        {
+            if (s[i] == '{') d++;
+            else if (s[i] == '}') { d--; if (d == 0) return i; }
+        }
+        return -1;
+    }
+
+    private static bool IsAbsolute(string s) => s.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || s.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>前两段路径：/api/v5/orders → /api/v5；/graphql → /graphql；含 ${…} 的运行时段及其后不要（/realms/${realm}/… → /realms）。</summary>
     public static string Group(string path)
     {
         var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        return "/" + string.Join('/', segs.Take(2));
+        return "/" + string.Join('/', segs.Take(2).TakeWhile(s => !s.Contains("${", StringComparison.Ordinal)));
+    }
+
+    /// <summary>API 根之后的第一段（/api/v5/mt5/groups → mt5）；路径不够长取最后一段。</summary>
+    private static string BusinessSegment(string path)
+    {
+        var segs = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segs.Length > 2 ? segs[2] : segs.Length > 0 ? segs[^1] : "/";
     }
 }

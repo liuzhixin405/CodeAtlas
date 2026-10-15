@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using CodeAtlas.Core.Architecture.Rules;
 using CodeAtlas.Core.Storage;
+using CodeAtlas.Core.Workspace;
 
 namespace CodeAtlas.Core.Architecture;
 
@@ -17,11 +18,21 @@ public static class ArchitectureScanner
         new GrpcChannelRule(),
         new InfrastructurePatternRule(),
         new FrontendHttpRule(),
+        new GoOutboundRule(),
+        new PythonOutboundRule(),
+        new PolyglotInfraRule(),
+        new JavaOutboundRule(),
+        new SpringCloudRule(),
+        new GrpcServiceRule(), // 放最后：要看前面各规则登记的 gRPC 通道，和它们去重
     ];
 
-    public static ArchModel Scan(string root, IReadOnlyList<IDiscoveryRule>? rules = null)
+    public static ArchModel Scan(string root, IReadOnlyList<IDiscoveryRule>? rules = null) => Scan(ProjectRoots.Single(root), rules);
+
+    /// <summary>多根：外部根的项目一样成为容器（键是相对主根的目录，如 ../backend/Api）；architecture.yaml 只读主根的。</summary>
+    public static ArchModel Scan(ProjectRoots roots, IReadOnlyList<IDiscoveryRule>? rules = null)
     {
-        var inv = ProjectInventory.Load(root);
+        var root = roots.Main;
+        var inv = ProjectInventory.Load(roots);
         var containers = ContainerDiscovery.Discover(inv);
         var ctx = new RuleContext(inv, containers);
         foreach (var rule in rules ?? DefaultRules) rule.Apply(ctx);
@@ -34,10 +45,12 @@ public static class ArchitectureScanner
         return declarations is null ? model : declarations.Apply(model);
     }
 
-    public static (ArchModel Model, ArchReport Report) ScanAndStore(string root, IndexDatabase db)
+    public static (ArchModel Model, ArchReport Report) ScanAndStore(string root, IndexDatabase db) => ScanAndStore(ProjectRoots.Single(root), db);
+
+    public static (ArchModel Model, ArchReport Report) ScanAndStore(ProjectRoots roots, IndexDatabase db)
     {
         var sw = Stopwatch.StartNew();
-        var model = Scan(root);
+        var model = Scan(roots);
         ArchStorage.Replace(db, model);
         // 未匹配 = 没有对上任何容器、只能挂到外部系统的 HTTP / gRPC 出口
         var unmatched = model.Outbound.Count(o => o.Protocol is "http" or "grpc" && (o.TargetKey is null || o.TargetKey.StartsWith("external:", StringComparison.Ordinal)));

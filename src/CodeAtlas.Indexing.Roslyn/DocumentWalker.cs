@@ -11,13 +11,14 @@ internal sealed class DocumentWalker
     private readonly SemanticModel _model;
     private readonly SyntaxNode _root;
     private readonly string _path;
-    private readonly string _repoRoot;
+    /// <summary>"仓库内"的根目录（主根 + 外部根）：定义在它们之下的符号是内部目标，否则记为 external。</summary>
+    private readonly IReadOnlyList<string> _repoRoot;
     private readonly Dictionary<string, List<(INamedTypeSymbol Type, ISymbol Entry)>> _handlers;
     private readonly Action<RoslynRecord> _emit;
     private readonly HashSet<(string, string, string, int, string?)> _seenEdges = [];
     private readonly HashSet<SyntaxNode> _conduitCreations = [];
 
-    public DocumentWalker(SemanticModel model, SyntaxNode root, string path, string repoRoot,
+    public DocumentWalker(SemanticModel model, SyntaxNode root, string path, IReadOnlyList<string> repoRoot,
         Dictionary<string, List<(INamedTypeSymbol Type, ISymbol Entry)>> handlers, Action<RoslynRecord> emit)
     {
         _model = model; _root = root; _path = path; _repoRoot = repoRoot; _handlers = handlers; _emit = emit;
@@ -187,13 +188,14 @@ internal sealed class DocumentWalker
         var from = EnclosingMemberKey(inv.SpanStart);
         if (from is null) return;
         var line = Line(inv);
+        var site = (CallSyntax.NamePos(inv), CallSyntax.ContextOf(inv));
         var info = _model.GetSymbolInfo(inv);
         var method = info.Symbol as IMethodSymbol;
 
         if (method is null)
         {
             foreach (var candidate in info.CandidateSymbols.OfType<IMethodSymbol>())
-                Edge(from, candidate, "calls", 0.8, line);
+                Edge(from, candidate, "calls", 0.8, line, site: site);
             return;
         }
 
@@ -209,14 +211,14 @@ internal sealed class DocumentWalker
                     && !_handlers.TryGetValue(SymbolKeys.Key(argType), out list)) continue;
                 var dispatchVia = "dispatch:" + SymbolKeys.MessageShortName(argType);
                 foreach (var (_, entry) in list)
-                    Edge(from, entry, "dispatches", 1.0, line, via: dispatchVia, evidenceLine: line);
+                    Edge(from, entry, "dispatches", 1.0, line, via: dispatchVia, evidenceLine: line, site: site);
                 via = "conduit";
                 if (arg.Expression is BaseObjectCreationExpressionSyntax creation) _conduitCreations.Add(creation);
             }
         }
 
         if (RoslynAnalyzer.DiMethods.Contains(method.Name)) EmitDi(inv, method);
-        Edge(from, method, "calls", 1.0, line, via);
+        Edge(from, method, "calls", 1.0, line, via, site: site);
     }
 
     private void EmitObjectCreation(BaseObjectCreationExpressionSyntax oc)
@@ -225,7 +227,8 @@ internal sealed class DocumentWalker
         if (from is null) return;
         if (_model.GetTypeInfo(oc).Type is not INamedTypeSymbol type || type.TypeKind == TypeKind.Error) return;
         // 目标是类型而不是构造函数：读图的人关心"new 了什么"，和 tree-sitter 的约定一致
-        Edge(from, type, "calls", 1.0, Line(oc), _conduitCreations.Contains(oc) ? "conduit" : null);
+        Edge(from, type, "calls", 1.0, Line(oc), _conduitCreations.Contains(oc) ? "conduit" : null,
+            site: (CallSyntax.NamePos(oc), CallSyntax.ContextOf(oc)));
     }
 
     private void EmitDi(InvocationExpressionSyntax inv, IMethodSymbol method)
@@ -297,13 +300,15 @@ internal sealed class DocumentWalker
         return null;
     }
 
-    private void Edge(string from, ISymbol to, string kind, double confidence, int line, string? via = null, int? evidenceLine = null)
+    /// <param name="site">调用点：调用名的偏移与所在控制结构（见 <see cref="CallSyntax"/>）；类型级 / 声明级的边没有调用点。</param>
+    private void Edge(string from, ISymbol to, string kind, double confidence, int line, string? via = null, int? evidenceLine = null,
+        (int Pos, string? Ctx)? site = null)
     {
         var toKey = SymbolKeys.Key(to);
         if (toKey.Length == 0) return;
         if (!_seenEdges.Add((from, toKey, kind, line, via))) return;
         var external = !SymbolKeys.IsInRepo(to, _repoRoot);
-        _emit(new EdgeRec(from, toKey, external, kind, confidence, _path, line, via, evidenceLine));
+        _emit(new EdgeRec(from, toKey, external, kind, confidence, _path, line, via, evidenceLine, site?.Pos, site?.Ctx));
     }
 
     private static int Line(SyntaxNode node) => node.GetLocation().GetLineSpan().StartLinePosition.Line + 1;

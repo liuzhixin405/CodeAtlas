@@ -3,7 +3,7 @@ using CodeAtlas.Core.Model;
 
 namespace CodeAtlas.Server.Tests;
 
-public class RouteLinkerTests
+public partial class RouteLinkerTests
 {
     [Theory]
     [InlineData("/api/v5/accounts/{id}", "/api/v5/accounts/123", true)]
@@ -124,6 +124,35 @@ public class RouteLinkerTests
         Assert.Equal(["/api/v5/x"], RouteLinker.CandidatePaths("http.GetAsync(\"api/v5/x?y=1\")", fields));
         Assert.Empty(RouteLinker.CandidatePaths("http.GetAsync(\"http://localhost:5000/api/v5/x\")", fields)); // 绝对 URL 由容器图规则管
         Assert.Empty(RouteLinker.CandidatePaths("log.Info(\"items/{id}\")", fields));                          // 不像 API 路径
+    }
+
+    [Fact]
+    public void Match_ProxiedFrontendCall_StripsProxyPrefix_PicksEntryByMethod_UpgradesTo09()
+    {
+        // 后端同一路由有 GET / POST 两个入口；前端出口经 /api/proxy-gateway 代理，方法记在 ClientName 里
+        List<EntryPoint> entries =
+        [
+            new(70, "Acme.Api", "aspnet.controller", "http", "/api/v5/mt5/groups", "POST", "Acme.Api/GroupsController.cs", 20),
+            new(71, "Acme.Api", "aspnet.controller", "http", "/api/v5/mt5/groups", "GET", "Acme.Api/GroupsController.cs", 12),
+        ];
+        List<Outbound> outbound =
+        [
+            new("web", "frontend-http", "http", "GET 经代理 /api/proxy-gateway", null, "/api/proxy-gateway/api/v5/mt5/groups", "web/src/hooks/useMT5Group.ts", 12, "external:http-service:api-api-v5"),
+            // 没有代理标记：前缀不剥，对不上（与 PathMatches 的"代理前缀不猜"一致）
+            new("web", "frontend-http", "http", "GET", null, "/api/proxy-gateway/api/v5/mt5/groups", "web/src/hooks/useOther.ts", 5, "external:http-service:api-api-v5"),
+        ];
+        var matches = RouteLinker.Match(outbound, entries, Containers, [], _ => []);
+        var m = Assert.Single(matches);
+        Assert.Equal(("web", "web/src/hooks/useMT5Group.ts", 12, "/api/v5/mt5/groups", 71L, "Acme.Api"), (m.FromContainerKey, m.File, m.Line, m.Path, m.EntrySymbolId, m.ToContainerKey));
+
+        var api = new ArchNode("external:http-service:api-api-v5", ArchNodeKind.External, "http-service", "API /api/v5", null, ArchSource.Discovered, [], [], []);
+        var model = new ArchModel([.. Containers, api],
+            [new ArchEdge("web", "external:http-service:api-api-v5", "http", 0.5, ArchSource.Discovered, [new Evidence("web/src/hooks/useMT5Group.ts", 12)])],
+            outbound, []);
+        var up = RouteLinker.Upgrade(model, matches);
+        var edge = Assert.Single(up.Edges, e => e.FromKey == "web" && e.ToKey == "Acme.Api");
+        Assert.Equal((0.9, "http", "/api/v5/mt5/groups"), (edge.Confidence, edge.Protocol, edge.Evidence[0].Note));
+        Assert.Contains(Assert.Single(up.Edges, e => e.ToKey == "external:http-service:api-api-v5").Evidence, e => e.Note == "1/2 处已对上路由");
     }
 
     [Fact]

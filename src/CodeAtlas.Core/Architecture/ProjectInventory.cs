@@ -2,18 +2,24 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
+using CodeAtlas.Core.Workspace;
 
 namespace CodeAtlas.Core.Architecture;
 
 /// <param name="Dir">项目目录，相对仓库根，'/' 分隔；仓库根本身为 ""。</param>
 /// <param name="ProjectRefs">引用的项目目录（同样相对仓库根）。</param>
 /// <param name="Ports">http 监听端口：launchSettings 的 applicationUrl（只取 http）、Dockerfile 的 EXPOSE / ASPNETCORE_URLS / ASPNETCORE_HTTP_PORTS。</param>
+/// <param name="Packages">&lt;PackageReference&gt; 与同目录 packages.config（旧式 .NET Framework 项目）的包。</param>
+/// <param name="TargetFramework">TargetFramework(s)，旧式项目是 TargetFrameworkVersion（v4.5）。</param>
+/// <param name="LegacyWeb">旧式 ASP.NET Web 应用：ProjectTypeGuids 里有 Web Application 类型（OutputType 是 Library）。</param>
 public sealed record CsProject(
     string Dir, string File, string Name, string? Sdk, string? OutputType, bool IsTest,
     IReadOnlyList<string> ProjectRefs, IReadOnlyList<PackageRef> Packages, IReadOnlyList<LocalRef> LocalReferences,
-    IReadOnlyList<int> Ports, IReadOnlyList<Evidence> DeployEvidence, string? Dockerfile);
+    IReadOnlyList<int> Ports, IReadOnlyList<Evidence> DeployEvidence, string? Dockerfile,
+    string? TargetFramework = null, bool LegacyWeb = false);
 
-public sealed record PackageRef(string Name, int Line);
+/// <param name="File">包声明所在文件；null 表示就是 csproj 本身（PackageReference）。packages.config 的包指向 packages.config。</param>
+public sealed record PackageRef(string Name, int Line, string? File = null);
 
 /// <summary>csproj 里的 &lt;Reference Include&gt; 本地程序集（厂商 SDK、原生封装）。</summary>
 public sealed record LocalRef(string Name, string? HintPath, int Line);
@@ -25,9 +31,10 @@ public sealed record FrontendApp(string Dir, string File, string Name, string Fr
 public sealed record ConfigEntry(string ProjectDir, string Key, string Value, string File, string? Environment);
 
 /// <summary>
-/// 一个仓库里和"部署 / 容器"有关的文件事实：项目、包引用、本地程序集、端口、配置、前端应用。只读文件系统，不碰代码语义。
+/// 一个仓库里和"部署 / 容器"有关的文件事实：.NET 项目、包引用、本地程序集、端口、配置、前端应用，
+/// 以及 Go 模块、Python 项目、Node 后端服务（见 ProjectInventory.Polyglot.cs）、Java 的 Maven / Gradle 模块（见 ProjectInventory.Java.cs）。只读文件系统，不碰代码语义。
 /// </summary>
-public sealed class ProjectInventory
+public sealed partial class ProjectInventory
 {
     public static readonly HashSet<string> IgnoredDirectories = new(StringComparer.OrdinalIgnoreCase)
         { "node_modules", "bin", "obj", ".git", "dist", "build", ".codeatlas", ".vs", ".idea", ".next", "coverage" };
@@ -37,16 +44,20 @@ public sealed class ProjectInventory
     private static readonly string[] FrontendFrameworks = ["next", "vite", "react-scripts", "@angular/core", "nuxt", "@sveltejs/kit", "vue"];
     private static readonly string[] TestPackages = ["Microsoft.NET.Test.Sdk", "xunit", "NUnit", "MSTest.TestFramework"];
 
+    /// <summary>主根。所有相对路径都相对它；外部根的文件形如 ../other/…，Absolute 照样能拼回去。</summary>
     public string Root { get; }
+    public ProjectRoots Roots { get; }
     public IReadOnlyList<CsProject> Projects { get; }
     public IReadOnlyList<FrontendApp> Frontends { get; }
     public IReadOnlyList<ConfigEntry> ConfigEntries { get; }
     /// <summary>仓库里全部源码文件（相对路径，'/' 分隔），已排除忽略目录；规则扫描用。</summary>
     public IReadOnlyList<string> SourceFiles { get; }
 
-    private ProjectInventory(string root, List<CsProject> projects, List<FrontendApp> frontends, List<ConfigEntry> config, List<string> sources)
+    private ProjectInventory(ProjectRoots roots, List<CsProject> projects, List<FrontendApp> frontends, List<ConfigEntry> config, List<string> sources,
+        List<GoModule> goModules, List<PythonProject> pythonProjects, List<NodeService> nodeServices)
     {
-        Root = root; Projects = projects; Frontends = frontends; ConfigEntries = config; SourceFiles = sources;
+        Roots = roots; Root = roots.Main; Projects = projects; Frontends = frontends; ConfigEntries = config; SourceFiles = sources;
+        GoModules = goModules; PythonProjects = pythonProjects; NodeServices = nodeServices;
     }
 
     /// <summary>主文件（appsettings.json）里的值；没有则取任一环境文件的值；都没有返回 null。</summary>
@@ -58,42 +69,66 @@ public sealed class ProjectInventory
 
     public string Absolute(string relative) => System.IO.Path.Combine(Root, relative.Replace('/', System.IO.Path.DirectorySeparatorChar));
 
-    public static ProjectInventory Load(string root)
+    /// <summary>单根：纳入嵌套的独立克隆与子模块，跳过 worktree。</summary>
+    public static ProjectInventory Load(string root) => Load(ProjectRoots.Single(root));
+
+    /// <summary>多根：主根 + 外部根依次遍历，路径都相对主根；根互相包含时不重复（遍历一个根时跳过另一个根的目录）。</summary>
+    public static ProjectInventory Load(ProjectRoots roots)
     {
-        root = System.IO.Path.GetFullPath(root);
+        var root = roots.Main;
         var csprojs = new List<string>();
         var packageJsons = new List<string>();
         var sources = new List<string>();
-        Walk(root, root, csprojs, packageJsons, sources);
+        var manifests = new List<string>();
+        var javaManifests = new List<string>();
+        foreach (var r in roots.All) Walk(roots, r, r, csprojs, packageJsons, sources, manifests, javaManifests);
 
-        var projects = csprojs.Select(p => ReadProject(root, p)).OrderBy(p => p.Dir, StringComparer.Ordinal).ToList();
-        var frontends = packageJsons.Select(p => ReadFrontend(root, p)).Where(f => f is not null).Select(f => f!).OrderBy(f => f.Dir, StringComparer.Ordinal).ToList();
+        var projects = csprojs.Select(p => ReadProject(roots, p)).OrderBy(p => p.Dir, StringComparer.Ordinal).ToList();
+        var frontends = packageJsons.Select(p => ReadFrontend(roots, p)).Where(f => f is not null).Select(f => f!).OrderBy(f => f.Dir, StringComparer.Ordinal).ToList();
         var config = new List<ConfigEntry>();
         foreach (var p in projects) config.AddRange(ReadAppSettings(root, p.Dir));
-        return new ProjectInventory(root, projects, frontends, config, sources);
+        var goModules = ReadGoModules(roots, manifests, sources);
+        var pythonProjects = ReadPythonProjects(roots, manifests, sources);
+        var frontendFiles = frontends.Select(f => f.File).ToHashSet(StringComparer.Ordinal);
+        var nodeServices = packageJsons.Where(p => !frontendFiles.Contains(p)).Select(p => ReadNodeService(roots, p)).Where(n => n is not null).Select(n => n!)
+            .OrderBy(n => n.Dir, StringComparer.Ordinal).ToList();
+        return new ProjectInventory(roots, projects, frontends, config, sources, goModules, pythonProjects, nodeServices)
+        {
+            JavaModules = ReadJavaModules(roots, javaManifests, sources),
+        };
     }
 
-    private static void Walk(string root, string dir, List<string> csprojs, List<string> packageJsons, List<string> sources)
+    private static void Walk(ProjectRoots roots, string currentRoot, string dir, List<string> csprojs, List<string> packageJsons, List<string> sources, List<string> manifests, List<string> javaManifests)
     {
-        IEnumerable<string> entries;
-        try { entries = Directory.EnumerateFileSystemEntries(dir); }
+        IEnumerable<FileSystemInfo> infos;
+        try { infos = new DirectoryInfo(dir).EnumerateFileSystemInfos(); }
         catch (UnauthorizedAccessException) { return; }
         catch (IOException) { return; }
-        foreach (var entry in entries)
+        foreach (var info in infos)
         {
-            var name = System.IO.Path.GetFileName(entry);
-            if (Directory.Exists(entry))
+            // 符号链接 / junction 不跟（与 RepositoryScanner 一致）：Linux / macOS 上 git 检出的是真链接，指回上级目录会无限递归、指向兄弟目录会重复；
+            // Windows 默认 core.symlinks=false，同一个仓库检出来是普通小文件，本来就进不去
+            if (info.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+            var entry = info.FullName;
+            var name = info.Name;
+            if (info is DirectoryInfo)
             {
-                // 点目录（.git / .claude 的 worktrees / .vs …）一律跳过：里面是工具状态或仓库副本，不是部署单元
+                // 点目录（.git / .claude 的 worktrees / .vs …）一律跳过：里面是工具状态或仓库副本，不是部署单元；
+                // 另一个根的目录（它自己遍历）、worktree、--no-nested 时的嵌套仓库也跳过
                 if (IgnoredDirectories.Contains(name) || name.StartsWith('.')) continue;
-                Walk(root, entry, csprojs, packageJsons, sources);
+                if (IsPolyglotNoise(entry, name) || IsMavenOutput(entry, name)) continue;
+                if (!roots.ShouldDescend(entry, currentRoot)) continue;
+                Walk(roots, currentRoot, entry, csprojs, packageJsons, sources, manifests, javaManifests);
                 continue;
             }
-            var rel = Rel(root, entry);
+            var rel = roots.Relative(entry);
             if (name.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase)) csprojs.Add(rel);
             else if (name.Equals("package.json", StringComparison.OrdinalIgnoreCase)) packageJsons.Add(rel);
+            else if (IsPolyglotManifest(name)) manifests.Add(rel);
+            else if (IsJavaManifest(name)) javaManifests.Add(rel);
+            // 规则逐行扫描的源码：C#、TS / JS（前端与 Node）、Go、Python、Java；各规则再按扩展名挑自己的
             var ext = System.IO.Path.GetExtension(name).ToLowerInvariant();
-            if (ext is ".cs" or ".ts" or ".tsx" or ".js" or ".jsx" or ".mts" or ".cts") sources.Add(rel);
+            if (ext is ".cs" or ".ts" or ".tsx" or ".js" or ".jsx" or ".mts" or ".cts" or ".go" or ".py" or ".java") sources.Add(rel);
         }
     }
 
@@ -103,8 +138,9 @@ public sealed class ProjectInventory
         return rel == "." ? "" : rel;
     }
 
-    private static CsProject ReadProject(string root, string relFile)
+    private static CsProject ReadProject(ProjectRoots roots, string relFile)
     {
+        var root = roots.Main;
         var full = System.IO.Path.Combine(root, relFile.Replace('/', System.IO.Path.DirectorySeparatorChar));
         var dir = relFile.Contains('/') ? relFile[..relFile.LastIndexOf('/')] : "";
         var name = System.IO.Path.GetFileNameWithoutExtension(relFile);
@@ -115,30 +151,76 @@ public sealed class ProjectInventory
         var sdk = doc.Root?.Attribute("Sdk")?.Value;
         var outputType = doc.Descendants(ns + "OutputType").Select(e => e.Value.Trim()).FirstOrDefault();
         var refs = doc.Descendants(ns + "ProjectReference").Select(e => e.Attribute("Include")?.Value).Where(v => v is not null)
-            .Select(v => ResolveRef(root, dir, v!)).Where(v => v is not null).Select(v => v!).Distinct().ToList();
+            .Select(v => ResolveRef(roots, dir, v!)).Where(v => v is not null).Select(v => v!).Distinct().ToList();
         var packages = doc.Descendants(ns + "PackageReference").Select(e => new PackageRef(e.Attribute("Include")?.Value ?? "", Line(e))).Where(p => p.Name.Length > 0).ToList();
-        var locals = doc.Descendants(ns + "Reference").Select(e => new LocalRef(e.Attribute("Include")?.Value ?? "", e.Element(ns + "HintPath")?.Value, Line(e))).Where(r => r.Name.Length > 0).ToList();
+        foreach (var p in ReadPackagesConfig(root, dir))
+            if (!packages.Any(x => x.Name.Equals(p.Name, StringComparison.OrdinalIgnoreCase))) packages.Add(p);
+        var locals = doc.Descendants(ns + "Reference").Select(e => new LocalRef(AssemblyName(e.Attribute("Include")?.Value ?? ""), e.Element(ns + "HintPath")?.Value, Line(e)))
+            .Where(r => r.Name.Length > 0 && !IsFrameworkOrNuGetReference(r)).ToList();
+        var targetFramework = new[] { "TargetFramework", "TargetFrameworks", "TargetFrameworkVersion" }
+            .Select(n => doc.Descendants(ns + n).Select(e => e.Value.Trim()).FirstOrDefault(v => v.Length > 0)).FirstOrDefault(v => v is not null);
+        var legacyWeb = doc.Descendants(ns + "ProjectTypeGuids").Any(e => e.Value.Contains(WebApplicationGuid, StringComparison.OrdinalIgnoreCase));
         // 测试项目：测试框架包、测试 SDK（MSTest.Sdk 这种不带 PackageReference 的），或名字以 Tests 结尾且引用了 xunit / NUnit
         var isTest = packages.Any(p => TestPackages.Any(t => p.Name.Equals(t, StringComparison.OrdinalIgnoreCase) || p.Name.StartsWith(t + ".", StringComparison.OrdinalIgnoreCase)))
                      || (sdk is not null && (sdk.Contains("Test", StringComparison.OrdinalIgnoreCase)))
-                     || Regex.IsMatch(name, @"\.Tests?$|Tests?$", RegexOptions.IgnoreCase) && packages.Any(p => p.Name.Contains("xunit", StringComparison.OrdinalIgnoreCase) || p.Name.Contains("NUnit", StringComparison.OrdinalIgnoreCase));
-        var (ports, deploy, dockerfile) = ReadDeployment(root, dir);
-        return new CsProject(dir, relFile, name, sdk, outputType, isTest, refs, packages, locals, ports, deploy, dockerfile);
+                     || Regex.IsMatch(name, @"\.Tests?$|Tests?$", RegexOptions.IgnoreCase) && packages.Any(p => p.Name.Contains("xunit", StringComparison.OrdinalIgnoreCase) || p.Name.Contains("NUnit", StringComparison.OrdinalIgnoreCase))
+                     // 测试包写在共享 props 里（<Import Project="..\framework.tests.props" />）：名字以 Tests 结尾且导入了带 test 的 props
+                     || Regex.IsMatch(name, @"Tests?$", RegexOptions.IgnoreCase) && doc.Descendants(ns + "Import").Any(e => e.Attribute("Project")?.Value.Contains("test", StringComparison.OrdinalIgnoreCase) == true);
+        var (ports, deploy, dockerfile) = ReadDeployment(roots, dir);
+        return new CsProject(dir, relFile, name, sdk, outputType, isTest, refs, packages, locals, ports, deploy, dockerfile, targetFramework, legacyWeb);
     }
 
     private static int Line(XElement e) => ((IXmlLineInfo)e).HasLineInfo() ? ((IXmlLineInfo)e).LineNumber : 0;
 
-    private static string? ResolveRef(string root, string fromDir, string include)
+    /// <summary>旧式 ASP.NET Web Application 的项目类型 GUID。</summary>
+    private const string WebApplicationGuid = "349c5851-65df-11da-9384-00065b846f21";
+    private static readonly Regex NuGetPackagesHint = new(@"(^|[\\/])packages[\\/]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly HashSet<string> FrameworkAssemblies = new(StringComparer.OrdinalIgnoreCase)
+        { "mscorlib", "netstandard", "WindowsBase", "PresentationCore", "PresentationFramework", "UIAutomationProvider", "UIAutomationTypes", "ReachFramework" };
+
+    /// <summary>强名称 "Npgsql, Version=4.1.0.0, Culture=neutral, …" → "Npgsql"。</summary>
+    private static string AssemblyName(string include) => (include.Contains(',') ? include[..include.IndexOf(',')] : include).Trim();
+
+    /// <summary>
+    /// 不是本地厂商程序集的 &lt;Reference&gt;：没有 HintPath 的框架程序集（System*、Microsoft.*、WPF 那几个），
+    /// 以及 HintPath 指向 packages\ 的 NuGet 程序集（packages.config 的还原目录，包本身从 packages.config 读）。
+    /// </summary>
+    private static bool IsFrameworkOrNuGetReference(LocalRef r)
     {
-        var combined = System.IO.Path.GetFullPath(System.IO.Path.Combine(root, fromDir.Replace('/', System.IO.Path.DirectorySeparatorChar), include.Replace('\\', System.IO.Path.DirectorySeparatorChar).Replace('/', System.IO.Path.DirectorySeparatorChar)));
-        var rel = Rel(root, combined);
-        if (rel.StartsWith("..", StringComparison.Ordinal)) return null;
+        if (r.HintPath is not null) return NuGetPackagesHint.IsMatch(r.HintPath);
+        return r.Name.Equals("System", StringComparison.OrdinalIgnoreCase) || r.Name.StartsWith("System.", StringComparison.OrdinalIgnoreCase)
+               || r.Name.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) || FrameworkAssemblies.Contains(r.Name);
+    }
+
+    /// <summary>同目录 packages.config 的 &lt;package id="…"&gt;：行号是 packages.config 里的行，File 指向它。</summary>
+    private static IEnumerable<PackageRef> ReadPackagesConfig(string root, string dir)
+    {
+        var rel = Combine(dir, "packages.config");
+        var full = System.IO.Path.Combine(root, rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+        if (!File.Exists(full)) return [];
+        try
+        {
+            var doc = XDocument.Load(full, LoadOptions.SetLineInfo);
+            return doc.Descendants().Where(e => e.Name.LocalName == "package")
+                .Select(e => new PackageRef(e.Attribute("id")?.Value ?? "", Line(e), rel)).Where(p => p.Name.Length > 0).ToList();
+        }
+        catch (XmlException) { return []; }
+        catch (IOException) { return []; }
+    }
+
+    /// <summary>ProjectReference → 被引用项目的目录（相对主根）；不在任何根之下返回 null。</summary>
+    private static string? ResolveRef(ProjectRoots roots, string fromDir, string include)
+    {
+        var combined = System.IO.Path.GetFullPath(System.IO.Path.Combine(roots.Main, fromDir.Replace('/', System.IO.Path.DirectorySeparatorChar), include.Replace('\\', System.IO.Path.DirectorySeparatorChar).Replace('/', System.IO.Path.DirectorySeparatorChar)));
+        if (!roots.Contains(combined)) return null;
+        var rel = roots.Relative(combined);
         return rel.Contains('/') ? rel[..rel.LastIndexOf('/')] : "";
     }
 
-    /// <summary>launchSettings 与 Dockerfile 里的端口；Dockerfile 在项目目录或上一级目录。</summary>
-    private static (List<int> Ports, List<Evidence> Evidence, string? Dockerfile) ReadDeployment(string root, string dir)
+    /// <summary>launchSettings 与 Dockerfile 里的端口；Dockerfile 在项目目录或上一级目录（项目目录本身是某个根时不往上找）。</summary>
+    private static (List<int> Ports, List<Evidence> Evidence, string? Dockerfile) ReadDeployment(ProjectRoots roots, string dir)
     {
+        var root = roots.Main;
         var ports = new List<int>();
         var evidence = new List<Evidence>();
         var launch = Combine(dir, "Properties/launchSettings.json");
@@ -152,29 +234,38 @@ public sealed class ProjectInventory
             evidence.Add(new Evidence(launch, null, "applicationUrl"));
         }
         string? dockerfile = null;
-        foreach (var candidateDir in new[] { dir, Parent(dir) })
+        var isRootDir = roots.IsRoot(System.IO.Path.Combine(root, dir.Replace('/', System.IO.Path.DirectorySeparatorChar)));
+        foreach (var candidateDir in new[] { dir, isRootDir ? null : Parent(dir) })
         {
             if (candidateDir is null) continue;
-            var dfRel = Combine(candidateDir, "Dockerfile");
-            var dfFull = System.IO.Path.Combine(root, dfRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
-            if (!File.Exists(dfFull)) continue;
-            dockerfile = dfRel;
-            var lines = File.ReadAllLines(dfFull);
-            for (var i = 0; i < lines.Length; i++)
-            {
-                var m = DockerPort.Match(lines[i]);
-                if (!m.Success) continue;
-                var g = m.Groups.Cast<Group>().Skip(1).FirstOrDefault(x => x.Success);
-                if (g is not null && int.TryParse(g.Value, out var port) && !ports.Contains(port)) { ports.Add(port); evidence.Add(new Evidence(dfRel, i + 1, lines[i].Trim())); }
-            }
-            if (!evidence.Any(e => e.File == dfRel)) evidence.Add(new Evidence(dfRel));
-            break;
+            dockerfile = ReadDockerfile(root, candidateDir, ports, evidence);
+            if (dockerfile is not null) break;
         }
         return (ports, evidence, dockerfile);
     }
 
-    private static FrontendApp? ReadFrontend(string root, string relFile)
+    /// <summary>dir 下的 Dockerfile：端口（EXPOSE / ASPNETCORE_*）与证据追加到 ports / evidence；没有 Dockerfile 返回 null。</summary>
+    private static string? ReadDockerfile(string root, string dir, List<int> ports, List<Evidence> evidence)
     {
+        var dirFull = System.IO.Path.Combine(root, dir.Replace('/', System.IO.Path.DirectorySeparatorChar));
+        if (FindFileIgnoreCase(dirFull, "Dockerfile") is not { } actualName) return null;
+        var dfRel = Combine(dir, actualName);
+        var dfFull = System.IO.Path.Combine(dirFull, actualName);
+        var lines = File.ReadAllLines(dfFull);
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var m = DockerPort.Match(lines[i]);
+            if (!m.Success) continue;
+            var g = m.Groups.Cast<Group>().Skip(1).FirstOrDefault(x => x.Success);
+            if (g is not null && int.TryParse(g.Value, out var port) && !ports.Contains(port)) { ports.Add(port); evidence.Add(new Evidence(dfRel, i + 1, lines[i].Trim())); }
+        }
+        if (!evidence.Any(e => e.File == dfRel)) evidence.Add(new Evidence(dfRel));
+        return dfRel;
+    }
+
+    private static FrontendApp? ReadFrontend(ProjectRoots roots, string relFile)
+    {
+        var root = roots.Main;
         var full = System.IO.Path.Combine(root, relFile.Replace('/', System.IO.Path.DirectorySeparatorChar));
         var dir = relFile.Contains('/') ? relFile[..relFile.LastIndexOf('/')] : "";
         try
@@ -191,7 +282,7 @@ public sealed class ProjectInventory
             var framework = FrontendFrameworks.FirstOrDefault(f => deps.Contains(f, StringComparer.OrdinalIgnoreCase));
             if (framework is null) return null;
             var name = rootEl.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String ? n.GetString()! : (dir.Length == 0 ? "web" : dir[(dir.LastIndexOf('/') + 1)..]);
-            var (ports, _, dockerfile) = ReadDeployment(root, dir);
+            var (ports, _, dockerfile) = ReadDeployment(roots, dir);
             return new FrontendApp(dir, relFile, name, framework, ports, dockerfile);
         }
         catch (JsonException) { return null; }
@@ -201,7 +292,11 @@ public sealed class ProjectInventory
     {
         var dirFull = System.IO.Path.Combine(root, dir.Replace('/', System.IO.Path.DirectorySeparatorChar));
         if (!Directory.Exists(dirFull)) yield break;
-        foreach (var file in Directory.EnumerateFiles(dirFull, "appsettings*.json"))
+        // 不分大小写（AppSettings.json 在 Windows 上也认）且按文件名排序：Config() 在没有主文件时取第一个环境文件，
+        // 枚举顺序在 NTFS 上是按名字排好的、在 ext4 上是散列序，不排序两个平台会取到不同的值。排序键与 NTFS 一致（不分大小写在前）。
+        var files = Directory.EnumerateFiles(dirFull, "appsettings*.json", CaseInsensitiveMatch)
+            .OrderBy(f => System.IO.Path.GetFileName(f), StringComparer.OrdinalIgnoreCase).ThenBy(f => System.IO.Path.GetFileName(f), StringComparer.Ordinal);
+        foreach (var file in files)
         {
             var fileName = System.IO.Path.GetFileName(file);
             var env = fileName.Equals("appsettings.json", StringComparison.OrdinalIgnoreCase) ? null : fileName["appsettings.".Length..^".json".Length];
@@ -233,6 +328,33 @@ public sealed class ProjectInventory
             case JsonValueKind.String: yield return (prefix, el.GetString() ?? ""); break;
             case JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False: yield return (prefix, el.GetRawText()); break;
         }
+    }
+
+    /// <summary>与 Directory.EnumerateFiles(path, pattern) 的默认行为相同，只是文件名匹配在所有平台都不分大小写。</summary>
+    private static readonly EnumerationOptions CaseInsensitiveMatch = new()
+    {
+        MatchCasing = MatchCasing.CaseInsensitive, MatchType = MatchType.Win32, AttributesToSkip = 0, IgnoreInaccessible = false,
+    };
+
+    /// <summary>
+    /// 目录里名为 name 的文件（不分大小写，大小写完全相同的优先），返回磁盘上的真实文件名；没有返回 null。
+    /// Windows 上 File.Exists(".../Dockerfile") 对 dockerfile 也成立、Linux 上不成立，按目录列表找两边结果一样，证据里记的也是真实文件名。
+    /// </summary>
+    internal static string? FindFileIgnoreCase(string dirFull, string name)
+    {
+        try
+        {
+            string? found = null;
+            foreach (var f in Directory.EnumerateFiles(dirFull, name, CaseInsensitiveMatch))
+            {
+                var actual = System.IO.Path.GetFileName(f);
+                if (actual == name) return actual;
+                if (found is null || string.CompareOrdinal(actual, found) < 0) found = actual;
+            }
+            return found;
+        }
+        catch (IOException) { return null; }
+        catch (UnauthorizedAccessException) { return null; }
     }
 
     internal static string Combine(string dir, string rel) => dir.Length == 0 ? rel : dir + "/" + rel;

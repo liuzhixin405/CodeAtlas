@@ -45,7 +45,9 @@ internal static class Schema
             file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
             line INTEGER NOT NULL,
             via TEXT,
-            evidence_line INTEGER
+            evidence_line INTEGER,
+            pos INTEGER,
+            ctx TEXT
         );
         CREATE INDEX IF NOT EXISTS ix_edges_from ON edges(from_id);
         CREATE INDEX IF NOT EXISTS ix_edges_to ON edges(to_id);

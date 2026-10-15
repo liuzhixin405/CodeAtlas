@@ -1,4 +1,4 @@
-import type { ArchDto, DsmDto, EntryDto, FlowDto, HealthDto, IndexStatusDto, MapDto, NarrationStatusDto, NarrativeDto, NarrativeKind, NeighborDto, PipelineDto, SymbolDto } from "./types";
+import type { ArchDto, DsmDto, EntryDto, FlowDto, HealthDto, IndexStatusDto, MapDto, NarrationStatusDto, NarrativeDto, NarrativeKind, NeighborDto, PipelineDto, RelationsDto, SymbolDto } from "./types";
 
 /** 默认不含 references：类型引用（参数类型、字段类型）不是调用链的一部分，按需打开。 */
 export const DefaultKinds = "calls,implements,inherits,dispatches";
@@ -77,6 +77,11 @@ export class Api {
 
   async neighbors(id: number, direction: "in" | "out" | "both" = "both", kinds = DefaultKinds): Promise<NeighborDto[]> {
     return (await this.get<NeighborDto[]>(`/api/symbols/${id}/neighbors?direction=${direction}&kinds=${encodeURIComponent(kinds)}`)) ?? [];
+  }
+
+  /** 模块关系：以 id 所属的单元（类 / 接口 / … / 模块）为中心。旧服务没有这个接口或符号不在索引里时返回 null。 */
+  relations(id: number, depth: 1 | 2, tests: boolean): Promise<RelationsDto | null> {
+    return this.get<RelationsDto>(`/api/symbols/${id}/relations?depth=${depth}&tests=${tests}`);
   }
 
   // ---- 本地 AI 叙述（M5d）。老服务没有这些路由 → 404 → null，页面按 unavailable 处理 ----

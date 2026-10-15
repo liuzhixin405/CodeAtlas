@@ -41,13 +41,16 @@ public class TreeSitterIndexerTests : IDisposable
         var helper = Sym("src/util/format.ts:helper");
 
         var mainOut = Reader.GetNeighbors(main.Id, Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Calls });
-        Assert.Contains(mainOut, n => n.Other?.Id == svc.Id && n.Edge.Confidence == 0.7);
+        // new Svc()：Svc 是 import { Svc } from './svc' 绑定的名字 → 按导出解析 0.95（以前按 import 范围同名 0.7）
+        Assert.Contains(mainOut, n => n.Other?.Id == svc.Id && n.Edge.Confidence == 0.95);
+        // new Svc().find()：接收者是表达式、类型未知 → 仍按 import 范围同名 0.7
         Assert.Contains(mainOut, n => n.Other?.Id == find.Id && n.Edge.Confidence == 0.7);
         Assert.Contains(mainOut, n => n.Edge.ToName == "external:fetch" && n.Edge.Confidence == 0.5);
 
+        // helper 是 import { helper } from './util/format' 绑定的名字 → 0.95（以前 0.7）
         var findOut = Reader.GetNeighbors(find.Id, Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Calls });
         Assert.Equal(helper.Id, findOut.Single().Other!.Id);
-        Assert.Equal(0.7, findOut.Single().Edge.Confidence);
+        Assert.Equal(0.95, findOut.Single().Edge.Confidence);
         Assert.Equal(3, findOut.Single().Edge.Line);
 
         var appModule = Sym("src/app.ts");
@@ -172,9 +175,10 @@ public class TreeSitterIndexerTests : IDisposable
     }
 
     [Fact]
-    public async Task Indexer_SkipsNestedGitCheckouts_WorktreesAndSubmodules()
+    public async Task Indexer_SkipsWorktrees_ButIncludesIndependentClones_UnlessNestedIsOff()
     {
-        // git worktree 的标记是一个 .git 文件；子模块/嵌套仓库是 .git 目录。两者都不属于本仓库。
+        // git worktree 的标记是一个 .git 文件（gitdir 指向 …/worktrees/…），是本仓库的副本，跳过；
+        // .git 目录是独立克隆，内容只在这里，默认纳入（多项目索引）；IncludeNested=false 恢复旧行为。
         Directory.CreateDirectory(Path.Combine(_repo, ".claude", "worktrees", "wt1", "src"));
         File.WriteAllText(Path.Combine(_repo, ".claude", "worktrees", "wt1", ".git"), "gitdir: ../../../.git/worktrees/wt1");
         File.WriteAllText(Path.Combine(_repo, ".claude", "worktrees", "wt1", "src", "dup.ts"), "export function duplicated() {}");
@@ -183,8 +187,14 @@ public class TreeSitterIndexerTests : IDisposable
 
         var report = await NewIndexer().IndexAsync(_repo);
 
-        Assert.Equal(3, report.FilesScanned);
+        // 旧期望 3（fixture 的 src/app.ts、src/svc.ts、src/util/format.ts）；现在 vendor/sub/lib.ts 是独立克隆，纳入 → 3 + 1 = 4
+        Assert.Equal(4, report.FilesScanned);
         Assert.Empty(Reader.FindByName("duplicated"));
+        Assert.Equal("vendor/sub/lib.ts", Reader.GetFileById(Reader.FindByName("fromSubmodule").Single().FileId)!.Path);
+
+        // 关掉嵌套仓库：回到 3 个文件，克隆里的文件按"磁盘上没有了"删掉
+        var off = await NewIndexer().IndexAsync(CodeAtlas.Core.Workspace.ProjectRoots.Single(_repo, includeNested: false));
+        Assert.Equal((3, 1), (off.FilesScanned, off.FilesRemoved));
         Assert.Empty(Reader.FindByName("fromSubmodule"));
     }
 
@@ -207,9 +217,10 @@ public class TreeSitterIndexerTests : IDisposable
             Assert.Equal(2, conduits.Count);
             Assert.Equal(7, dispatch.Edge.EvidenceLine); // new ListFeedsQuery 所在行
 
-            // 链条继续：HandleAsync → repo.ListFeedsAsync（同名唯一，全仓库 0.5）
+            // 链条继续：HandleAsync → repo.ListFeedsAsync。接收者是 IFeedRepository 字段，接口定义不在夹具里，
+            // FeedRepository 的 base_list 写了它 → 连到实现上的同名方法，名字匹配的低档 0.5（以前按"全仓库同名唯一"也是 0.5）
             var next = Reader.GetNeighbors(handle.Id, Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Calls });
-            Assert.Contains(next, n => n.Other?.QualifiedName == "Acme.Infrastructure.FeedRepository.ListFeedsAsync");
+            Assert.Contains(next, n => n.Other?.QualifiedName == "Acme.Infrastructure.FeedRepository.ListFeedsAsync" && n.Edge.Confidence == 0.5);
         }
         finally { Directory.Delete(cqrs, recursive: true); }
     }

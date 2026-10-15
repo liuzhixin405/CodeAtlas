@@ -22,7 +22,7 @@ export interface AiServicePreset {
   model: string;
 }
 
-/** 「CodeAtlas: 选择 AI 服务」里的预设。模型名只是默认值。 */
+/** 「CodeTrail Graph: 选择 AI 服务」里的预设。模型名只是默认值。 */
 export const AiServicePresets: readonly AiServicePreset[] = [
   { id: "local", label: "本地 llama-server", provider: "openai", endpoint: "http://127.0.0.1:8080/v1", model: "qwen3.6-27b" },
   { id: "deepseek", label: "DeepSeek", provider: "openai", endpoint: "https://api.deepseek.com/v1", model: "deepseek-chat" },

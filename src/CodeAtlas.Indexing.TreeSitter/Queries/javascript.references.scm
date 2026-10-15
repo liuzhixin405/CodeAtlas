@@ -1,5 +1,21 @@
 (call_expression function: (identifier) @ref.calls)
 (call_expression function: (member_expression property: (property_identifier) @ref.calls))
+; this.#m()
+(call_expression function: (member_expression property: (private_property_identifier) @ref.calls))
 (new_expression constructor: (identifier) @ref.calls)
 (class_heritage (identifier) @ref.inherits)
 (import_statement source: (string (string_fragment) @ref.imports))
+(export_statement source: (string (string_fragment) @ref.imports))
+; CommonJS：require('m') 是 import（require 这个调用本身由适配器丢掉）
+((call_expression function: (identifier) @_f arguments: (arguments . (string (string_fragment) @ref.imports))) (#eq? @_f "require"))
+(jsx_opening_element name: (identifier) @ref.render)
+(jsx_self_closing_element name: (identifier) @ref.render)
+(jsx_opening_element name: (member_expression property: (property_identifier) @ref.render))
+(jsx_self_closing_element name: (member_expression property: (property_identifier) @ref.render))
+; const X = memo(Y) / forwardRef(Y) / observer(Y)：X 渲染 Y
+((program (lexical_declaration (variable_declarator value: (call_expression function: (_) @_w arguments: (arguments . (identifier) @ref.render .))))) (#match? @_w "^((React\\.)?(memo|forwardRef)|observer)$"))
+((program (export_statement (lexical_declaration (variable_declarator value: (call_expression function: (_) @_w arguments: (arguments . (identifier) @ref.render .)))))) (#match? @_w "^((React\\.)?(memo|forwardRef)|observer)$"))
+; 作为 on 开头属性传出去的处理函数：onClick={handleX} / onClick={this.handleX} / onSubmit={form.handleSubmit(onSubmit)}（适配器标 via = event）
+((jsx_attribute (property_identifier) @_a (jsx_expression (identifier) @ref.calls)) (#match? @_a "^on[A-Z]"))
+((jsx_attribute (property_identifier) @_a (jsx_expression (member_expression object: (this) property: (property_identifier) @ref.calls))) (#match? @_a "^on[A-Z]"))
+((jsx_attribute (property_identifier) @_a (jsx_expression (call_expression arguments: (arguments (identifier) @ref.calls)))) (#match? @_a "^on[A-Z]"))

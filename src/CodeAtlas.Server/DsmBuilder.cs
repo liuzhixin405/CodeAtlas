@@ -50,6 +50,27 @@ public static class DsmBuilder
     /// （接口调用 → 实现，里程碑 3 为了调用链加的）——它们表达的是运行时去向，算进去会让 Application "依赖" Infrastructure，与项目引用矛盾。
     /// </summary>
     private static readonly HashSet<EdgeKind> DependencyKinds = [EdgeKind.Calls, EdgeKind.Implements, EdgeKind.Inherits, EdgeKind.References];
+    /// <summary>
+    /// 没有任何可部署容器（纯类库仓库）时的整库伪容器键：DSM 仍可按项目 / 模块看依赖。
+    /// 成员 = 清单里的非测试项目目录（csproj、go.mod、Python 项目、Java 模块、前端）；一个都没有就是整个仓库（""）。
+    /// </summary>
+    public const string RepoKey = "*";
+
+    public static ArchNode RepoContainer(CodeAtlas.Core.Workspace.ProjectRoots roots)
+    {
+        var inv = ProjectInventory.Load(roots);
+        var dirs = inv.Projects.Where(p => !p.IsTest).Select(p => p.Dir)
+            .Concat(inv.GoModules.Select(m => m.Dir))
+            .Concat(inv.PythonProjects.Where(p => !p.IsTest).Select(p => p.Dir))
+            .Concat(inv.JavaModules.Where(m => !m.IsTest).Select(m => m.Dir))
+            .Concat(inv.Frontends.Select(f => f.Dir))
+            .Concat(inv.NodeServices.Select(n => n.Dir))
+            .Distinct(StringComparer.Ordinal).OrderBy(d => d, StringComparer.Ordinal).ToList();
+        if (dirs.Count == 0) dirs = [""];
+        var name = System.IO.Path.GetFileName(roots.Main.TrimEnd('/', '\\'));
+        return new ArchNode(RepoKey, ArchNodeKind.Container, "repo", name.Length == 0 ? "仓库" : name, "", ArchSource.Discovered, [], dirs, []);
+    }
+
     public const string SelfLabel = "（本级）";
     public const string GlobalLabel = "（全局命名空间）";
     public const string StrayPrefix = "⚠ ";
@@ -65,8 +86,10 @@ public static class DsmBuilder
         var members = container.Members.OrderByDescending(m => m.Length).ToList();
         string? MemberOf(string path) => members.FirstOrDefault(m => Rules.Under(path, m));
 
-        // module 符号是"每个文件一个"的容器节点，没有命名空间，会把所有文件堆进一个空键组件；不参与
-        var scoped = symbols.Where(s => s.Kind is not (SymbolKind.External or SymbolKind.Module) && MemberOf(s.Path) is not null).ToList();
+        // module 符号是"每个文件一个"的容器节点，没有命名空间，会把所有文件堆进一个空键组件；不参与。
+        // Java 的测试代码（Maven / Gradle 布局在同一个模块目录的 src/test/java 里）不是架构的一部分，也不参与——C# 的测试项目本来就不是容器成员
+        var scoped = symbols.Where(s => s.Kind is not (SymbolKind.External or SymbolKind.Module) && MemberOf(s.Path) is not null
+                                        && !(MapBuilder.IsJava(s) && PipelineBuilder.IsTest(s.Path, ""))).ToList();
         var byId = symbols.ToDictionary(s => s.Id);
         var keys = MapBuilder.GroupKeys(scoped);
 
@@ -78,6 +101,14 @@ public static class DsmBuilder
             baseOf[m] = ks.Count == 0 ? m : DominantPrefix(ks, m);
         }
 
+        // Go / Python 的成员（多数符号在 .go / .py 里）：组件是包目录。容器层不是"一个成员一个组件"，而是成员目录本身（直接放在里面的文件）
+        // 加它下面的顶层子目录——Go 模块 / Python 项目通常只有一个成员目录（go.mod / pyproject 所在），一个组件什么也看不出
+        var packageMembers = members.Where(m =>
+        {
+            var inMember = scoped.Where(s => MemberOf(s.Path) == m).ToList();
+            return inMember.Count > 0 && inMember.Count(s => IsPackageLanguage(s.Path)) * 2 > inMember.Count;
+        }).ToHashSet(StringComparer.Ordinal);
+
         var compOf = new Dictionary<long, string>();
         var hasChildren = new Dictionary<string, bool>(StringComparer.Ordinal);
         var labels = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -86,7 +117,15 @@ public static class DsmBuilder
             if (!keys.TryGetValue(s.Id, out var key)) continue;
             var member = MemberOf(s.Path)!;
             string? comp;
-            if (root.Length == 0)
+            if (root.Length == 0 && packageMembers.Contains(member))
+            {
+                comp = key == member ? member : MapBuilder.ChildKey(member, key) ?? member;
+                labels[comp] = comp != member ? MapBuilder.KeyLabel(comp) : member.Length == 0 ? container.Name : MapBuilder.KeyLabel(member);
+                // 本级的子目录已经摊在这一层，本级组件不再往下钻
+                if (comp != member && MapBuilder.ChildKey(comp, key) is not null) hasChildren[comp] = true;
+                else hasChildren.TryAdd(comp, false);
+            }
+            else if (root.Length == 0)
             {
                 comp = member;
                 labels[comp] = member.Length == 0 ? container.Name : MapBuilder.LastSegment(member);
@@ -107,7 +146,7 @@ public static class DsmBuilder
                     else continue;
                 }
                 // 漏前缀的命名空间标 ⚠ 加顶层段，和同名的正常组件区分开（RolePermissionLibrary vs ⚠ RolePermissionLibrary）
-                labels[comp] = comp == basis ? SelfLabel : stray ? (comp.Length == 0 ? GlobalLabel : StrayPrefix + comp) : MapBuilder.LastSegment(comp);
+                labels[comp] = comp == basis ? SelfLabel : stray ? (comp.Length == 0 ? GlobalLabel : StrayPrefix + comp) : MapBuilder.KeyLabel(comp);
                 if (comp != basis && MapBuilder.ChildKey(comp, key) is not null) hasChildren[comp] = true;
                 else hasChildren.TryAdd(comp, false);
             }
@@ -137,21 +176,7 @@ public static class DsmBuilder
         foreach (var (from, to) in cellMap.Keys) deps[from].Add(to);
 
         // Tarjan + 分量间拓扑（被依赖者在前）
-        var sccOf = Tarjan(compKeys, deps);
-        var sccMembers = sccOf.GroupBy(p => p.Value).ToDictionary(g => g.Key, g => g.Select(p => p.Key).ToList());
-        var sccDeps = sccMembers.Keys.ToDictionary(id => id, id => sccMembers[id].SelectMany(k => deps[k]).Select(k => sccOf[k]).Where(d => d != id).ToHashSet());
-        var ordered = new List<string>();
-        var placed = new HashSet<int>();
-        int SccSize(int id) => sccMembers[id].Sum(k => symbolCount[k]);
-        while (placed.Count < sccMembers.Count)
-        {
-            var ready = sccMembers.Keys.Where(id => !placed.Contains(id) && sccDeps[id].All(placed.Contains))
-                .OrderByDescending(SccSize).ThenBy(id => sccMembers[id].Min(StringComparer.Ordinal), StringComparer.Ordinal).ToList();
-            if (ready.Count == 0) ready = [sccMembers.Keys.First(id => !placed.Contains(id))]; // 理论上不会：分量间无环
-            var id = ready[0];
-            placed.Add(id);
-            ordered.AddRange(sccMembers[id].OrderByDescending(k => symbolCount[k]).ThenBy(k => k, StringComparer.Ordinal));
-        }
+        var (ordered, sccOf, sccMembers) = DependencyOrder(compKeys, deps, k => symbolCount[k]);
         var index = ordered.Select((k, i) => (k, i)).ToDictionary(p => p.k, p => p.i, StringComparer.Ordinal);
         var sccIndex = new Dictionary<int, int>();
         foreach (var k in ordered) sccIndex.TryAdd(sccOf[k], sccIndex.Count);
@@ -236,13 +261,41 @@ public static class DsmBuilder
         return violations.OrderBy(v => v.Row).ThenBy(v => v.Col).ThenBy(v => v.RuleId).ToList();
     }
 
+    private static bool IsPackageLanguage(string path) =>
+        path.EndsWith(".go", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".py", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>多数派的公共前缀：按第一段分组取最大组，再求组内公共前缀；全失败回退 fallback。</summary>
     public static string DominantPrefix(IReadOnlyList<string> keys, string fallback)
     {
-        var dominant = keys.Where(k => k.Length > 0).GroupBy(k => k.Split(['.', '/'])[0]).OrderByDescending(g => g.Count()).ThenBy(g => g.Key, StringComparer.Ordinal).FirstOrDefault();
+        var dominant = keys.Where(k => MapBuilder.KeySegments(k).Length > 0).GroupBy(k => MapBuilder.KeySegments(k)[0]).OrderByDescending(g => g.Count()).ThenBy(g => g.Key, StringComparer.Ordinal).FirstOrDefault();
         if (dominant is null) return fallback;
         var prefix = PipelineBuilder.CommonPrefix(dominant);
         return prefix.Length == 0 ? dominant.Key : prefix;
+    }
+
+    /// <summary>
+    /// 组件的依赖序（DSM 与模块关系共用）：Tarjan 找强连通分量，分量之间拓扑排序、被依赖者在前；同时可放的分量按 size 之和降序、再按分量里最小的键；
+    /// 分量（环）内按 size 降序、再按键。deps[k] 是 k 依赖的组件（必须含 keys 里每个键）。
+    /// </summary>
+    internal static (List<string> Ordered, Dictionary<string, int> SccOf, Dictionary<int, List<string>> SccMembers) DependencyOrder(
+        List<string> keys, Dictionary<string, HashSet<string>> deps, Func<string, int> size)
+    {
+        var sccOf = Tarjan(keys, deps);
+        var sccMembers = sccOf.GroupBy(p => p.Value).ToDictionary(g => g.Key, g => g.Select(p => p.Key).ToList());
+        var sccDeps = sccMembers.Keys.ToDictionary(id => id, id => sccMembers[id].SelectMany(k => deps[k]).Select(k => sccOf[k]).Where(d => d != id).ToHashSet());
+        var ordered = new List<string>();
+        var placed = new HashSet<int>();
+        int SccSize(int id) => sccMembers[id].Sum(size);
+        while (placed.Count < sccMembers.Count)
+        {
+            var ready = sccMembers.Keys.Where(id => !placed.Contains(id) && sccDeps[id].All(placed.Contains))
+                .OrderByDescending(SccSize).ThenBy(id => sccMembers[id].Min(StringComparer.Ordinal), StringComparer.Ordinal).ToList();
+            if (ready.Count == 0) ready = [sccMembers.Keys.First(id => !placed.Contains(id))]; // 理论上不会：分量间无环
+            var id = ready[0];
+            placed.Add(id);
+            ordered.AddRange(sccMembers[id].OrderByDescending(size).ThenBy(k => k, StringComparer.Ordinal));
+        }
+        return (ordered, sccOf, sccMembers);
     }
 
     private static Dictionary<string, int> Tarjan(List<string> nodes, Dictionary<string, HashSet<string>> adj)
@@ -275,6 +328,7 @@ public static class DsmBuilder
 
     private static class Rules
     {
-        public static bool Under(string rel, string dir) => dir.Length == 0 || rel == dir || rel.StartsWith(dir + "/", StringComparison.Ordinal);
+        // 多项目：成员目录 "" 是主根，不含外部根的 ../… 文件（见 RuleContext.Under）
+        public static bool Under(string rel, string dir) => Core.Architecture.Rules.RuleContext.Under(rel, dir);
     }
 }

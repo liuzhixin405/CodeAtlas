@@ -1,11 +1,6 @@
-using TreeSitter;
+﻿namespace CodeAtlas.Indexing.TreeSitter.Adapters;
 
-namespace CodeAtlas.Indexing.TreeSitter.Adapters;
-
-public sealed class TsxAdapter() : LanguageAdapterBase(
+public sealed class TsxAdapter() : ScriptAdapterBase(
     "tsx", "TSX", [".tsx"],
     QueryResources.Load("typescript.definitions.scm"),
-    QueryResources.Load("typescript.references.scm"))
-{
-    protected override string? ExtractVisibility(Node definition) => TypeScriptAdapter.TypeScriptVisibility(definition);
-}
+    QueryResources.Load("tsx.references.scm"));

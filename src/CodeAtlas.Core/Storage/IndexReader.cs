@@ -8,7 +8,9 @@ public sealed record Neighbor(EdgeRecord Edge, SymbolRecord? Other);
 public sealed class IndexReader(IndexDatabase db)
 {
     private const string SymbolColumns = "s.id, s.file_id, s.kind, s.name, s.qualified_name, s.signature, s.start_line, s.start_col, s.end_line, s.end_col, s.parent_id, s.visibility, s.source";
-    private const string EdgeColumns = "e.id, e.from_id, e.to_id, e.to_name, e.kind, e.source, e.confidence, e.file_id, e.line, e.via, e.evidence_line";
+    private const string EdgeColumns = "e.id, e.from_id, e.to_id, e.to_name, e.kind, e.source, e.confidence, e.file_id, e.line, e.via, e.evidence_line, e.pos, e.ctx";
+    /// <summary>EdgeColumns 的列数：同一行里边后面接符号列时，符号从这个下标开始。</summary>
+    private const int EdgeColumnCount = 13;
 
     public IReadOnlyList<SymbolRecord> SearchSymbols(string query, int limit = 50)
     {
@@ -144,7 +146,7 @@ public sealed class IndexReader(IndexDatabase db)
         using var cmd = db.CreateCommand(sql, ("$id", id));
         using var r = cmd.ExecuteReader();
         var list = new List<Neighbor>();
-        while (r.Read()) list.Add(new Neighbor(ReadEdge(r, 0), ReadSymbol(r, 11)));
+        while (r.Read()) list.Add(new Neighbor(ReadEdge(r, 0), ReadSymbol(r, EdgeColumnCount)));
         return list;
     }
 
@@ -175,5 +177,6 @@ public sealed class IndexReader(IndexDatabase db)
     private static EdgeRecord ReadEdge(SqliteDataReader r, int o) => new(
         r.GetInt64(o), r.GetInt64(o + 1), r.IsDBNull(o + 2) ? null : r.GetInt64(o + 2), r.GetString(o + 3),
         DbNames.ParseEdgeKind(r.GetString(o + 4)), DbNames.ParseSource(r.GetString(o + 5)), r.GetDouble(o + 6),
-        r.GetInt64(o + 7), r.GetInt32(o + 8), r.IsDBNull(o + 9) ? null : r.GetString(o + 9), r.IsDBNull(o + 10) ? null : r.GetInt32(o + 10));
+        r.GetInt64(o + 7), r.GetInt32(o + 8), r.IsDBNull(o + 9) ? null : r.GetString(o + 9), r.IsDBNull(o + 10) ? null : r.GetInt32(o + 10),
+        r.IsDBNull(o + 11) ? null : r.GetInt32(o + 11), r.IsDBNull(o + 12) ? null : r.GetString(o + 12));
 }
