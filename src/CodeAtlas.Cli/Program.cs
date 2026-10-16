@@ -13,12 +13,15 @@ public static class Program
           codeatlas query  <repo> <name|qualified-name> --outline [--depth N] [--no-externals] [--tests] [--db <path>]
           codeatlas query  <repo> <name|qualified-name> --impact [--depth N] [--tests] [--db <path>]（谁调了它、一路影响到哪些入口）
           codeatlas query  <repo> <name|qualified-name> --relations [--depth 1|2] [--tests] [--db <path>]（以它所属的类为中心，类与类之间的依赖，按组件分组）
+          codeatlas query  <repo> <name|qualified-name|#符号id> --flow [--depth N] [--json] [--db <path>]（从这个方法出发的时序树；入口与 arch --flow 相同）
           codeatlas search <repo> <text> [--limit N] [--db <path>]
           codeatlas serve  <repo> [--db <path>] [--port N] [--parent-pid N] [--token T] [--roslyn auto|off] [--project <外部根> …] [--no-nested] [--ai-provider openai|anthropic] [--ai-endpoint <url>] [--ai-model <名>] [--ai-timeout <秒>] [--ai-concurrency N] [--ai-no-source] [--no-ai]
           codeatlas arch   <repo> [--db <path>] [--json] [--no-store] [--project <外部根> …] [--no-nested]
           codeatlas arch   <repo> --dsm <容器键|*> [--root <组件键>] [--json] [--db <path>]（* = 整个仓库，纯类库仓库用）
           codeatlas arch   <repo> --entries <容器键> [--kind http|hosted|command|job|hub|grpc|handler|page|api-route] [--q <文本>] [--json] [--db <path>]
           codeatlas arch   <repo> --flow <入口符号 id> [--depth N] [--json] [--db <path>]
+          codeatlas arch   <repo> --framework <容器键> [--json] [--db <path>]（框架流程：中间件 → 控制器 → 分派器 → 行为链 → Handler → 收尾）
+          codeatlas arch   <repo> --flow-coverage <容器键> [--sample N] [--levels N] [--json] [--db <path>]（任意方法时序图前几层的业务调用覆盖率，回归用）
           codeatlas arch   <repo> --narrate <container|component|flow> <键> [--force] [--facts] [--ai-provider openai|anthropic] [--ai-endpoint <url>] [--ai-model <名>] [--ai-timeout <秒>] [--ai-concurrency N] [--ai-no-source] [--no-ai] [--json] [--db <path>]
           codeatlas arch   <repo> --narrate-all [--flows N] [--force] [--ai-* …] [--db <path>]
 
@@ -48,7 +51,8 @@ public static class Program
     {
         if (args.Length == 0) { stderr.WriteLine(Usage); return 2; }
         ParsedArgs parsed;
-        try { parsed = ParsedArgs.Parse(args.Skip(1).ToList(), Flags); }
+        // --flow 在 query 里是开关（从这个符号出发的时序树），在 arch 里带入口 id
+        try { parsed = ParsedArgs.Parse(args.Skip(1).ToList(), args[0] == "query" ? [.. Flags, "--flow"] : Flags); }
         catch (ArgumentException ex) { stderr.WriteLine(ex.Message); stderr.WriteLine(Usage); return 2; }
 
         try

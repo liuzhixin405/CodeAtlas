@@ -8,8 +8,10 @@ namespace CodeAtlas.Server;
 /// <param name="Hot">git 热点；没有 git 数据为 null。</param>
 public sealed record DsmComponentDto(string Key, string Label, int Symbols, int Files, bool HasChildren, int Scc, DsmHotDto? Hot);
 
+/// <param name="Revisions">组件内各文件修订数之和（文件修订合计：一次提交改了 N 个文件算 N 次），不是提交数。</param>
 /// <param name="AgeMonths">最近一次提交距今的月数。</param>
-public sealed record DsmHotDto(int Revisions, int Added, int Deleted, int AgeMonths, string LastCommit);
+/// <param name="Commits">涉及的提交数（按提交去重）；git 统计里没有提交号（从库里读回的）时为 null，页面只能写"文件修订合计"。</param>
+public sealed record DsmHotDto(int Revisions, int Added, int Deleted, int AgeMonths, string LastCommit, int? Commits = null);
 
 /// <summary>行 Row 依赖列 Col 的边数与种类。</summary>
 public sealed record DsmCellDto(int Row, int Col, int Count, Dictionary<string, int> Kinds);
@@ -59,12 +61,14 @@ public static class DsmBuilder
     public static ArchNode RepoContainer(CodeAtlas.Core.Workspace.ProjectRoots roots)
     {
         var inv = ProjectInventory.Load(roots);
+        // 测试树下的项目（tests/…/Fixtures 里的 Go 模块、夹具 csproj）与测试项目不是架构的一部分：与容器发现同一条测试路径规则
         var dirs = inv.Projects.Where(p => !p.IsTest).Select(p => p.Dir)
             .Concat(inv.GoModules.Select(m => m.Dir))
             .Concat(inv.PythonProjects.Where(p => !p.IsTest).Select(p => p.Dir))
             .Concat(inv.JavaModules.Where(m => !m.IsTest).Select(m => m.Dir))
             .Concat(inv.Frontends.Select(f => f.Dir))
             .Concat(inv.NodeServices.Select(n => n.Dir))
+            .Where(d => !ContainerDiscovery.InTestTree(d))
             .Distinct(StringComparer.Ordinal).OrderBy(d => d, StringComparer.Ordinal).ToList();
         if (dirs.Count == 0) dirs = [""];
         var name = System.IO.Path.GetFileName(roots.Main.TrimEnd('/', '\\'));
@@ -88,8 +92,9 @@ public static class DsmBuilder
 
         // module 符号是"每个文件一个"的容器节点，没有命名空间，会把所有文件堆进一个空键组件；不参与。
         // Java 的测试代码（Maven / Gradle 布局在同一个模块目录的 src/test/java 里）不是架构的一部分，也不参与——C# 的测试项目本来就不是容器成员
+        // 生成代码（protoc 的 *.pb.go / *_pb2.py、*.g.cs …）也不参与：microservices-demo 的 genproto 会成一个 618 符号的大组件，全是桩
         var scoped = symbols.Where(s => s.Kind is not (SymbolKind.External or SymbolKind.Module) && MemberOf(s.Path) is not null
-                                        && !(MapBuilder.IsJava(s) && PipelineBuilder.IsTest(s.Path, ""))).ToList();
+                                        && !(MapBuilder.IsJava(s) && PipelineBuilder.IsTest(s.Path, "")) && !ProjectInventory.IsGeneratedSource(s.Path)).ToList();
         var byId = symbols.ToDictionary(s => s.Id);
         var keys = MapBuilder.GroupKeys(scoped);
 
@@ -192,7 +197,8 @@ public static class DsmBuilder
                 if (stats.Count > 0)
                 {
                     var last = stats.Max(s => s.LastCommit);
-                    hot = new DsmHotDto(stats.Sum(s => s.Revisions), stats.Sum(s => s.Added), stats.Sum(s => s.Deleted), Math.Max(0, (todayValue.DayNumber - last.DayNumber) / 30), last.ToString("yyyy-MM-dd"));
+                    int? commits = stats.All(s => s.Commits is not null) ? stats.SelectMany(s => s.Commits!).Distinct(StringComparer.Ordinal).Count() : null;
+                    hot = new DsmHotDto(stats.Sum(s => s.Revisions), stats.Sum(s => s.Added), stats.Sum(s => s.Deleted), Math.Max(0, (todayValue.DayNumber - last.DayNumber) / 30), last.ToString("yyyy-MM-dd"), commits);
                 }
             }
             return new DsmComponentDto(k, labels[k], symbolCount[k], filesOf[k].Count, hasChildren.GetValueOrDefault(k), sccIndex[sccOf[k]], hot);

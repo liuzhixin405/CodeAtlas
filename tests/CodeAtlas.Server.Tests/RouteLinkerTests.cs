@@ -67,7 +67,7 @@ public partial class RouteLinkerTests
             "    public Task<X?> Get(int id)",                                               // 4
             "    {",                                                                         // 5
             "        var uri = $\"{remoteServiceBaseUrl}invoices?id={id}\";",                 // 6：{字段} 展开 → /api/billing/invoices
-            "        return http.GetFromJsonAsync<X>(uri);",                                 // 7
+            "        return http.PostAsJsonAsync(uri, id);",                                 // 7：POST，与入口 60 一致（GET 不配 POST 入口，见 Match_KnownMethodsThatDiffer_AreNeverLinked）
             "    }",                                                                         // 8
             "    public async Task Create() {",                                              // 9
             "        var req = new HttpRequestMessage(HttpMethod.Post, remoteServiceBaseUrl);", // 10：字段名直接当参数 → /api/billing，按 POST 挑入口
@@ -152,7 +152,10 @@ public partial class RouteLinkerTests
         var up = RouteLinker.Upgrade(model, matches);
         var edge = Assert.Single(up.Edges, e => e.FromKey == "web" && e.ToKey == "Acme.Api");
         Assert.Equal((0.9, "http", "/api/v5/mt5/groups"), (edge.Confidence, edge.Protocol, edge.Evidence[0].Note));
-        Assert.Contains(Assert.Single(up.Edges, e => e.ToKey == "external:http-service:api-api-v5").Evidence, e => e.Note == "1/2 处已对上路由");
+        // 两处里对上一处、都指向 Acme.Api：这个"API /api/v5"就是 Acme.Api，外部边删掉，对不上的处数记在容器边上
+        Assert.DoesNotContain(up.Edges, e => e.ToKey == "external:http-service:api-api-v5");
+        Assert.DoesNotContain(up.Nodes, n => n.Key == "external:http-service:api-api-v5");
+        Assert.Contains(edge.Evidence, e => e.Note == "1/2 处对不上后端路由");
     }
 
     [Fact]

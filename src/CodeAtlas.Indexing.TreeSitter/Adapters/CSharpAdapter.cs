@@ -257,13 +257,13 @@ public sealed partial class CSharpAdapter() : LanguageAdapterBase(
         {
             var written = TargetType(node, state);
             if (written is null) return reference with { Script = new ScriptBinding(ScriptReceiver.This, HeuristicEdgeResolver.CSharpDelegateMarker) };
-            return reference with { Name = written.Split('.')[^1], Script = new ScriptBinding(ScriptReceiver.None, written, Argc(node)) };
+            return reference with { Name = written.Split('.')[^1], Via = DispatchSite(node), Script = new ScriptBinding(ScriptReceiver.None, written, Argc(node)) };
         }
         var target = node.Parent is { Type: "generic_name" } g ? g : node;
         switch (target.Parent)
         {
             case { Type: "object_creation_expression" } creation:
-                return reference with { Line = StartLine(creation), Script = new ScriptBinding(ScriptReceiver.None, TypeName(target, target), Argc(creation)) };
+                return reference with { Line = StartLine(creation), Via = DispatchSite(creation), Script = new ScriptBinding(ScriptReceiver.None, TypeName(target, target), Argc(creation)) };
             case { Type: "invocation_expression" } call when Same(call.GetChildForField("function"), target):
             {
                 var argc = Argc(call);
@@ -280,6 +280,21 @@ public sealed partial class CSharpAdapter() : LanguageAdapterBase(
             default:
                 return reference;
         }
+    }
+
+    private static string? DispatchSite(Node creation)
+    {
+        var expression = creation;
+        while (expression.Parent is { Type: "parenthesized_expression" } parent) expression = parent;
+        if (expression.Parent is not { Type: "argument" } argument
+            || argument.Parent is not { Type: "argument_list" } arguments
+            || arguments.Parent is not { Type: "invocation_expression" } call) return null;
+        var function = call.GetChildForField("function");
+        var name = function?.Type is "member_access_expression" or "member_binding_expression"
+            ? function.GetChildForField("name") : function;
+        if (name?.Type == "generic_name") name = name.FirstChild;
+        return name is not null && HeuristicEdgeResolver.IsDispatcherMethod(name.Text)
+            ? "dispatch-site:" + name.StartIndex.ToString(System.Globalization.CultureInfo.InvariantCulture) : null;
     }
 
     private static int StartLine(Node node) => node.StartPosition.Row + 1;

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using CodeAtlas.Core.Architecture;
 
 namespace CodeAtlas.Core.Storage;
@@ -11,6 +11,7 @@ public static class ArchStorage
     public static void Replace(IndexDatabase db, ArchModel model)
     {
         using var batch = db.BeginBatch();
+        ArchFingerprintStorage.Set(db, ArchFingerprintStorage.Post, null); // 结果换了，指纹作废（后处理写完再记新的）
         db.Execute("DELETE FROM arch_nodes");
         db.Execute("DELETE FROM arch_edges");
         db.Execute("DELETE FROM arch_outbound");

@@ -5,19 +5,19 @@ namespace CodeAtlas.Core.Tests.Architecture;
 
 public class ArchRulesTests
 {
-    /// <summary>ccs-backend PipelineArchitectureTests 的几种链写法（行号对齐：第 1 行是 using）。</summary>
-    private static readonly string[] CcsLike =
+    /// <summary>真实项目 PipelineArchitectureTests 的几种链写法（行号对齐：第 1 行是 using）。</summary>
+    private static readonly string[] ShopLike =
     """
-    using CentralizedConfigurationSystem.Application.Abstractions;
+    using Acme.Shop.Application.Abstractions;
     using NetArchTest.Rules;
 
-    namespace CentralizedConfigurationSystem.ArchTests;
+    namespace Acme.Shop.ArchTests;
 
     public class PipelineArchitectureTests
     {
-        private const string ApplicationNamespace = "CentralizedConfigurationSystem.Application";
-        private const string InfrastructureNamespace = "CentralizedConfigurationSystem.Infrastructure";
-        private const string ApiNamespace = "CentralizedConfigurationSystem.Api";
+        private const string ApplicationNamespace = "Acme.Shop.Application";
+        private const string InfrastructureNamespace = "Acme.Shop.Infrastructure";
+        private const string ApiNamespace = "Acme.Shop.Api";
 
         [Fact]
         public void Commands_ShouldResideInModulesNamespace()
@@ -77,23 +77,23 @@ public class ArchRulesTests
         [Fact]
         public void Domain_ShouldNotDependOnApplication_AndBeSealed()
         {
-            var a = Types.InNamespace("CentralizedConfigurationSystem.Domain").Should().NotHaveDependencyOn(ApplicationNamespace).GetResult();
-            var b = Types.InNamespace("CentralizedConfigurationSystem.Domain").That().HaveNameEndingWith("Entity").Should().BeSealed().GetResult();
-            var c = Types.InNamespace("CentralizedConfigurationSystem.Api").Should().HaveDependencyOn(ApplicationNamespace).GetResult();
+            var a = Types.InNamespace("Acme.Shop.Domain").Should().NotHaveDependencyOn(ApplicationNamespace).GetResult();
+            var b = Types.InNamespace("Acme.Shop.Domain").That().HaveNameEndingWith("Entity").Should().BeSealed().GetResult();
+            var c = Types.InNamespace("Acme.Shop.Api").Should().HaveDependencyOn(ApplicationNamespace).GetResult();
         }
     }
     """.Split('\n').Select(l => l.TrimEnd('\r')).ToArray();
 
     private sealed class FakeResolver : IArchTypeResolver
     {
-        public string? NamespaceOf(string typeName) => typeName is "ICommand" or "ICommandHandler" or "IQueryHandler" or "IPipelineBehavior" or "IApprovable" ? "CentralizedConfigurationSystem.Application.Abstractions" : null;
-        public string? AssemblyRootOf(string typeName) => NamespaceOf(typeName) is null ? null : "CentralizedConfigurationSystem.Application";
+        public string? NamespaceOf(string typeName) => typeName is "ICommand" or "ICommandHandler" or "IQueryHandler" or "IPipelineBehavior" or "IApprovable" ? "Acme.Shop.Application.Abstractions" : null;
+        public string? AssemblyRootOf(string typeName) => NamespaceOf(typeName) is null ? null : "Acme.Shop.Application";
     }
 
     [Fact]
-    public void Parse_CcsChains_WithResolver()
+    public void Parse_ShopChains_WithResolver()
     {
-        var r = ArchRuleParser.Parse("Tests/Arch/PipelineArchitectureTests.cs", CcsLike, new FakeResolver());
+        var r = ArchRuleParser.Parse("Tests/Arch/PipelineArchitectureTests.cs", ShopLike, new FakeResolver());
         var rules = r.Rules;
 
         // 第 1 条链：ImplementInterface + Should().ResideInNamespaceContaining → placement，from = 接口名
@@ -103,28 +103,28 @@ public class ArchRulesTests
 
         // 跨多行 + Or() 两个接口 + 常量替换 → 一条 forbid，主语 = 程序集根命名空间，Source 注明接口限定
         var handlers = rules.Single(x => x.TestName == "Handlers_ShouldNotDependOnInfrastructure");
-        Assert.Equal((ArchRuleKind.ForbidDependency, "CentralizedConfigurationSystem.Application", ArchRuleMatch.Prefix, "CentralizedConfigurationSystem.Infrastructure", ArchRuleMatch.Prefix), (handlers.Kind, handlers.FromPattern, handlers.FromMatch, handlers.ToPattern, handlers.ToMatch));
+        Assert.Equal((ArchRuleKind.ForbidDependency, "Acme.Shop.Application", ArchRuleMatch.Prefix, "Acme.Shop.Infrastructure", ArchRuleMatch.Prefix), (handlers.Kind, handlers.FromPattern, handlers.FromMatch, handlers.ToPattern, handlers.ToMatch));
         Assert.Equal(29, handlers.Line);
         Assert.StartsWith("netarchtest", handlers.Source);
         Assert.Contains("ICommandHandler / IQueryHandler", handlers.Source);
 
         // 插值常量 $"{ApplicationNamespace}.Behaviors" → StartingWith 是 prefix
         var behaviors = rules.Single(x => x.TestName == "Behaviors_ShouldResideInApplicationBehaviors");
-        Assert.Equal((ArchRuleKind.Placement, "IPipelineBehavior", "CentralizedConfigurationSystem.Application.Behaviors", ArchRuleMatch.Prefix), (behaviors.Kind, behaviors.FromPattern, behaviors.ToPattern, behaviors.ToMatch));
+        Assert.Equal((ArchRuleKind.Placement, "IPipelineBehavior", "Acme.Shop.Application.Behaviors", ArchRuleMatch.Prefix), (behaviors.Kind, behaviors.FromPattern, behaviors.ToPattern, behaviors.ToMatch));
 
         // GetTypes() 的链不是规则
         Assert.DoesNotContain(rules, x => x.TestName == "ApprovableCommands_ShouldHaveTaskActionProperty");
 
         // HaveDependencyOnAny → 每个目标一条；注释里的链不算
         var any = rules.Where(x => x.TestName == "Application_ShouldNotDependOnApiOrInfrastructure").ToList();
-        Assert.Equal(new[] { "CentralizedConfigurationSystem.Api", "CentralizedConfigurationSystem.Infrastructure" }, any.Select(x => x.ToPattern));
-        Assert.All(any, x => Assert.Equal((ArchRuleKind.ForbidDependency, "CentralizedConfigurationSystem.Application", "netarchtest", 61), (x.Kind, x.FromPattern, x.Source, x.Line)));
+        Assert.Equal(new[] { "Acme.Shop.Api", "Acme.Shop.Infrastructure" }, any.Select(x => x.ToPattern));
+        Assert.All(any, x => Assert.Equal((ArchRuleKind.ForbidDependency, "Acme.Shop.Application", "netarchtest", 61), (x.Kind, x.FromPattern, x.Source, x.Line)));
 
         // 同一方法里三条链：Should().NotHaveDependencyOn → forbid；BeSealed 跳过计数；Should().HaveDependencyOn → require
         var domain = rules.Where(x => x.TestName == "Domain_ShouldNotDependOnApplication_AndBeSealed").ToList();
         Assert.Equal(2, domain.Count);
-        Assert.Equal((ArchRuleKind.ForbidDependency, "CentralizedConfigurationSystem.Domain", "CentralizedConfigurationSystem.Application", 70), (domain[0].Kind, domain[0].FromPattern, domain[0].ToPattern, domain[0].Line));
-        Assert.Equal((ArchRuleKind.RequireDependency, "CentralizedConfigurationSystem.Api", "CentralizedConfigurationSystem.Application", 72), (domain[1].Kind, domain[1].FromPattern, domain[1].ToPattern, domain[1].Line));
+        Assert.Equal((ArchRuleKind.ForbidDependency, "Acme.Shop.Domain", "Acme.Shop.Application", 70), (domain[0].Kind, domain[0].FromPattern, domain[0].ToPattern, domain[0].Line));
+        Assert.Equal((ArchRuleKind.RequireDependency, "Acme.Shop.Api", "Acme.Shop.Application", 72), (domain[1].Kind, domain[1].FromPattern, domain[1].ToPattern, domain[1].Line));
         Assert.Equal(1, r.SkippedPredicates);
         Assert.Equal(7, rules.Count);
     }
@@ -133,9 +133,9 @@ public class ArchRulesTests
     public void Parse_WithoutResolver_FallsBackToUniqueConstantMatchingUsings_OrAny()
     {
         // 文件里只有 ApplicationNamespace 是 using 的前缀 → InAssembly 猜成它
-        var r = ArchRuleParser.Parse("t.cs", CcsLike);
+        var r = ArchRuleParser.Parse("t.cs", ShopLike);
         var handlers = r.Rules.Single(x => x.TestName == "Handlers_ShouldNotDependOnInfrastructure");
-        Assert.Equal("CentralizedConfigurationSystem.Application", handlers.FromPattern);
+        Assert.Equal("Acme.Shop.Application", handlers.FromPattern);
 
         // 没有 using、没有常量 → * 并在 Source 里注明
         string[] bare =
@@ -150,6 +150,36 @@ public class ArchRulesTests
         Assert.Equal((ArchRule.Any, ArchRuleMatch.Prefix, "X.Infra", "A", 3), (rule.FromPattern, rule.FromMatch, rule.ToPattern, rule.TestName, rule.Line));
         Assert.Contains("无法解析", rule.Source);
         Assert.True(ArchRule.Matches("Anything.At.All", rule.FromPattern, rule.FromMatch));
+    }
+
+    [Fact]
+    public void Parse_ChainsInsideMultiLineStringsAndBlockComments_AreNotRules()
+    {
+        // 测试文件里把 NetArchTest 样例写在多行原始字符串、逐字字符串、普通字符串、块注释里（解析器自己的测试就这么写）：都不是规则。
+        // 最后一条才是真链，行号要对得上
+        const string q = "\"\"\"";
+        string[] lines =
+        [
+            "using NetArchTest.Rules;",                                                                            // 1
+            "public class SampleTests {",                                                                          // 2
+            "  private static readonly string Raw =",                                                              // 3
+            "    " + q,                                                                                            // 4
+            "    var r = Types.InNamespace(\"Acme.Domain\").ShouldNot().HaveDependencyOn(\"Acme.Raw\").GetResult();", // 5
+            "    " + q + ";",                                                                                      // 6
+            "  private static readonly string Verbatim = @\"",                                                     // 7
+            "    var r = Types.InNamespace(\"\"Acme.Domain\"\").ShouldNot().HaveDependencyOn(\"\"Acme.Verbatim\"\").GetResult();", // 8
+            "  \";",                                                                                               // 9
+            "  private const string Inline = \"Types.InNamespace(Acme.Domain).ShouldNot().HaveDependencyOn(Acme.Inline).GetResult();\";", // 10
+            "  /* var r = Types.InNamespace(\"Acme.Domain\")",                                                     // 11
+            "       .ShouldNot().HaveDependencyOn(\"Acme.Block\").GetResult(); */",                               // 12
+            "  public void Real() {",                                                                              // 13
+            "    var r = Types.InNamespace(\"Acme.Domain\") // 注释里的 ; 和 ( 不算",                               // 14
+            "      .ShouldNot().HaveDependencyOn(\"Acme;Infra(\").GetResult();",                                  // 15
+            "  }",                                                                                                 // 16
+            "}",                                                                                                   // 17
+        ];
+        var rule = Assert.Single(ArchRuleParser.Parse("Acme.Tests/SampleTests.cs", lines).Rules);
+        Assert.Equal((ArchRuleKind.ForbidDependency, "Acme.Domain", "Acme;Infra(", "Real", 14), (rule.Kind, rule.FromPattern, rule.ToPattern, rule.TestName, rule.Line));
     }
 
     [Fact]

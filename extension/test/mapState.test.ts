@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { lastSegment, MapState } from "../webview/mapState";
+import { lastSegment, loadMapViewChoice, MapState, MapViewKey, parseMapViewChoice, saveMapViewChoice, type StorageLike } from "../webview/mapState";
 
 describe("MapState", () => {
   it("starts at the top level and drills down building breadcrumbs", () => {
@@ -44,24 +44,43 @@ describe("MapState", () => {
     expect(s.root).toBe("");
   });
 
-  it("goToPathFrom uses the floor as the first level and hides levels above it", () => {
-    const s = new MapState();
-    s.goToPathFrom("Acme.App.Modules", "Acme.App.Modules.MT5.Accounts");
-    expect(s.crumbs.map((c) => c.root)).toEqual(["", "Acme.App.Modules", "Acme.App.Modules.MT5", "Acme.App.Modules.MT5.Accounts"]);
-    expect(s.crumbs.map((c) => c.label)).toEqual(["项目", "Modules", "MT5", "Accounts"]);
-    s.goToPathFrom("Acme.App.Modules", "Acme.App.Modules");
-    expect(s.crumbs.map((c) => c.root)).toEqual(["", "Acme.App.Modules"]);
-    // root 不在 floor 之下（比如用户手动传了别的 root）：退化为完整路径
-    s.goToPathFrom("Acme.App.Modules", "Acme.Other");
-    expect(s.crumbs.map((c) => c.root)).toEqual(["", "Acme", "Acme.Other"]);
-    // 前缀相同但不是层级关系（Acme.App.ModulesX）不算在 floor 之下
-    s.goToPathFrom("Acme.App.Modules", "Acme.App.ModulesX.Y");
-    expect(s.crumbs.map((c) => c.root)).toEqual(["", "Acme", "Acme.App", "Acme.App.ModulesX", "Acme.App.ModulesX.Y"]);
-  });
-
   it("lastSegment handles namespaces, paths and plain keys", () => {
     expect(lastSegment("Acme.Infra")).toBe("Infra");
     expect(lastSegment("src/app")).toBe("app");
     expect(lastSegment("src")).toBe("src");
+  });
+});
+
+function memory(init: Record<string, string> = {}): StorageLike & { data: Record<string, string> } {
+  const data = { ...init };
+  return { data, getItem: (k) => data[k] ?? null, setItem: (k, v) => { data[k] = v; } };
+}
+
+describe("map view choice (top-level 容器 | 框架流程 | 命名空间)", () => {
+  it("maps the old persisted 'pipeline' view to 'framework'", () => {
+    expect(parseMapViewChoice("pipeline")).toBe("framework");
+    expect(parseMapViewChoice("framework")).toBe("framework");
+    expect(parseMapViewChoice("arch")).toBe("arch");
+    expect(parseMapViewChoice("ns")).toBe("ns");
+    // 子视图与不认识的值不记，交给第一屏的默认规则
+    expect(parseMapViewChoice("dsm")).toBeNull();
+    expect(parseMapViewChoice("flow")).toBeNull();
+    expect(parseMapViewChoice("")).toBeNull();
+    expect(parseMapViewChoice(null)).toBeNull();
+  });
+
+  it("load rewrites the old value in storage; save / load round-trip", () => {
+    const s = memory({ [MapViewKey]: "pipeline" });
+    expect(loadMapViewChoice(() => s)).toBe("framework");
+    expect(s.data[MapViewKey]).toBe("framework");
+    saveMapViewChoice(() => s, "ns");
+    expect(loadMapViewChoice(() => s)).toBe("ns");
+  });
+
+  it("storage that throws or is missing reads as no choice", () => {
+    const broken: StorageLike = { getItem: () => { throw new Error("denied"); }, setItem: () => { throw new Error("denied"); } };
+    expect(loadMapViewChoice(() => broken)).toBeNull();
+    expect(() => saveMapViewChoice(() => broken, "arch")).not.toThrow();
+    expect(loadMapViewChoice(() => null)).toBeNull();
   });
 });

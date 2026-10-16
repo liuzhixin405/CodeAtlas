@@ -32,7 +32,8 @@ public static partial class EntryDiscovery
         ["Get"] = "GET", ["Post"] = "POST", ["Put"] = "PUT", ["Delete"] = "DELETE", ["Patch"] = "PATCH", ["Options"] = "OPTIONS", ["Head"] = "HEAD", ["All"] = "",
     };
 
-    [GeneratedRegex(@"\b(\w+)\s*\.\s*(get|post|put|delete|patch|head|options|all|del)\s*\(")]
+    // 接收者由 NodeChainReceiver 往回找：router.get(…) / this.app.get(…) / Router().get(…).post(…)
+    [GeneratedRegex(@"\.\s*(get|post|put|delete|patch|head|options|all|del)\s*\(")]
     private static partial Regex NodeVerbCall();
     [GeneratedRegex(@"\b(\w+)\s*\.\s*route\s*\(")]
     private static partial Regex NodeRouteCall();
@@ -41,8 +42,12 @@ public static partial class EntryDiscovery
     // const router = express.Router()   const app = express()   const router = new Router({ prefix })   const app = Fastify()   const r = Router()
     [GeneratedRegex(@"\b(\w+)\s*(?::\s*[\w.<>]+\s*)?=\s*(?:await\s+)?(?:express\s*\(\s*\)|express\s*\.\s*Router\s*\(|Router\s*\(|new\s+(?:Koa)?Router\s*\(|new\s+Koa\s*\(|[Ff]astify\s*\(|require\s*\(\s*['""]fastify['""]\s*\)\s*\()")]
     private static partial Regex NodeRouterDecl();
-    [GeneratedRegex(@"\b(\w+)\s*\.\s*(use|register)\s*\(")]
+    // app.use(…) / Router().use('/api', api) / const api = Router()⏎ .use(a)⏎ .use(b)：接收者同样由 NodeChainReceiver 往回找
+    [GeneratedRegex(@"\.\s*(use|register)\s*\(")]
     private static partial Regex NodeMount();
+    // export default Router().use('/api', api)   module.exports = express.Router()：没有变量名的默认导出路由器
+    [GeneratedRegex(@"(?:export\s+default|module\s*\.\s*exports\s*=)\s*(?:new\s+)?(?:express\s*\.\s*)?Router\s*\(")]
+    private static partial Regex NodeDefaultRouterExpr();
     [GeneratedRegex(@"(?:module\s*\.\s*exports\s*=|export\s+default)\s*(\w+)\s*;?\s*$")]
     private static partial Regex NodeDefaultExportIdent();
     // import x from './a'   import x, { y } from './a'   import { a, b as c } from './a'   import * as x from './a'
@@ -79,7 +84,9 @@ public static partial class EntryDiscovery
     private static partial Regex YargsObjectCommand();
     [GeneratedRegex(@"(?:\b([\w$]+)\s*\.\s*)?\b([\w$]+)\s*\(")]
     private static partial Regex NodeCallSite();
-    private static readonly HashSet<string> NodeNotHandlerCalls = new(StringComparer.Ordinal) { "function", "if", "for", "while", "switch", "return", "await", "require", "import", "catch", "then", "log", "error", "warn", "exit", "String", "Number", "Boolean", "parseInt", "parseFloat", "setTimeout" };
+    private static readonly HashSet<string> NodeNotHandlerCalls = new(StringComparer.Ordinal) { "function", "if", "for", "while", "switch", "return", "await", "require", "import", "catch", "then", "log", "error", "warn", "exit", "String", "Number", "Boolean", "parseInt", "parseFloat", "setTimeout", "next", "Date", "Array", "Error" };
+    // 内联处理器体里这些接收者上的调用不是"转调的业务函数"：请求 / 响应对象、运行时内置
+    private static readonly HashSet<string> NodeNotHandlerQualifiers = new(StringComparer.Ordinal) { "console", "process", "argv", "args", "options", "opts", "JSON", "Object", "Promise", "Math", "Array", "Date", "req", "res", "ctx", "reply", "request", "response" };
 
     internal static bool IsNodeSource(string path) =>
         !path.EndsWith(".d.ts", StringComparison.OrdinalIgnoreCase)
@@ -211,7 +218,8 @@ public static partial class EntryDiscovery
         }
 
         // 处理器表达式 → 符号
-        // firstCall：内联函数时取函数体里第一个能找到的调用（命令行的 action 通常只是转调）；HTTP 的内联处理器落在包含它的函数上
+        // firstCall：内联函数时取函数体里第一个能找到的仓库函数调用（命令行的 action、HTTP 的 async (req, res) => { … getArticles(…) … } 通常只是转调），
+        // 找不到才落在包含它的函数 / 文件模块上——否则同一文件的几条内联路由共用模块符号，流程把整份文件的处理逻辑混在一起
         MapSymbol? HandlerOf(string expr, string file, int line, int depth = 0, bool firstCall = false)
         {
             expr = expr.Trim();
@@ -226,12 +234,17 @@ public static partial class EntryDiscovery
                     var arrow = expr.IndexOf("=>", StringComparison.Ordinal);
                     var bodyAt = arrow >= 0 ? arrow + 2 : expr.IndexOf('{');
                     if (bodyAt >= 0)
-                        foreach (Match site in NodeCallSite().Matches(expr[bodyAt..]))
+                    {
+                        var body = expr[bodyAt..];
+                        foreach (Match site in NodeCallSite().Matches(body))
                         {
                             var q = site.Groups[1].Success ? site.Groups[1].Value : null;
-                            if (NodeNotHandlerCalls.Contains(site.Groups[2].Value) || q is "console" or "process" or "argv" or "args" or "options" or "opts" or "JSON" or "Object" or "Promise") continue;
+                            if (NodeNotHandlerCalls.Contains(site.Groups[2].Value) || (q is not null && NodeNotHandlerQualifiers.Contains(q))) continue;
+                            // res.status(201).json(…) 的 .json：接在调用结果上的方法，不是仓库函数
+                            if (q is null && body[..site.Index].TrimEnd().EndsWith('.')) continue;
                             if (FindNamed(site.Groups[2].Value, file, q) is { } f) return f;
                         }
+                    }
                 }
                 return Enclosing(file, line);
             }
@@ -279,6 +292,13 @@ public static partial class EntryDiscovery
                 }
                 routers[(file, m.Groups[1].Value)] = prefix;
             }
+            // export default Router().use('/api', api)：默认导出的匿名路由器记成 "default"，挂载链里它是 main.ts 的 app.use(routes) 的子
+            if (NodeDefaultRouterExpr().Match(text) is { Success: true } anon && !Skip(file, anon.Index))
+            {
+                routers[(file, "default")] = "";
+                exportedRouter[file] = "default";
+                continue;
+            }
             foreach (var line in scan.ReadLines(file))
                 if (NodeDefaultExportIdent().Match(line) is { Success: true } ex && routers.ContainsKey((file, ex.Groups[1].Value))) exportedRouter[file] = ex.Groups[1].Value;
             if (!exportedRouter.ContainsKey(file) && routers.Keys.Count(k => k.File == file) == 1) exportedRouter[file] = routers.Keys.First(k => k.File == file).Var;
@@ -286,19 +306,22 @@ public static partial class EntryDiscovery
 
         // 挂载：父 (文件, 变量) 在 segment 下挂子 (文件, 变量)；子变量 "*" = 文件里所有不是本地路由器的接收者（Fastify 插件的参数）
         var mounts = new List<((string File, string Var) Parent, string Segment, (string File, string Var) Child)>();
+        var parenCache = new Dictionary<string, Dictionary<int, int>>(StringComparer.Ordinal);
+        string? Receiver(string file, int dot) =>
+            NodeChainReceiver(texts[file], dot, parenCache.TryGetValue(file, out var p) ? p : parenCache[file] = NodeParenPairs(texts[file]));
         foreach (var file in files)
         {
             var text = texts[file];
             foreach (Match m in NodeMount().Matches(text))
             {
-                if (Skip(file, m.Index)) continue;
-                var (args, _) = ArgParser.SplitArgs(text, m.Index + m.Length - 1);
+                if (Skip(file, m.Index) || Receiver(file, m.Index) is not { } receiver) continue;
+                var (args, _) = NodeSplitArgs(text, m.Index + m.Length - 1);
                 if (args.Count == 0) continue;
-                var parent = (file, m.Groups[1].Value);
+                var parent = (file, receiver);
                 var segment = "";
                 var targets = args;
-                if (m.Groups[2].Value == "use" && ArgParser.Literal(args[0]) is { } seg) { segment = seg; targets = args.Skip(1).ToList(); }
-                else if (m.Groups[2].Value == "register")
+                if (m.Groups[1].Value == "use" && ArgParser.Literal(args[0]) is { } seg) { segment = seg; targets = args.Skip(1).ToList(); }
+                else if (m.Groups[1].Value == "register")
                 {
                     targets = args.Take(1).ToList();
                     if (args.Count > 1 && args[1].StartsWith('{'))
@@ -346,22 +369,22 @@ public static partial class EntryDiscovery
             void Route(string receiver, string verb, string path, string handlerExpr, int index)
             {
                 var line = LineOf(text, index);
-                if (HandlerOf(handlerExpr, file, line) is not { } h) return;
+                if (HandlerOf(handlerExpr, file, line, firstCall: true) is not { } h) return;
                 var method = verb is "all" ? null : verb == "del" ? "DELETE" : verb.ToUpperInvariant();
                 foreach (var prefix in PrefixesOf((file, receiver), 0))
                     Add(h, file, line, ruleId, "http", JoinRoute(prefix, path), method);
             }
             foreach (Match m in NodeVerbCall().Matches(text))
             {
-                if (Skip(file, m.Index) || !IsRouterReceiver(file, m.Groups[1].Value)) continue;
-                var (args, _) = ArgParser.SplitArgs(text, m.Index + m.Length - 1);
+                if (Skip(file, m.Index) || Receiver(file, m.Index) is not { } receiver || !IsRouterReceiver(file, receiver)) continue;
+                var (args, _) = NodeSplitArgs(text, m.Index + m.Length - 1);
                 if (args.Count < 2 || ArgParser.Literal(args[0]) is not { } path || !(path.StartsWith('/') || path == "*")) continue;
-                Route(m.Groups[1].Value, m.Groups[2].Value, path, args[^1], m.Index);
+                Route(receiver, m.Groups[1].Value, path, args[^1], m.Index);
             }
             foreach (Match m in NodeRouteCall().Matches(text))
             {
                 if (Skip(file, m.Index) || !IsRouterReceiver(file, m.Groups[1].Value)) continue;
-                var (args, close) = ArgParser.SplitArgs(text, m.Index + m.Length - 1);
+                var (args, close) = NodeSplitArgs(text, m.Index + m.Length - 1);
                 if (args.Count == 0) continue;
                 if (ArgParser.Literal(args[0]) is { } path)
                 {
@@ -370,7 +393,7 @@ public static partial class EntryDiscovery
                     {
                         var next = NodeChainedCall().Match(text[at..]);
                         if (!next.Success) break;
-                        var (cargs, cclose) = ArgParser.SplitArgs(text, at + next.Length - 1);
+                        var (cargs, cclose) = NodeSplitArgs(text, at + next.Length - 1);
                         if (NodeVerbs.Contains(next.Groups[1].Value) && cargs.Count > 0) Route(m.Groups[1].Value, next.Groups[1].Value, path, cargs[^1], at);
                         if (cclose < 0) break;
                         at = cclose + 1;
@@ -617,6 +640,92 @@ public static partial class EntryDiscovery
     }
 
     private static string JoinCommand(string a, string b) => a.Length == 0 ? b : b.Length == 0 ? a : a + " " + b;
+
+    /// <summary>
+    /// 调用实参（同 <see cref="ArgParser.SplitArgs"/>），去掉多行写法末尾逗号留下的空实参：
+    /// <c>router.get(⏎ '/x',⏎ auth,⏎ async (req, res) => { … },⏎ );</c> 的最后一个实参是处理器，不是 ""。
+    /// </summary>
+    private static (List<string> Args, int Close) NodeSplitArgs(string text, int open)
+    {
+        var (args, close) = ArgParser.SplitArgs(text, open);
+        if (args.Count > 0 && args[^1].Length == 0) args.RemoveAt(args.Count - 1);
+        return (args, close);
+    }
+
+    /// <summary>文本里每对 ( ) 的下标：右括号 → 左括号（跳过 ' " ` 字符串与 // /* */ 注释）。往回找链式调用的链头用。</summary>
+    private static Dictionary<int, int> NodeParenPairs(string text)
+    {
+        var result = new Dictionary<int, int>();
+        var stack = new Stack<int>();
+        char? quote = null;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (quote is not null)
+            {
+                if (ch == '\\' && quote != '`') { i++; continue; }
+                if (ch == quote) quote = null;
+                continue;
+            }
+            if (ch == '/' && i + 1 < text.Length && text[i + 1] == '/') { var nl = text.IndexOf('\n', i); if (nl < 0) break; i = nl; continue; }
+            if (ch == '/' && i + 1 < text.Length && text[i + 1] == '*') { var end = text.IndexOf("*/", i + 2, StringComparison.Ordinal); if (end < 0) break; i = end + 1; continue; }
+            if (ch is '"' or '\'' or '`') quote = ch;
+            else if (ch == '(') stack.Push(i);
+            else if (ch == ')' && stack.Count > 0) result[i] = stack.Pop();
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// text[dot] 是 <c>.use(</c> / <c>.get(</c> 的点：往回跨过链上的调用，给出这次调用作用在哪个路由器变量上。
+    /// <list type="bullet">
+    /// <item><c>app.use(…)</c> / <c>this.app.get(…)</c>：紧挨着的标识符（app）。</item>
+    /// <item><c>router.use(a).use(b)</c>：use / 动词调用返回路由器本身，跨过它们到链头变量（router）。</item>
+    /// <item>链头是构造 <c>Router()</c> / <c>express.Router()</c> / <c>new Router()</c>：整条链赋给的变量（<c>const api = Router().use(a)</c> → api），
+    /// 默认导出（<c>export default Router().use('/api', api)</c>）→ "default"。</item>
+    /// </list>
+    /// 别的链（<c>axios.create().get(…)</c>、<c>router.route('/x').get(…)</c>）→ null。
+    /// </summary>
+    private static string? NodeChainReceiver(string text, int dot, Dictionary<int, int> parens)
+    {
+        var segments = new List<(string Name, bool Called, int Start)>(); // 从点往回：最近的在前
+        var i = dot - 1;
+        while (true)
+        {
+            while (i >= 0 && char.IsWhiteSpace(text[i])) i--;
+            var called = false;
+            if (i >= 0 && text[i] == ')')
+            {
+                if (!parens.TryGetValue(i, out var open)) return null;
+                i = open - 1;
+                while (i >= 0 && char.IsWhiteSpace(text[i])) i--;
+                called = true;
+            }
+            var end = i;
+            while (i >= 0 && (char.IsLetterOrDigit(text[i]) || text[i] is '_' or '$')) i--;
+            if (end == i) return null;
+            segments.Add((text[(i + 1)..(end + 1)], called, i + 1));
+            var j = i;
+            while (j >= 0 && char.IsWhiteSpace(text[j])) j--;
+            if (j >= 0 && text[j] == '.' && (j == 0 || text[j - 1] != '.')) { i = j - 1; continue; }
+            break;
+        }
+        if (!segments[0].Called) return segments[0].Name;
+        var k = 0;
+        while (k < segments.Count && segments[k].Called && (segments[k].Name == "use" || NodeVerbs.Contains(segments[k].Name))) k++;
+        if (k >= segments.Count) return null;
+        var head = segments[k];
+        if (!head.Called) return k == segments.Count - 1 ? head.Name : null;
+        // 构造：Router( / express.Router( / new Router(
+        if (head.Name != "Router") return null;
+        var start = k + 1 < segments.Count && segments[k + 1] is { Name: "express", Called: false } ex && k + 2 == segments.Count ? ex.Start : head.Start;
+        if (k + 1 < segments.Count && start == head.Start) return null;
+        var before = text[Math.Max(0, start - 200)..start].TrimEnd(); // 只看链头前一小段（打包过的大文件里不整段扫）
+        if (before.EndsWith("new", StringComparison.Ordinal) && (before.Length == 3 || !char.IsLetterOrDigit(before[^4]))) before = before[..^3].TrimEnd();
+        if (before.EndsWith("export default", StringComparison.Ordinal) || Regex.IsMatch(before, @"module\s*\.\s*exports\s*=$")) return "default";
+        var assign = Regex.Match(before, @"\b(\w+)\s*(?::\s*[\w.<>]+\s*)?=$");
+        return assign.Success && !before.EndsWith("==", StringComparison.Ordinal) ? assign.Groups[1].Value : null;
+    }
 
     /// <summary>行 [from+1, to]（1 起）拼成文本：装饰器夹在上一个成员结束与声明行之间。</summary>
     private static string Window(string[] lines, int from, int to) =>

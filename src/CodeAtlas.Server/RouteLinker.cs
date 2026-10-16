@@ -78,8 +78,9 @@ public static partial class RouteLinker
     private static partial Regex MemberCall();
 
     /// <summary>
-    /// 路由模板是否匹配一条具体路径。段数相同；模板的 {x} / :x / *（Spring 的单段通配）匹配任意一段，{*x} / **（Spring）匹配其余；
-    /// 路径里的 ${…} 与 {…} 也匹配任意模板段。忽略查询串、大小写与尾斜杠。
+    /// 路由模板是否匹配一条具体路径。段数相同；模板的 {x} / :x / *（Spring 的单段通配）匹配任意一段，{*x} / {**x} / **（Spring）匹配其余；
+    /// 路径里的变量段（${…}、生成 SDK 的 {…}）只配模板的参数段——值不知道，不能当成 backups / preview 这类字面量段。
+    /// 字面量段对字面量段，忽略查询串、大小写与尾斜杠。
     /// </summary>
     public static bool PathMatches(string template, string path)
     {
@@ -88,19 +89,38 @@ public static partial class RouteLinker
         for (var i = 0; i < t.Length; i++)
         {
             var seg = t[i];
-            if (seg.StartsWith("{*", StringComparison.Ordinal) || seg == "**") return p.Length >= i;
+            if (IsCatchAll(seg)) return p.Length >= i;
             if (i >= p.Length) return seg.EndsWith("?}", StringComparison.Ordinal); // 可选参数
-            if (seg.StartsWith('{') || seg.StartsWith(':') || seg == "*" || p[i].Contains("${", StringComparison.Ordinal) || IsPlaceholder(p[i])) continue;
+            if (IsParamSegment(seg)) continue;
+            if (IsVariableSegment(p[i])) return false;
             if (!string.Equals(seg, p[i], StringComparison.OrdinalIgnoreCase)) return false;
         }
         return t.Length == p.Length;
     }
 
-    // 参数段数：{id} / {id:int}（ASP.NET）、:slug（gin / express）与 Spring 的 * / **
-    private static int ParamSegments(string route) => route.Count(ch => ch == '{') + route.Split('/').Count(s => s.StartsWith(':') || s is "*" or "**");
+    private static bool IsCatchAll(string seg) => seg.StartsWith("{*", StringComparison.Ordinal) || seg == "**";
 
-    // 生成的 SDK 里路径参数写成 {id}（与后端的 {item_id} 名字不一定相同）
-    private static bool IsPlaceholder(string seg) => seg.Length > 2 && seg[0] == '{' && seg[^1] == '}';
+    // 模板的参数段：{id} / {id:int} / {id?}（ASP.NET、FastAPI）、:slug（gin / express）与 Spring 的单段 *
+    private static bool IsParamSegment(string seg) => seg.StartsWith('{') || seg.StartsWith(':') || seg == "*";
+
+    // 路径里值不知道的段：插值孔 ${x}（含 v${n} 这类半截的），生成的 SDK 里的 {id}（与后端的 {item_id} 名字不一定相同）
+    private static bool IsVariableSegment(string seg) => seg.Contains("${", StringComparison.Ordinal) || (seg.Length > 2 && seg[0] == '{' && seg[^1] == '}');
+
+    /// <summary>
+    /// 几个模板都匹配同一路径时的具体程度（越小越具体）：字面量段多的优先（/accounts/backups 比 /accounts/{id} 具体——但只在路径那一段本来就是
+    /// 字面量 backups 时两者才会同时匹配），再看通配（{**x} 能配零段，/symbols 与 /symbols/{**name} 同时匹配 /symbols 时取前者），再看参数段数。
+    /// </summary>
+    private static (int Literals, int CatchAlls, int Params) Specificity(string route)
+    {
+        var segs = Segments(route, stripQuery: false);
+        var catchAll = segs.Count(IsCatchAll);
+        var param = segs.Count(s => !IsCatchAll(s) && IsParamSegment(s));
+        return (-(segs.Length - catchAll - param), catchAll, param);
+    }
+
+    /// <summary>调用方与入口的 HTTP 方法相容：任一方不知道（null）就不拿方法排除；都知道时必须相同（GET 不配 POST 入口）。</summary>
+    private static bool MethodAgrees(string? caller, string? entry) =>
+        caller is null || entry is null || string.Equals(caller, entry, StringComparison.OrdinalIgnoreCase);
 
     private static string[] Segments(string s, bool stripQuery)
     {
@@ -139,11 +159,13 @@ public static partial class RouteLinker
         // target：只在这个容器里找（Java 出口的主机名 / Feign 的 name 已经点名了服务）
         RouteMatch? ResolveIn(string fromContainer, string file, int line, string path, string? method, string? target)
         {
-            var hits = MostSpecific(httpEntries.Where(e => e.ContainerKey != fromContainer && (target is null || e.ContainerKey == target) && PathMatches(e.Route!, path)).ToList());
+            // 方法都知道且不同的入口直接排除：同一路径的 GET / POST 两个入口按调用方式挑，只有 POST 入口时 GET 调用不连
+            var hits = MostSpecific(httpEntries.Where(e => e.ContainerKey != fromContainer && (target is null || e.ContainerKey == target)
+                && MethodAgrees(method, e.HttpMethod) && PathMatches(e.Route!, path)).ToList());
             var targetContainers = hits.Select(h => h.ContainerKey).Distinct().ToList();
             if (targetContainers.Count != 1) return null; // 对到两个容器不猜
-            var best = hits.OrderBy(h => method is not null && h.HttpMethod is not null && h.HttpMethod != method ? 1 : 0) // 同一路径有 GET / POST 两个入口时按调用方式挑
-                .ThenBy(h => ParamSegments(h.Route!)).ThenBy(h => h.Route, StringComparer.Ordinal).First(); // 字面量多的模板更具体
+            var best = hits.OrderBy(h => Specificity(h.Route!)) // 字面量段多的模板更具体
+                .ThenBy(h => h.Route, StringComparer.Ordinal).ThenBy(h => h.File, StringComparer.Ordinal).ThenBy(h => h.Line).First();
             return new RouteMatch(fromContainer, file, line, path, best.SymbolId, best.ContainerKey);
         }
 
@@ -207,13 +229,7 @@ public static partial class RouteLinker
             var lines = readLines(file);
             var call = lang switch { Lang.Go => GoHttpCall(), Lang.Python => PyHttpCall(), _ => HttpCall() };
             if (!Array.Exists(lines, l => call.IsMatch(l))) continue;
-            var fields = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var l in lines)
-            {
-                var f = lang switch { Lang.Go => GoPathField().Match(l), Lang.Python => PyPathField().Match(l), _ => PathField().Match(l) };
-                if (!f.Success || (lang != Lang.Python && RuleContext.InCommentOrString(l, f.Index))) continue;
-                fields[f.Groups[1].Value] = lang == Lang.Python ? f.Groups[3].Value : f.Groups[2].Value;
-            }
+            var (fileFields, locals) = ScopedPathFields(lang, lines, group);
             foreach (var method in group)
             {
                 var start = Math.Max(0, method.StartLine - 1);
@@ -221,13 +237,20 @@ public static partial class RouteLinker
                 if (end <= start) continue;
                 var body = lines[start..end];
                 if (!Array.Exists(body, l => call.IsMatch(l))) continue;
-                var hint = MethodHintOf(lang, body);
+                // 文件级字段 / 常量全文件可见；方法里声明的局部变量只在声明它的方法（含其中的局部函数）里可见
+                var fields = new Dictionary<string, string>(fileFields, StringComparer.Ordinal);
+                foreach (var (line, name, value) in locals)
+                    if (line > start && line <= end) fields[name] = value;
                 for (var i = 0; i < body.Length; i++)
                 {
                     var candidates = lang switch { Lang.Go => GoCandidatePaths(body[i], fields), Lang.Python => PyCandidatePaths(body[i], fields), _ => CandidatePaths(body[i], fields) };
+                    string? hint = null;
                     foreach (var path in candidates)
+                    {
+                        hint ??= MethodHintAt(lang, body, i, call);
                         foreach (var c in owners)
                             if (Resolve(c.Key, file, start + i + 1, path, hint) is { } m) matches.Add(m);
+                    }
                 }
             }
         }
@@ -332,6 +355,15 @@ public static partial class RouteLinker
                     if (Resolve(c.Key, file, line, path, method) is { } m) matches.Add(m);
             }
         }
+
+        // 7. C# 经已注册的 HttpClient（CreateClient(名字)、类型化客户端、点名注册的封装类）调别的容器：只在注册的目标容器里找，见 RouteLinker.Clients.cs。
+        // 同一方法里第 2 段已按字面量对上同一入口的不再记（行号不同，时序图会多出一个一样的 hop）
+        foreach (var (from, call) in RegisteredClientCalls(outbound, containers, symbols, methodsByFile, readLines, OwnersOf))
+        {
+            if (Resolve(from, call.File, call.Line, call.Path, call.Method, call.Target) is not { } m) continue;
+            if (matches.Any(x => x.FromContainerKey == from && x.File == call.File && x.EntrySymbolId == m.EntrySymbolId && x.Line >= call.MethodStart && x.Line <= call.MethodEnd)) continue;
+            matches.Add(m);
+        }
         return matches.DistinctBy(m => (m.FromContainerKey, m.File, m.Line, m.EntrySymbolId)).OrderBy(m => m.FromContainerKey, StringComparer.Ordinal).ThenBy(m => m.File, StringComparer.Ordinal).ThenBy(m => m.Line).ToList();
     }
 
@@ -356,15 +388,50 @@ public static partial class RouteLinker
         }
     }
 
-    private static string? MethodHintOf(Lang lang, string[] body)
+    /// <summary>
+    /// 文件里的路径字段：声明行落在某个方法 / 函数体里的是那个方法的局部变量（(行号, 名字, 值)，只给包含该行的方法用），
+    /// 其余是类字段 / 常量 / 模块级常量，全文件可见。先前按整个文件收集，一个方法里的 <c>const string url = "api/x/bulk-update"</c> 会被别的方法里同名的 url 借走。
+    /// </summary>
+    private static (Dictionary<string, string> FileFields, List<(int Line, string Name, string Value)> Locals) ScopedPathFields(Lang lang, string[] lines, IEnumerable<MapSymbol> methods)
     {
-        foreach (var l in body)
+        var bodies = methods.Where(m => m.EndLine > m.StartLine).Select(m => (m.StartLine, m.EndLine)).ToList();
+        var fileFields = new Dictionary<string, string>(StringComparer.Ordinal);
+        var locals = new List<(int, string, string)>();
+        for (var i = 0; i < lines.Length; i++)
         {
-            var m = (lang switch { Lang.Go => GoMethodHint(), Lang.Python => PyMethodHint(), _ => MethodHint() }).Match(l);
-            if (!m.Success) continue;
-            var g = m.Groups.Cast<Group>().Skip(1).First(x => x.Success);
-            return g.Value.ToUpperInvariant();
+            var l = lines[i];
+            var f = lang switch { Lang.Go => GoPathField().Match(l), Lang.Python => PyPathField().Match(l), _ => PathField().Match(l) };
+            if (!f.Success || (lang != Lang.Python && RuleContext.InCommentOrString(l, f.Index))) continue;
+            var name = f.Groups[1].Value;
+            var value = lang == Lang.Python ? f.Groups[3].Value : f.Groups[2].Value;
+            var line = i + 1;
+            // 方法首行是签名，不算方法体
+            if (bodies.Any(b => line > b.StartLine && line <= b.EndLine)) locals.Add((line, name, value));
+            else fileFields[name] = value;
         }
+        return (fileFields, locals);
+    }
+
+    /// <summary>
+    /// body[i] 上那个路径的 HTTP 方法：本行有提示（GetAsync / HttpMethod.Post / requests.post）就用本行的；否则看从本行到下一处 HTTP 调用之间
+    /// （<c>var url = …;</c> 之后 <c>new HttpRequestMessage(HttpMethod.Put, url)</c> / <c>PostAsync(url)</c>）；都没有退回方法体里的第一个提示。
+    /// 先前一律取方法体第一个提示，同一方法里先 GET 后 POST 时后一处的路径也被当成 GET。
+    /// </summary>
+    private static string? MethodHintAt(Lang lang, string[] body, int i, Regex call)
+    {
+        var hint = lang switch { Lang.Go => GoMethodHint(), Lang.Python => PyMethodHint(), _ => MethodHint() };
+        string? On(string l)
+        {
+            var m = hint.Match(l);
+            return m.Success ? m.Groups.Cast<Group>().Skip(1).First(x => x.Success).Value.ToUpperInvariant() : null;
+        }
+        for (var j = i; j < body.Length; j++)
+        {
+            if (On(body[j]) is { } h) return h;
+            if (call.IsMatch(body[j])) break;
+        }
+        foreach (var l in body)
+            if (On(l) is { } h) return h;
         return null;
     }
 
@@ -478,18 +545,28 @@ public static partial class RouteLinker
             }
             else edges.Add(new ArchEdge(g.Key.FromContainerKey, g.Key.ToContainerKey, g.Key.Protocol, EdgeMatcher.ByRoute, ArchSource.Discovered, evidence));
         }
-        // 前端出口对上了的那些，从"API /xxx"外部节点的边里拿掉；外部节点没人指了就删
-        var matchedSites = matches.Select(m => (m.File, m.Line)).ToHashSet();
+        // 前端出口对上了的那些，从"API /xxx"外部节点的边里拿掉；外部节点没人指了就删。
+        // 同一 API 根的出口：已对上的都指向同一个容器、且对上的不少于对不上的 → 这个"外部 API"就是那个容器，删掉外部边，
+        // 对不上的处数记在容器边上（多是后端确实没有的接口）。先前要全部对上才删，合并前后端时 API /api/v5 一直挂着、和后端容器重复画
+        var matchedTo = matches.GroupBy(m => (m.FromContainerKey, m.File, m.Line)).ToDictionary(g => g.Key, g => g.Select(m => m.ToContainerKey).Distinct(StringComparer.Ordinal).ToList());
         var apiTargets = model.Outbound.Where(o => o.RuleId == "frontend-http" && o.TargetKey is not null && o.TargetKey.StartsWith("external:http-service:api-", StringComparison.Ordinal))
             .GroupBy(o => (o.ContainerKey, o.TargetKey!));
         foreach (var g in apiTargets)
         {
             var total = g.Count();
-            var matched = g.Count(o => matchedSites.Contains((o.File, o.Line)));
+            var hit = g.Where(o => matchedTo.ContainsKey((o.ContainerKey, o.File, o.Line))).ToList();
+            var matched = hit.Count;
             if (matched == 0) continue;
             var idx = edges.FindIndex(e => e.FromKey == g.Key.ContainerKey && e.ToKey == g.Key.Item2);
             if (idx < 0) continue;
+            var to = hit.SelectMany(o => matchedTo[(o.ContainerKey, o.File, o.Line)]).Distinct(StringComparer.Ordinal).ToList();
             if (matched == total) edges.RemoveAt(idx);
+            else if (to.Count == 1 && matched >= total - matched)
+            {
+                edges.RemoveAt(idx);
+                var c = edges.FindIndex(e => e.FromKey == g.Key.ContainerKey && e.ToKey == to[0] && e.Protocol == "http");
+                if (c >= 0) edges[c] = edges[c] with { Evidence = [.. edges[c].Evidence, new Evidence(ArchitectureDeclarations.RelativePath, null, $"{total - matched}/{total} 处对不上后端路由")] };
+            }
             else edges[idx] = edges[idx] with { Evidence = [.. edges[idx].Evidence, new Evidence(ArchitectureDeclarations.RelativePath, null, $"{matched}/{total} 处已对上路由")] };
         }
         var referenced = edges.SelectMany(e => new[] { e.FromKey, e.ToKey }).ToHashSet(StringComparer.Ordinal);

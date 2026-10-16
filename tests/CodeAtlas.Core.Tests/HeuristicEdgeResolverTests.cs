@@ -239,17 +239,17 @@ public class HeuristicEdgeResolverTests
     }
 
     [Fact]
-    public async Task Dispatch_NewCommandInMethod_LinksToHandlerMethod_ViaHandlesEdge()
+    public async Task Dispatch_MessageArgument_LinksToHandlerMethod_ViaHandlesEdge()
     {
         using var f = new Fixture();
-        // Controller.List 里 new ListQuery(...)；ListQueryHandler : IQueryHandler<ListQuery,...> 有 HandleAsync
         var (ctlFile, ctl) = f.File("Ctl.cs", "csharp", (SymbolKind.Class, "Ctl", null), (SymbolKind.Method, "List", 1));
         var (_, q) = f.File("ListQuery.cs", "csharp", (SymbolKind.Class, "ListQuery", null));
         var (hFile, h) = f.File("Handler.cs", "csharp", (SymbolKind.Class, "ListQueryHandler", null), (SymbolKind.Method, "HandleAsync", 1), (SymbolKind.Method, "Helper", 1));
 
         await f.Resolve(
             new PendingReference(h[1], hFile, "Handler.cs", "csharp", "ListQuery", EdgeKind.Dispatches, 2, Via: "handles"),
-            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "ListQuery", EdgeKind.Calls, 9));
+            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "QueryAsync", EdgeKind.Calls, 9, Pos: 100),
+            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "ListQuery", EdgeKind.Calls, 9, Via: "dispatch-site:100", Pos: 110));
 
         // 1. handles 边：Handler 类 → Query 类
         var handles = f.Reader.GetNeighbors(h[1], Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Dispatches }).Single();
@@ -278,8 +278,8 @@ public class HeuristicEdgeResolverTests
 
         await f.Resolve(
             new PendingReference(h[1], hFile, "Handler.cs", "csharp", "ListQuery", EdgeKind.Dispatches, 2, Via: "handles"),
-            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "QueryAsync", EdgeKind.Calls, 9),
-            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "ListQuery", EdgeKind.Calls, 9));
+            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "QueryAsync", EdgeKind.Calls, 9, Pos: 100),
+            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "ListQuery", EdgeKind.Calls, 9, Via: "dispatch-site:100", Pos: 110));
 
         var outgoing = f.Reader.GetNeighbors(ctl[2], Direction.Outgoing);
         var toDispatcher = outgoing.Single(n => n.Other?.Id == disp[2]);
@@ -305,6 +305,7 @@ public class HeuristicEdgeResolverTests
 
         var toLog = f.Reader.GetNeighbors(ctl[2], Direction.Outgoing).Single(n => n.Other?.Id == ctl[3]);
         Assert.Null(toLog.Edge.Via); // Log 不是分发方法名，不折叠
+        Assert.Empty(f.Reader.GetNeighbors(ctl[2], Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Dispatches }));
     }
 
     [Fact]
@@ -317,7 +318,8 @@ public class HeuristicEdgeResolverTests
 
         await f.Resolve(
             new PendingReference(h[1], hFile, "H.cs", "csharp", "Cmd", EdgeKind.Dispatches, 2, Via: "handles"),
-            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "Cmd", EdgeKind.Calls, 5));
+            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "Send", EdgeKind.Calls, 5, Pos: 50),
+            new PendingReference(ctl[2], ctlFile, "Ctl.cs", "csharp", "Cmd", EdgeKind.Calls, 5, Via: "dispatch-site:50", Pos: 60));
 
         var dispatch = f.Reader.GetNeighbors(ctl[2], Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Dispatches }).Single();
         Assert.Equal(h[1], dispatch.Other!.Id);

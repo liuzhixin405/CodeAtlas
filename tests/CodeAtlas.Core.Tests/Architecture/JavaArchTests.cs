@@ -219,11 +219,11 @@ public class JavaArchTests : IDisposable
         Assert.Equal(
         [
             "ads → external:broker:google-cloud-pub-sub grpc 0.5",
-            "clinic → external:database:h2 sql 0.5",
+            "clinic → external:database:h2-内嵌 sql 0.5",
             "clinic → external:database:mysql sql 0.5",
             "clinic → external:database:postgresql sql 0.5",            // application-postgres.properties 的 datasource url
             "inventory/app → external:broker:kafka kafka 0.5",          // 来自被依赖的 lib 模块
-            "inventory/app → external:database:hsqldb sql 0.5",
+            "inventory/app → external:database:hsqldb-内嵌 sql 0.5",
             "inventory/app → external:http-service:pricing-url http 0.5",
             "payments → external:database:数据库-jpa sql 0.5",           // 只有 JPA、没有驱动（h2 只在测试里）
             "payments → shop/registry http 0.5",

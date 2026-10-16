@@ -10,6 +10,12 @@ public sealed class PackageReferenceRule : IDiscoveryRule
     public string Description => "按 NuGet 包（含 packages.config）、go.mod require、Python 依赖、Maven / Gradle 依赖与 Spring 数据源配置推断外部系统（数据库、缓存、消息、存储、遥测、邮件）";
 
     /// <summary>包名前缀 → (外部系统种类, 名字, 协议)。按顺序匹配，先命中先用。</summary>
+    /// <summary>
+    /// 进程内的嵌入式数据库：库文件或内存，跟着应用进程走，不是另起的数据库服务。名字带"（内嵌）"，和 PostgreSQL 这类外部服务区分开
+    /// （petclinic 的 H2 / HSQLDB 是默认内存库，MySQL / PostgreSQL 才是可选的外部库）。
+    /// </summary>
+    public const string SQLite = "SQLite（内嵌）", H2 = "H2（内嵌）", HSQLDB = "HSQLDB（内嵌）", Derby = "Derby（内嵌）";
+
     public static readonly IReadOnlyList<(string Prefix, string SubKind, string Name, string Protocol)> Map =
     [
         // .NET Aspire 的客户端集成包（包名以 Aspire. 开头，后面是被包装的库）
@@ -34,15 +40,20 @@ public sealed class PackageReferenceRule : IDiscoveryRule
         ("Microsoft.Data.SqlClient", "database", "SQL Server", "sql"),
         ("Pomelo.EntityFrameworkCore.MySql", "database", "MySQL", "sql"),
         ("MySql", "database", "MySQL", "sql"),
-        ("Microsoft.EntityFrameworkCore.Sqlite", "database", "SQLite", "sql"),
+        ("Microsoft.EntityFrameworkCore.Sqlite", "database", SQLite, "sql"),
         ("MongoDB.Driver", "database", "MongoDB", "mongo"),
         ("Elastic.Clients.Elasticsearch", "database", "Elasticsearch", "http"),
         ("NEST", "database", "Elasticsearch", "http"),
         ("StackExchange.Redis", "cache", "Redis", "redis"),
+        // IDistributedCache 的 Redis 实现（AddStackExchangeRedisCache）：包名不以 StackExchange.Redis 开头
+        ("Microsoft.Extensions.Caching.StackExchangeRedis", "cache", "Redis", "redis"),
+        ("Microsoft.AspNetCore.DataProtection.StackExchangeRedis", "cache", "Redis", "redis"),
+        ("Google.Cloud.Spanner", "database", "Cloud Spanner", "grpc"),
         ("Confluent.Kafka", "broker", "Kafka", "kafka"),
         ("RabbitMQ.Client", "broker", "RabbitMQ", "amqp"),
         ("MassTransit.RabbitMQ", "broker", "RabbitMQ", "amqp"),
         ("AWSSDK.S3", "storage", "AWS S3", "http"),
+        ("AWSSDK.SimpleSystemsManagement", "config-center", "AWS SSM Parameter Store", "http"),
         ("Azure.Storage.Blobs", "storage", "Azure Blob Storage", "http"),
         ("OpenTelemetry.Exporter.OpenTelemetryProtocol", "observability", "OpenTelemetry Collector", "otlp"),
         ("AWSSDK.CloudWatchLogs", "observability", "AWS CloudWatch Logs", "http"),
@@ -62,15 +73,15 @@ public sealed class PackageReferenceRule : IDiscoveryRule
     [
         ("gorm.io/driver/postgres", "database", "PostgreSQL", "sql"),
         ("gorm.io/driver/mysql", "database", "MySQL", "sql"),
-        ("gorm.io/driver/sqlite", "database", "SQLite", "sql"),
+        ("gorm.io/driver/sqlite", "database", SQLite, "sql"),
         ("gorm.io/driver/sqlserver", "database", "SQL Server", "sql"),
         ("gorm.io/driver/clickhouse", "database", "ClickHouse", "sql"),
         ("github.com/jackc/pgx", "database", "PostgreSQL", "sql"),
         ("github.com/lib/pq", "database", "PostgreSQL", "sql"),
         ("github.com/go-sql-driver/mysql", "database", "MySQL", "sql"),
-        ("github.com/mattn/go-sqlite3", "database", "SQLite", "sql"),
-        ("modernc.org/sqlite", "database", "SQLite", "sql"),
-        ("github.com/glebarez/sqlite", "database", "SQLite", "sql"),
+        ("github.com/mattn/go-sqlite3", "database", SQLite, "sql"),
+        ("modernc.org/sqlite", "database", SQLite, "sql"),
+        ("github.com/glebarez/sqlite", "database", SQLite, "sql"),
         ("github.com/microsoft/go-mssqldb", "database", "SQL Server", "sql"),
         ("github.com/denisenkom/go-mssqldb", "database", "SQL Server", "sql"),
         ("go.mongodb.org/mongo-driver", "database", "MongoDB", "mongo"),
@@ -121,7 +132,7 @@ public sealed class PackageReferenceRule : IDiscoveryRule
         ("pyodbc", "database", "SQL Server", "sql"),
         ("oracledb", "database", "Oracle", "sql"),
         ("cx-oracle", "database", "Oracle", "sql"),
-        ("aiosqlite", "database", "SQLite", "sql"),
+        ("aiosqlite", "database", SQLite, "sql"),
         ("pymongo", "database", "MongoDB", "mongo"),
         ("motor", "database", "MongoDB", "mongo"),
         ("mongoengine", "database", "MongoDB", "mongo"),
@@ -170,13 +181,13 @@ public sealed class PackageReferenceRule : IDiscoveryRule
         ("io.asyncer:r2dbc-mysql", "database", "MySQL", "sql"),
         ("org.mariadb.jdbc:*", "database", "MariaDB", "sql"),
         ("org.mariadb:r2dbc-mariadb", "database", "MariaDB", "sql"),
-        ("com.h2database:h2", "database", "H2", "sql"),
-        ("org.hsqldb:hsqldb", "database", "HSQLDB", "sql"),
-        ("org.apache.derby:*", "database", "Derby", "sql"),
+        ("com.h2database:h2", "database", H2, "sql"),
+        ("org.hsqldb:hsqldb", "database", HSQLDB, "sql"),
+        ("org.apache.derby:*", "database", Derby, "sql"),
         ("com.microsoft.sqlserver:*", "database", "SQL Server", "sql"),
         ("com.oracle.database.jdbc:*", "database", "Oracle", "sql"),
         ("com.oracle.ojdbc:*", "database", "Oracle", "sql"),
-        ("org.xerial:sqlite-jdbc", "database", "SQLite", "sql"),
+        ("org.xerial:sqlite-jdbc", "database", SQLite, "sql"),
         ("org.springframework.boot:spring-boot-starter-data-mongodb*", "database", "MongoDB", "mongo"),
         ("org.mongodb:*", "database", "MongoDB", "mongo"),
         ("org.springframework.boot:spring-boot-starter-data-elasticsearch", "database", "Elasticsearch", "http"),
@@ -255,8 +266,8 @@ public sealed class PackageReferenceRule : IDiscoveryRule
     /// <summary>JDBC / R2DBC URL 的子协议 → 数据库名（jdbc:mysql://… → MySQL；Testcontainers 的 jdbc:tc:mysql:… 取后一段）。</summary>
     private static readonly Dictionary<string, string> JdbcDatabases = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["mysql"] = "MySQL", ["postgresql"] = "PostgreSQL", ["postgres"] = "PostgreSQL", ["h2"] = "H2", ["hsqldb"] = "HSQLDB", ["mariadb"] = "MariaDB",
-        ["sqlserver"] = "SQL Server", ["oracle"] = "Oracle", ["sqlite"] = "SQLite", ["db2"] = "Db2", ["derby"] = "Derby", ["clickhouse"] = "ClickHouse",
+        ["mysql"] = "MySQL", ["postgresql"] = "PostgreSQL", ["postgres"] = "PostgreSQL", ["h2"] = H2, ["hsqldb"] = HSQLDB, ["mariadb"] = "MariaDB",
+        ["sqlserver"] = "SQL Server", ["oracle"] = "Oracle", ["sqlite"] = SQLite, ["db2"] = "Db2", ["derby"] = Derby, ["clickhouse"] = "ClickHouse",
     };
 
     /// <summary>Spring 配置里直接说明外部系统的键（数据源 URL 之外）。</summary>

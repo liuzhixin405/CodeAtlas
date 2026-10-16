@@ -91,6 +91,8 @@ public sealed class ArchFixture : IDisposable
             public sealed class Cache(IConnectionMultiplexer redis) { }
             public sealed class Publisher(IProducer<string, string> producer) { }
             """);
+        // 业务代码按名字取 Names.LarkClient：Setup.cs 里只占名字的那条注册仍算出口（地址在部署配置里给）
+        Write("Acme.App/Notifier.cs", "namespace Acme.App; public sealed class Notifier(IHttpClientFactory f) { public HttpClient Lark() => f.CreateClient(Names.LarkClient); }\n");
         Write("Acme.Tests/Acme.Tests.csproj", """
             <Project Sdk="Microsoft.NET.Sdk">
               <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework></PropertyGroup>

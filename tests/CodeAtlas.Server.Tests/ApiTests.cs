@@ -63,18 +63,6 @@ public class ApiTests(ServerFixture fx) : IClassFixture<ServerFixture>
     }
 
     [Fact]
-    public async Task Pipeline_OnScriptRepoWithoutDispatch_ReturnsEmptyRows()
-    {
-        var r = await C.GetAsync("/api/pipeline");
-        Assert.Equal(HttpStatusCode.OK, r.StatusCode);
-        var p = await r.Content.ReadFromJsonAsync<PipelineDto>();
-        Assert.Equal("", p!.Root);
-        Assert.Empty(p.Rows);
-        Assert.Empty(p.Behaviors);
-        Assert.False(p.BehaviorsOrdered);
-    }
-
-    [Fact]
     public async Task ArchContainers_OnScriptRepoWithoutDeployables_ReturnsEmptyWithNote()
     {
         var a = await C.GetFromJsonAsync<ArchDto>("/api/arch/containers");

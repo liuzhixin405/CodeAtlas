@@ -434,7 +434,7 @@ public class NarrationTests
         Assert.Contains("comp:Acme.Api", f.Ids);   // 隐性耦合对端
         Assert.Contains("在环里", f.Text);
         Assert.Contains("反向", f.Text);          // App → Infra 依赖了排在后面的
-        Assert.Contains("修订 21 次", f.Text);
+        Assert.Contains("文件修订合计 21", f.Text); // 夹具 Revisions=21、没有提交号：各文件修订之和，照实写（同一提交改几个文件算几次）
         Assert.Equal("App", f.Title);
 
         var leaf = new FlowNodeDto(21, "Save", "Acme.Infra.OrderRepo.Save(Order)", "call", "Acme.Api|Acme.Infra", "impl", 0.9, 1, 2, [], 0, null);

@@ -1,4 +1,4 @@
-using CodeAtlas.Core.Architecture;
+﻿using CodeAtlas.Core.Architecture;
 
 namespace CodeAtlas.Core.Storage;
 
@@ -8,6 +8,7 @@ public static class ArchRuleStorage
     public static void Replace(IndexDatabase db, IReadOnlyList<ArchRule> rules)
     {
         using var batch = db.BeginBatch();
+        ArchFingerprintStorage.Set(db, ArchFingerprintStorage.Post, null); // 结果换了，指纹作废（后处理写完再记新的）
         db.Execute("DELETE FROM arch_rules");
         foreach (var r in rules)
             db.Execute("""

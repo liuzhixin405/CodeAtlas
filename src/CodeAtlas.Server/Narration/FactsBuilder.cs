@@ -102,7 +102,7 @@ public static class FactsBuilder
         var inCycle = dsm.Cycles.FirstOrDefault(c => c.Contains(comp.Key));
         w.Line(10, $"对象：组件 {comp.Label}（键 {comp.Key}），属于容器 {containerName}，层级 root=\"{dsm.Root}\"，同层共 {dsm.Components.Count} 个组件，依赖序第 {index + 1} 位（越靠前被依赖越多）", null);
         w.Line(10, $"符号 {comp.Symbols} 个，文件 {comp.Files} 个，{(comp.HasChildren ? "还能往下钻" : "没有更深的层级")}，{(inCycle is null ? "不在环里" : "在环里")}"
-                 + (comp.Hot is null ? "，没有 git 统计" : $"，git：修订 {comp.Hot.Revisions} 次，+{comp.Hot.Added}/-{comp.Hot.Deleted} 行，最近提交 {comp.Hot.LastCommit}（{comp.Hot.AgeMonths} 个月前）"), $"comp:{comp.Key}",
+                 + (comp.Hot is null ? "，没有 git 统计" : $"，git：{(comp.Hot.Commits is { } commits ? $"{commits} 次提交" : $"文件修订合计 {comp.Hot.Revisions}")}，+{comp.Hot.Added}/-{comp.Hot.Deleted} 行，最近提交 {comp.Hot.LastCommit}（{comp.Hot.AgeMonths} 个月前）"), $"comp:{comp.Key}",
             // 指纹里不放 git 计数：每次提交都变，会让叙述动不动就"过期"；代码真改了由 Sources 判
             fingerprint: $"符号 {comp.Symbols} 个，文件 {comp.Files} 个，{(comp.HasChildren ? "还能往下钻" : "没有更深的层级")}，{(inCycle is null ? "不在环里" : "在环里")}");
 
@@ -129,7 +129,7 @@ public static class FactsBuilder
         }
         // 提到的邻居组件给个简介，让模型能引
         foreach (var n in outCells.Select(c => dsm.Components[c.Col]).Concat(inCells.Select(c => dsm.Components[c.Row])).DistinctBy(c => c.Key))
-            w.Line(5, $"邻居组件 {n.Label}：符号 {n.Symbols}，文件 {n.Files}{(n.Hot is null ? "" : $"，修订 {n.Hot.Revisions} 次")}{(dsm.Cycles.Any(c => c.Contains(n.Key)) ? "，在环里" : "")}", $"comp:{n.Key}",
+            w.Line(5, $"邻居组件 {n.Label}：符号 {n.Symbols}，文件 {n.Files}{(n.Hot is null ? "" : $"，{(n.Hot.Commits is { } nc ? $"{nc} 次提交" : $"文件修订合计 {n.Hot.Revisions}")}")}{(dsm.Cycles.Any(c => c.Contains(n.Key)) ? "，在环里" : "")}", $"comp:{n.Key}",
                 fingerprint: $"邻居组件 {n.Label}：符号 {n.Symbols}，文件 {n.Files}{(dsm.Cycles.Any(c => c.Contains(n.Key)) ? "，在环里" : "")}");
         if (dsm.Note is not null) w.Line(4, $"备注：{dsm.Note}", null);
         if (!dsm.GitAvailable) w.Line(4, "git 统计不可用（热点与隐性耦合为空）", null);

@@ -43,10 +43,12 @@ public partial class FlowBuilderTests
 
         var f = FlowBuilder.Build(symbols, edges, entry, containers, matches, [entry, remote]);
         Assert.Equal("OwnerController.showOwner", f.Root.Label);
-        Assert.Equal(new[] { ("OwnerServiceImpl.find", "impl"), ("OwnerService.find", (string?)null) }, f.Root.Children.Select(c => (c.Label, c.Via)));
+        // 接口调用 → 唯一实现合成一步：只留实现（接口方法没有方法体，单独一步只是个叶子）
+        Assert.Equal(new[] { ("OwnerServiceImpl.find", (string?)"impl") }, f.Root.Children.Select(c => (c.Label, c.Via)));
         var impl = f.Root.Children[0];
-        Assert.Equal(new[] { "OwnerRepository.findById", "PetKind.label", "HTTP /owners/{ownerId}", "save" }, impl.Children.Select(c => c.Label));
-        Assert.Equal("ext|JpaRepository", impl.Children[3].Actor);
+        // JpaRepository.save 是持久化调用：单独一行，标签带类型，Note 写类别
+        Assert.Equal(new[] { "OwnerRepository.findById", "PetKind.label", "HTTP /owners/{ownerId}", "JpaRepository.save" }, impl.Children.Select(c => c.Label));
+        Assert.Equal(("ext|JpaRepository", "数据库"), (impl.Children[3].Actor, impl.Children[3].Note));
         var hop = impl.Children[2];
         Assert.Equal(("hop", "→ customers /owners/{ownerId}"), (hop.Kind, hop.Note));
         Assert.Equal(("OwnerResource.findOwner", "customers|customers"), (Assert.Single(hop.Children).Label, hop.Children[0].Actor));

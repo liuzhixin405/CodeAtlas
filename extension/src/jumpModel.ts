@@ -67,8 +67,29 @@ export function calleePickItem(step: OutlineStepDto, containerPath: string): Jum
   };
 }
 
+/**
+ * "调用 N 个"的列表：第一层每一步一项；分发调用（Send / Publish）下的 dispatch 子步骤、接口调用下的实现（impl）各补一项
+ * 「↳ Handler · 经分派」「↳ 实现 · 经接口」——它们不是直接引用，选中直接跳到 Handler / 实现的定义（跳到调用处只会停在 Send 那一行）。
+ * 第一层本身就是 dispatch 的（没经过分发调用的分派边）同样跳到定义。
+ */
 export function calleePickItems(outline: OutlineDto): JumpPickItem[] {
-  return outline.steps.map((s) => calleePickItem(s, outline.symbol.path));
+  const out: JumpPickItem[] = [];
+  for (const s of outline.steps) {
+    const item = calleePickItem(s, outline.symbol.path);
+    out.push(s.kind === "dispatch" && item.definition ? { ...item, target: item.definition } : item);
+    for (const c of s.children) {
+      if (c.kind !== "dispatch" && c.kind !== "impl") continue;
+      const sub = calleePickItem(c, outline.symbol.path);
+      if (!sub.definition) continue;
+      out.push({
+        ...sub,
+        label: `↳ ${sub.label}`,
+        description: `${c.kind === "dispatch" ? "经分派" : "经接口"} · ${sub.description}`,
+        target: sub.definition,
+      });
+    }
+  }
+  return out;
 }
 
 /** 受影响的入口 → 项：label 入口（同影响范围），description 所在容器 · 经几层，detail 入口文件；选中跳到入口方法。 */

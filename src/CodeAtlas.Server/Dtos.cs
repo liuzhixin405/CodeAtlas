@@ -7,15 +7,17 @@ public sealed record HealthDto(string Repo, string DbPath, long Files, long Symb
 /// <param name="Roslyn">null 自动（全量或从未跑过时跑）；true 强制跑；false 不跑。</param>
 public sealed record IndexRequest(bool Full, bool? Roslyn = null);
 
+/// <param name="Timings">各阶段耗时，按发生顺序：ts.*（tree-sitter）、roslyn[解决方案].*、roslyn.finish.*、arch、git、entries；索引结束时才填全。</param>
 public sealed record IndexReportDto(
     int FilesScanned, int FilesParsed, int FilesFailed, int FilesSkipped, int FilesRemoved, int FilesUnchanged,
-    long TotalSymbols, long TotalEdges, double ElapsedSeconds, RoslynReportDto? Roslyn = null);
+    long TotalSymbols, long TotalEdges, double ElapsedSeconds, RoslynReportDto? Roslyn = null,
+    IReadOnlyList<CodeAtlas.Core.Diagnostics.PhaseTiming>? Timings = null);
 
 /// <param name="Error">没跑成的原因（找不到 worker / 解决方案、worker 崩溃）；成功为 null。</param>
 /// <param name="Unavailable">本机缺 .NET 10 运行时或 SDK，Roslyn 没跑（Error 是给用户看的原因）；C# 用 tree-sitter 的结果。</param>
 public sealed record RoslynReportDto(
     int Files, int FilesSkipped, int SymbolsMerged, int SymbolsAdded, int Edges, int DiRegistrations, int Errors, double ElapsedSeconds, string? Error,
-    bool Unavailable = false);
+    bool Unavailable = false, bool Incremental = false);
 
 public sealed record IndexStatusDto(bool Running, string? Phase, int Done, int Total, IndexReportDto? LastReport, string? Error);
 
@@ -55,6 +57,36 @@ public sealed record NeighborDto(
     long EdgeId, string Kind, string Direction, double Confidence, int Line, string? AmbiguousGroup, SymbolDto? Other, string ToName,
     string? Via = null, int? EvidenceLine = null, int? Pos = null, string? Ctx = null);
 
+// ---- 框架流程（项目地图「容器 | 框架流程 | 命名空间」）：每个请求都要经过的那套框架怎么运转 ----
+
+/// <summary>
+/// GET /api/arch/framework?container=&lt;容器键&gt; 的结果。与"请求流程"（调用图 / 入口流程：某个请求做了什么）互补：
+/// 这里画框架本身——HTTP 中间件 → 控制器（占位）→ 分派器 → 行为链（按注册顺序，每个行为自己的关键调用可展开；await next() 之前是前置、之后是后置）
+/// → Handler（占位，Handlers 里是清单）→ 收尾（提交、领域 / 集成事件……）。
+/// </summary>
+/// <param name="Flow">骨架时序图：与入口流程同一个 FlowDto。Actors 是阶段（FlowActorDto.Kind = "stage"，Key 取 FrameworkStageDto.Key），
+/// Handler 占位节点 Kind = "handlers"（Count = Handler 个数，点开看 Handlers 清单）；控制器占位节点 Kind = "controllers"（Count = 控制器个数）。</param>
+/// <param name="Stages">阶段（顺序即列顺序）。</param>
+/// <param name="Handlers">Handler 清单，按模块分组（模块 = 消息所在命名空间段，与组件矩阵同一套取名）。</param>
+/// <param name="Notes">说明：识别不到的阶段、顺序未知的原因、用了哪种分派器（MediatR / 自研）等，给人看的句子。</param>
+public sealed record FrameworkFlowDto(
+    string ContainerKey, string ContainerName, FlowDto Flow, IReadOnlyList<FrameworkStageDto> Stages,
+    IReadOnlyList<FrameworkHandlerGroupDto> Handlers, IReadOnlyList<string> Notes);
+
+/// <param name="Key">middleware / controller / dispatcher / behavior / handler / tail。</param>
+/// <param name="Label">显示名：中间件 / 控制器 / 分派器 / 行为链 / Handler / 收尾。</param>
+/// <param name="OrderKnown">这一阶段内部的先后是否有依据（中间件来自 app.UseXxx 的书写顺序；行为来自 DI 注册顺序）。</param>
+/// <param name="Symbols">这一阶段涉及的符号（中间件类、分派器方法、各行为类……），用来高亮与跳转。</param>
+public sealed record FrameworkStageDto(string Key, string Label, bool OrderKnown, IReadOnlyList<SymbolDto> Symbols);
+
+public sealed record FrameworkHandlerGroupDto(string Module, IReadOnlyList<FrameworkHandlerDto> Items);
+
+/// <param name="Handler">Handler 的入口方法（Handle / HandleAsync / Consume…）。</param>
+/// <param name="MessageType">处理的消息类型短名（命令 / 查询 / 事件），不知道为 null。</param>
+/// <param name="MessageKind">command / query / event / null。</param>
+/// <param name="Entries">会分派到它的入口（HTTP / 任务 / 消息消费…），点一个打开它的入口流程。</param>
+public sealed record FrameworkHandlerDto(SymbolDto Handler, string? MessageType, string? MessageKind, IReadOnlyList<EntryDto> Entries);
+
 // ---- 快速跳转（编辑器 CodeLens 与"转到调用方 / 被调方"）----
 
 /// <summary>
@@ -71,7 +103,9 @@ public sealed record FileLensDto(string Path, IReadOnlyList<SymbolLensDto> Symbo
 /// <param name="TestCallers">测试代码里的调用方个数。</param>
 /// <param name="Callees">调用大纲第一层的步骤数（规则与调用大纲一致，含框架调用）。</param>
 /// <param name="IsEntry">它本身是入口（HTTP / 任务 / 命令 / 消息处理…）。</param>
-public sealed record SymbolLensDto(SymbolDto Symbol, int Callers, int CallSites, int TestCallers, int Callees, bool IsEntry);
+/// <param name="Dispatches">经分派到的 Handler 个数（大纲第一层的 dispatch 步骤，加挂在分发调用 Send / Publish 下面的 dispatch 子步骤，按目标去重）：
+/// 不是直接引用，编辑器上单独写出来，"调用 N 个"的跳转列表里也能直接跳过去。</param>
+public sealed record SymbolLensDto(SymbolDto Symbol, int Callers, int CallSites, int TestCallers, int Callees, bool IsEntry, int Dispatches = 0);
 
 // ---- 模块关系（面板「模块关系」模式）：以一个类为中心，类与类之间的依赖，按组件分框 ----
 

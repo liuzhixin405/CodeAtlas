@@ -9,6 +9,8 @@ public sealed record IndexOptions
     public long MaxFileBytes { get; init; } = 2_000_000;
     public int MaxParallelism { get; init; } = Environment.ProcessorCount;
     public bool Full { get; init; }
+    /// <summary>增量时仍重解析全部引用（不按受影响文件收窄）：排查增量解析问题、对照测试用。</summary>
+    public bool ResolveAllReferences { get; init; }
     public int WriteBatchSize { get; init; } = 200;
 }
 
@@ -16,4 +18,5 @@ public sealed record IndexProgress(string Phase, int Done, int Total, string? Cu
 
 public sealed record IndexReport(
     int FilesScanned, int FilesParsed, int FilesFailed, int FilesSkipped, int FilesRemoved, int FilesUnchanged,
-    long TotalSymbols, long TotalEdges, TimeSpan Elapsed, IReadOnlyList<(string Path, string Error)> Errors);
+    long TotalSymbols, long TotalEdges, TimeSpan Elapsed, IReadOnlyList<(string Path, string Error)> Errors,
+    IReadOnlyList<CodeAtlas.Core.Diagnostics.PhaseTiming>? Timings = null);

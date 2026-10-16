@@ -8,10 +8,13 @@ public sealed class AnalyzerFixture : IAsyncLifetime
     /// <summary>用源码树里的 fixture（不是 bin 下的拷贝），这样 obj/project.assets.json 里的路径才对得上。</summary>
     public string Root { get; } = LocateFixture();
 
-    private static string LocateFixture()
+    private static string LocateFixture([System.Runtime.CompilerServices.CallerFilePath] string thisFile = "")
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "CodeAtlas.slnx"))) dir = dir.Parent;
+        // 用 --artifacts-path 构建时输出目录不在仓库里，按源码文件位置找
+        if (dir is null && Path.GetDirectoryName(thisFile) is { } here && Directory.Exists(Path.Combine(here, "Fixtures", "RoslynSample")))
+            return Path.Combine(here, "Fixtures", "RoslynSample");
         if (dir is null) throw new InvalidOperationException("找不到仓库根目录（CodeAtlas.slnx）");
         return Path.Combine(dir.FullName, "tests", "CodeAtlas.Indexing.Roslyn.Tests", "Fixtures", "RoslynSample");
     }

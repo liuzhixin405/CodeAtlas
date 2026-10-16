@@ -36,7 +36,8 @@ public class ImpactApiTests(ServerFixture fx) : IClassFixture<ServerFixture>
         // 展开 find：再取它的影响范围（不要入口汇总）
         var find = await C.GetFromJsonAsync<ImpactDto>($"/api/symbols/{caller.Caller.Id}/impact?entries=false&tests=false");
         var main = Assert.Single(find!.Callers);
-        Assert.Equal(("call", "main", 0.7, false), (main.Kind, main.Label, main.Confidence, main.Expandable));
+        // main 里是 new Svc().find(1)：接收者是 new 出来的 Svc，类型已知 → 0.9（2026-10-16 起 TS 按接收者类型解析，原来按名字给 0.7）
+        Assert.Equal(("call", "main", 0.9, false), (main.Kind, main.Label, main.Confidence, main.Expandable));
         Assert.Null(find.Entries);
     }
 

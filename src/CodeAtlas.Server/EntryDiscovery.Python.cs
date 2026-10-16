@@ -58,6 +58,23 @@ public static partial class EntryDiscovery
     };
     private static readonly HashSet<string> DrfCollectionActions = new(StringComparer.Ordinal) { "list", "create" };
     private static readonly HashSet<string> DrfDetailActions = new(StringComparer.Ordinal) { "retrieve", "update", "partial_update", "destroy" };
+    /// <summary>DRF 通用视图 / mixin / ViewSet 基类自带的动作：子类没重写也照样对外提供（ListCreateAPIView 的 GET 走继承来的 list）。</summary>
+    private static readonly Dictionary<string, string[]> DrfInheritedActions = new(StringComparer.Ordinal)
+    {
+        ["ListAPIView"] = ["list"], ["CreateAPIView"] = ["create"], ["RetrieveAPIView"] = ["retrieve"], ["DestroyAPIView"] = ["destroy"],
+        ["UpdateAPIView"] = ["update", "partial_update"], ["ListCreateAPIView"] = ["list", "create"],
+        ["RetrieveUpdateAPIView"] = ["retrieve", "update", "partial_update"], ["RetrieveDestroyAPIView"] = ["retrieve", "destroy"],
+        ["RetrieveUpdateDestroyAPIView"] = ["retrieve", "update", "partial_update", "destroy"],
+        ["ListModelMixin"] = ["list"], ["CreateModelMixin"] = ["create"], ["RetrieveModelMixin"] = ["retrieve"],
+        ["UpdateModelMixin"] = ["update", "partial_update"], ["DestroyModelMixin"] = ["destroy"],
+        ["ModelViewSet"] = ["list", "create", "retrieve", "update", "partial_update", "destroy"], ["ReadOnlyModelViewSet"] = ["list", "retrieve"],
+    };
+    // __main__ 文件里起了常驻进程的迹象：Web 服务器、gRPC server.start / wait_for_termination、事件循环、消费循环
+    [GeneratedRegex(@"\b(?:uvicorn|gunicorn|hypercorn|waitress)\b|(?<!asyncio)\.run\s*\(|\bserve\w*\s*\(|serve_forever|wait_for_termination|\.start\s*\(\s*\)|run_simple|make_server|run_app|execute_from_command_line|run_forever|run_until_complete|while\s+True\b|start_consuming|\.listen\s*\(|\.poll\s*\(|\.worker_main\s*\(")]
+    private static partial Regex PyLongRunning();
+    // email_client.py / client.py / client_demo.py：调自己服务的示例 / 测试客户端
+    [GeneratedRegex(@"(?:^|[_\-.])client$|^client[_\-]", RegexOptions.IgnoreCase)]
+    private static partial Regex PyClientStem();
 
     internal static bool IsPython(string path) => path.EndsWith(".py", StringComparison.OrdinalIgnoreCase);
 
@@ -66,6 +83,11 @@ public static partial class EntryDiscovery
 
     private static void DiscoverPython(Scan scan)
     {
+        // 记下有 HTTP 入口的容器：同容器里不起服务的 __main__ 文件是一次性脚本（见文件末尾 __main__ 的裁定）
+        var httpContainers = new HashSet<string>(StringComparer.Ordinal);
+        var add = scan.Add;
+        scan = scan with { Add = e => { if (e.Kind == "http") httpContainers.Add(e.ContainerKey); add(e); } };
+        var mains = new List<(string File, MapSymbol Target, int Line, string Name, IReadOnlyList<ArchNode> Owners)>();
         var pySymbols = scan.Symbols.Where(s => IsPython(s.Path) && !PipelineBuilder.IsTest(s.Path, "")).ToList();
         if (pySymbols.Count == 0) return;
         var files = pySymbols.Select(s => s.Path).Distinct().OrderBy(p => p, StringComparer.Ordinal).ToList();
@@ -278,8 +300,12 @@ public static partial class EntryDiscovery
                     if (impl is not null)
                     {
                         var servicers = ServicerNames(impl, scan, classes);
+                        // 同一个实例又交给 add_HealthServicer_to_server(service, server)：它的 Check / Watch 是 grpc.health 服务的，不是本服务的方法
+                        var instance = args.Count >= 1 ? args[0].Trim() : "";
+                        var sharesHealth = instance.Length > 0 && Array.Exists(lines, l => Regex.IsMatch(l, $@"\badd_HealthServicer_to_server\s*\(\s*{Regex.Escape(instance)}\s*,"));
                         if (servicers.Count == 0 || servicers.Contains(service))
-                            foreach (var m in scan.Children[impl.Id].Where(m => m.Kind == SymbolKind.Method && !m.Name.StartsWith('_')).OrderBy(m => m.StartLine))
+                            foreach (var m in scan.Children[impl.Id].Where(m => m.Kind == SymbolKind.Method && !m.Name.StartsWith('_')
+                                                                                && !(m.Name is "Check" or "Watch" && sharesHealth) && !IsPyHealthMethod(m, scan.ReadLines)).OrderBy(m => m.StartLine))
                                 foreach (var c in owners) scan.Add(new EntryPoint(m.Id, c.Key, "python.grpc", "grpc", service + "/" + m.Name, null, m.Path, m.StartLine));
                     }
                 }
@@ -294,14 +320,27 @@ public static partial class EntryDiscovery
                             if (LauncherName().IsMatch(call.Groups[1].Value) && (entry = topLevel.FirstOrDefault(s => s.Name == call.Groups[1].Value)) is not null) break;
                     var target = entry ?? modules.GetValueOrDefault(file);
                     if (target is null) continue;
-                    var name = MapSymbol.FileName(file)[..^3];
-                    foreach (var c in owners) scan.Add(new EntryPoint(target.Id, c.Key, "python.main", "hosted", name, null, file, entry?.StartLine ?? i + 1));
+                    mains.Add((file, target, entry?.StartLine ?? i + 1, MapSymbol.FileName(file)[..^3], owners));
                 }
             }
         }
 
         DiscoverDjango(scan, files, ImportsOf, ResolveModule, ClassNamed, FunctionNamed);
         DiscoverPythonCli(scan, files, atLine, ResolveRef, FunctionNamed);
+
+        // __main__ 的裁定（要等 HTTP 入口都出来）：
+        // - 示例 / 测试客户端（email_client.py、client.py）：同容器里另有不是客户端的 __main__（真正的服务端）时不算入口——它只是拿来调本服务的；
+        // - 一次性脚本：容器靠框架对外提供 HTTP（uvicorn / gunicorn 从命令行拉起，不经这个文件），文件里又没有起服务 / 常驻循环的迹象
+        //   （initial_data.py 建初始数据、跑完就退）→ kind command，不是常驻服务；
+        // - 其余照旧是 hosted。
+        bool IsClient(string file) => PyClientStem().IsMatch(MapSymbol.FileName(file)[..^3]);
+        foreach (var (file, target, line, name, owners) in mains)
+            foreach (var c in owners)
+            {
+                if (IsClient(file) && mains.Any(m => !IsClient(m.File) && m.Owners.Any(o => o.Key == c.Key))) continue;
+                var script = httpContainers.Contains(c.Key) && !scan.ReadLines(file).Any(l => PyLongRunning().IsMatch(l) && (RouteLinker.PyCommentStart(l) is var h && (h < 0 || h > PyLongRunning().Match(l).Index)));
+                scan.Add(new EntryPoint(target.Id, c.Key, script ? "python.script" : "python.main", script ? "command" : "hosted", name, null, file, line));
+            }
     }
 
     private static void DiscoverDjango(
@@ -316,6 +355,7 @@ public static partial class EntryDiscovery
         var views = new List<(string File, string Pattern, bool Regex, string Expr)>();
         var registrations = new List<(string File, string Router, string Prefix, string Expr)>();
         var trailing = new Dictionary<(string, string), bool>();
+        var admins = new List<(string File, string Pattern, bool Regex, int Line)>();                        // admin.site.urls
 
         foreach (var file in urlFiles)
         {
@@ -337,6 +377,12 @@ public static partial class EntryDiscovery
                 if (args.Count < 2 || ArgParser.Literal(args[0]) is not { } pattern) continue;
                 var isRegex = p.Groups[1].Value != "path";
                 var view = args[1];
+                // url(r'^admin/', admin.site.urls)：Django 自带的管理后台，整站挂在这个前缀下
+                if (Regex.IsMatch(view.Trim(), @"^(?:\w+\.)?admin\s*\.\s*site\s*\.\s*urls$"))
+                {
+                    admins.Add((file, pattern, isRegex, text.AsSpan(0, p.Index).Count('\n') + 1));
+                    continue;
+                }
                 var inc = Regex.Match(view, @"^include\s*\(");
                 if (inc.Success)
                 {
@@ -379,8 +425,12 @@ public static partial class EntryDiscovery
                     var cls = classNamed(name, PreferredFile(imports, expr, name), file);
                     if (cls is null) continue;
                     var methods = scan.Children[cls.Id].Where(m => m.Kind == SymbolKind.Method && ViewMethods.ContainsKey(m.Name)).OrderBy(m => m.StartLine).ToList();
-                    if (methods.Count == 0) AddEntry(cls, route, null, "python.django");
+                    var inherited = InheritedActions(cls, viewSet: false);
+                    if (methods.Count == 0 && inherited.Count == 0) AddEntry(cls, route, null, "python.django");
                     foreach (var m in methods) AddEntry(m, route, ViewMethods[m.Name], "python.django");
+                    // 通用视图继承来、子类没重写的动作（ListCreateAPIView 的 list → GET）：同一个 HTTP 方法已有重写的处理方法时不重复
+                    foreach (var action in inherited.Where(a => methods.All(m => ViewMethods[m.Name] != ViewMethods[a])))
+                        AddEntry(InheritedTarget(cls, action, methods), route, ViewMethods[action], "python.django");
                     continue;
                 }
                 var fn = Regex.Match(expr.Trim(), @"^(?:(\w+)\.)?(\w+)$");
@@ -407,14 +457,75 @@ public static partial class EntryDiscovery
                 ? Prefixes(file, 0)
                 : mounts.SelectMany(x => Prefixes(file, 0).Select(p => p + DjangoSegment(x.Pattern, x.Regex))).ToList();
             var actions = scan.Children[cls.Id].Where(m => m.Kind == SymbolKind.Method && (DrfCollectionActions.Contains(m.Name) || DrfDetailActions.Contains(m.Name))).OrderBy(m => m.StartLine).ToList();
+            // mixin / ModelViewSet 带来的、没重写的动作：路由器照样按它们生成路由（hasattr(viewset, action)）
+            var inherited = InheritedActions(cls, viewSet: true).Where(a => actions.All(m => m.Name != a)).ToList();
+            string ActionRoute(string collection, string action) => DrfCollectionActions.Contains(action) ? collection + slash : collection + "/{" + lookup + "}" + slash;
             foreach (var b in bases.Distinct(StringComparer.Ordinal))
             {
                 var collection = "/" + (b + regPrefix.Trim('/')).TrimStart('/');
-                if (actions.Count == 0) AddEntry(cls, collection + slash, null, "python.drf");
-                foreach (var m in actions)
-                    AddEntry(m, DrfCollectionActions.Contains(m.Name) ? collection + slash : collection + "/{" + lookup + "}" + slash, ViewMethods[m.Name], "python.drf");
+                if (actions.Count == 0 && inherited.Count == 0) AddEntry(cls, collection + slash, null, "python.drf");
+                foreach (var m in actions) AddEntry(m, ActionRoute(collection, m.Name), ViewMethods[m.Name], "python.drf");
+                foreach (var action in inherited) AddEntry(InheritedTarget(cls, action, actions), ActionRoute(collection, action), ViewMethods[action], "python.drf");
             }
         }
+
+        // admin.site.urls：入口落在 urls.py 模块上（管理后台的视图在 Django 里，仓库里没有对应函数），File / Line 是那条 url()
+        foreach (var (file, pattern, isRegex, line) in admins)
+        {
+            if (scan.Symbols.FirstOrDefault(s => s.Kind == SymbolKind.Module && s.Path == file) is not { } module) continue;
+            foreach (var prefix in Prefixes(file, 0))
+                foreach (var c in scan.ContainersOf(file))
+                    scan.Add(new EntryPoint(module.Id, c.Key, "python.django", "http", "/" + (prefix + DjangoSegment(pattern, isRegex)).TrimStart('/'), null, file, line));
+        }
+
+        // 类声明的基类里出现的 DRF 通用视图 / mixin / ViewSet（经仓库里的中间基类也算，最多 4 层）带来的动作。
+        // as_view() 的类视图只认 XxxAPIView（mixin 只给 list() 这类方法，get / post 处理器是通用视图类定义的）；路由器注册的 ViewSet 认 mixin 与 XxxViewSet
+        HashSet<string> InheritedActions(MapSymbol cls, bool viewSet, int depth = 0)
+        {
+            var result = new HashSet<string>(StringComparer.Ordinal);
+            if (depth > 4) return result;
+            foreach (var b in PyBaseNames(scan.ReadLines(cls.Path), cls))
+            {
+                if (DrfInheritedActions.TryGetValue(b, out var acts))
+                {
+                    if (viewSet ? b.EndsWith("Mixin", StringComparison.Ordinal) || b.EndsWith("ViewSet", StringComparison.Ordinal) : b.EndsWith("APIView", StringComparison.Ordinal)) result.UnionWith(acts);
+                }
+                else if (classNamed(b, null, cls.Path) is { } parent && parent.Id != cls.Id)
+                {
+                    var own = scan.Children[parent.Id].Where(m => m.Kind == SymbolKind.Method && ViewMethods.ContainsKey(m.Name)).Select(m => m.Name);
+                    result.UnionWith(InheritedActions(parent, viewSet, depth + 1).Concat(own.Where(n => DrfCollectionActions.Contains(n) || DrfDetailActions.Contains(n))));
+                }
+            }
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// 继承来的 DRF 动作落在哪个符号上：partial_update 没重写但 update 重写了 → update（DRF 的 partial_update 就是 self.update(partial=True)，
+    /// PATCH /api/user 实际跑的是子类的 update）；其余 → 类本身（处理代码在框架里）。
+    /// </summary>
+    private static MapSymbol InheritedTarget(MapSymbol cls, string action, IReadOnlyList<MapSymbol> overridden) =>
+        action == "partial_update" && overridden.FirstOrDefault(m => m.Name == "update") is { } update ? update : cls;
+
+    /// <summary>class X(a.B, C, metaclass=M): 的基类简名（B、C），声明可跨行。</summary>
+    private static List<string> PyBaseNames(string[] lines, MapSymbol cls)
+    {
+        if (cls.StartLine < 1 || cls.StartLine > lines.Length) return [];
+        var head = string.Join('\n', lines[(cls.StartLine - 1)..Math.Min(lines.Length, cls.StartLine + 8)]);
+        var at = Regex.Match(head, $@"\bclass\s+{Regex.Escape(cls.Name)}\s*\(");
+        if (!at.Success) return [];
+        var (args, _) = ArgParser.SplitArgs(head, at.Index + at.Length - 1);
+        return args.Where(a => a.Length > 0 && !ArgParser.IsKeyword(a)).Select(a => Regex.Replace(a, @"\[.*$", "").Trim()).Select(a => a[(a.LastIndexOf('.') + 1)..]).ToList();
+    }
+
+    /// <summary>gRPC 健康检查（grpc.health.v1 的 Check / Watch）：方法体里构造 HealthCheckResponse。和业务服务写在同一个实现类里时也不算业务入口。</summary>
+    private static bool IsPyHealthMethod(MapSymbol m, Func<string, string[]> readLines)
+    {
+        if (m.Name is not ("Check" or "Watch")) return false;
+        var lines = readLines(m.Path);
+        for (var i = Math.Max(0, m.StartLine - 1); i < Math.Min(lines.Length, Math.Max(m.EndLine, m.StartLine + 3)); i++)
+            if (lines[i].Contains("HealthCheckResponse", StringComparison.Ordinal) || lines[i].Contains("health_pb2", StringComparison.Ordinal)) return true;
+        return false;
     }
 
     private static bool IsGeneratedPyStub(string path) =>

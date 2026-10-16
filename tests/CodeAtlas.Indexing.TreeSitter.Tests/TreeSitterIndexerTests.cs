@@ -43,8 +43,8 @@ public class TreeSitterIndexerTests : IDisposable
         var mainOut = Reader.GetNeighbors(main.Id, Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Calls });
         // new Svc()：Svc 是 import { Svc } from './svc' 绑定的名字 → 按导出解析 0.95（以前按 import 范围同名 0.7）
         Assert.Contains(mainOut, n => n.Other?.Id == svc.Id && n.Edge.Confidence == 0.95);
-        // new Svc().find()：接收者是表达式、类型未知 → 仍按 import 范围同名 0.7
-        Assert.Contains(mainOut, n => n.Other?.Id == find.Id && n.Edge.Confidence == 0.7);
+        // new Svc().find()：接收者是 new 出来的 Svc 实例 → Svc 的成员 0.9（以前当类型未知、按 import 范围同名 0.7）
+        Assert.Contains(mainOut, n => n.Other?.Id == find.Id && n.Edge.Confidence == 0.9);
         Assert.Contains(mainOut, n => n.Edge.ToName == "external:fetch" && n.Edge.Confidence == 0.5);
 
         // helper 是 import { helper } from './util/format' 绑定的名字 → 0.95（以前 0.7）
@@ -223,6 +223,137 @@ public class TreeSitterIndexerTests : IDisposable
             Assert.Contains(next, n => n.Other?.QualifiedName == "Acme.Infrastructure.FeedRepository.ListFeedsAsync" && n.Edge.Confidence == 0.5);
         }
         finally { Directory.Delete(cqrs, recursive: true); }
+    }
+
+    [Fact]
+    public async Task Indexer_FailedResolution_DoesNotPublishFileChanges()
+    {
+        await NewIndexer().IndexAsync(_repo);
+        var original = Reader.GetFile("src/app.ts")!;
+        var appPath = Path.Combine(_repo, "src", "app.ts");
+        File.AppendAllText(appPath, "\nexport function added() {}\n");
+        var failing = new TreeSitterIndexer(_db, _adapters, new FailingResolver());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failing.IndexAsync(_repo));
+
+        Assert.Equal(original.Hash, Reader.GetFile("src/app.ts")!.Hash);
+        Assert.Empty(Reader.FindByName("added"));
+        var retry = await NewIndexer().IndexAsync(_repo);
+        Assert.Equal(1, retry.FilesParsed);
+        Assert.Contains(Reader.GetNeighbors(Sym("src/app.ts:main").Id, Direction.Outgoing),
+            neighbor => neighbor.Other?.QualifiedName == "src/svc.ts:Svc.find");
+    }
+
+    [Fact]
+    public async Task Indexer_NewTarget_ResolvesUnchangedCaller()
+    {
+        File.WriteAllText(Path.Combine(_repo, "src", "app.ts"),
+            "import { later } from './later';\nexport function main() { later(); }\n");
+        await NewIndexer().IndexAsync(_repo);
+        File.WriteAllText(Path.Combine(_repo, "src", "later.ts"), "export function later() {}\n");
+
+        await NewIndexer().IndexAsync(_repo);
+
+        var calls = Reader.GetNeighbors(Sym("src/app.ts:main").Id, Direction.Outgoing,
+            new HashSet<EdgeKind> { EdgeKind.Calls });
+        Assert.Equal(Sym("src/later.ts:later").Id, Assert.Single(calls).Other?.Id);
+        Assert.Equal(0.95, calls[0].Edge.Confidence);
+    }
+
+    [Theory]
+    [InlineData("var unused = new Query();", false)]
+    [InlineData("var unused = new Query(); Send(\"other\");", false)]
+    [InlineData("Send(new Query());", true)]
+    [InlineData("Send(\n new Query());", true)]
+    public async Task Indexer_DispatchRequiresMessageArgument(string body, bool dispatched)
+    {
+        File.WriteAllText(Path.Combine(_repo, "src", "dispatch.cs"), $$"""
+            namespace DispatchTest;
+            public class Query {}
+            public interface IRequestHandler<T> {}
+            public class Handler : IRequestHandler<Query> {
+                public void Handle(Query query) {}
+            }
+            public class Sender {
+                public void Run() { {{body}} }
+                public void Send(object message) {}
+            }
+            """);
+        await NewIndexer().IndexAsync(_repo);
+
+        var sender = Sym("DispatchTest.Sender.Run");
+        var outgoing = Reader.GetNeighbors(sender.Id, Direction.Outgoing);
+        Assert.Equal(dispatched ? 1 : 0, outgoing.Count(neighbor => neighbor.Edge.Kind == EdgeKind.Dispatches));
+        Assert.Equal(dispatched ? 2 : 0, outgoing.Count(neighbor => neighbor.Edge.Via == "conduit"));
+    }
+
+    [Fact]
+    public async Task Indexer_ChangedCSharpTarget_RefreshesPreciseCallersWithoutLosingTheCall()
+    {
+        var targetPath = Path.Combine(_repo, "src", "target.cs");
+        File.WriteAllText(targetPath, "namespace Refresh; public class Target { public static int Value() => 1; }");
+        File.WriteAllText(Path.Combine(_repo, "src", "caller.cs"), "namespace Refresh; public class Caller { public int Run() => Target.Value(); }");
+        await NewIndexer().IndexAsync(_repo);
+        var caller = Sym("Refresh.Caller.Run");
+        var target = Sym("Refresh.Target.Value");
+        _db.Execute("UPDATE symbols SET qualified_name = 'Refresh.Target.Value()', source = 'roslyn' WHERE id = $id", ("$id", target.Id));
+        _db.Execute("UPDATE edges SET source = 'roslyn', to_name = 'Refresh.Target.Value()', confidence = 1.0 WHERE to_id = $id AND kind = 'calls'", ("$id", target.Id));
+        _db.Execute("UPDATE files SET roslyn_at = '2026-10-16T00:00:00Z' WHERE language = 'csharp'");
+        File.AppendAllText(targetPath, "\n");
+
+        var report = await NewIndexer().IndexAsync(_repo);
+
+        Assert.Equal(1, report.FilesParsed);
+        var bound = Reader.GetNeighbors(caller.Id, Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Calls })
+            .Where(neighbor => neighbor.Other is not null).ToList();
+        Assert.Equal(Sym("Refresh.Target.Value").Id, Assert.Single(bound).Other!.Id);
+        Assert.Equal(IndexSource.TreeSitter, bound[0].Edge.Source);
+        Assert.Equal(0, _db.Scalar<long>("SELECT COUNT(*) FROM files WHERE id = $file AND roslyn_at IS NOT NULL", ("$file", caller.FileId)));
+    }
+
+    [Fact]
+    public async Task Indexer_ReExportChange_RebindsPreviouslyResolvedCaller()
+    {
+        File.WriteAllText(Path.Combine(_repo, "src", "app.ts"), "import { target } from './target'; export function main() { target(); }");
+        var targetPath = Path.Combine(_repo, "src", "target.ts");
+        File.WriteAllText(targetPath, "export function target() {}");
+        File.WriteAllText(Path.Combine(_repo, "src", "moved.ts"), "export function target() {}");
+        await NewIndexer().IndexAsync(_repo);
+        File.WriteAllText(targetPath, "export { target } from './moved';");
+
+        await NewIndexer().IndexAsync(_repo);
+
+        var calls = Reader.GetNeighbors(Sym("src/app.ts:main").Id, Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.Calls });
+        Assert.Equal(Sym("src/moved.ts:target").Id, Assert.Single(calls).Other?.Id);
+    }
+
+    [Fact]
+    public async Task Indexer_CanceledBetweenWriteChunks_RollsBackAllChunks()
+    {
+        await NewIndexer().IndexAsync(_repo);
+        var original = Reader.GetFile("src/app.ts")!;
+        File.AppendAllText(Path.Combine(_repo, "src", "app.ts"), "\nexport function added() {}\n");
+        File.AppendAllText(Path.Combine(_repo, "src", "svc.ts"), "\nexport function changed() {}\n");
+        using var cancellation = new CancellationTokenSource();
+        var progress = new ImmediateProgress(value => { if (value.Phase == "write") cancellation.Cancel(); });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            NewIndexer(new IndexOptions { WriteBatchSize = 1 }).IndexAsync(_repo, progress, cancellation.Token));
+
+        Assert.Equal(original.Hash, Reader.GetFile("src/app.ts")!.Hash);
+        Assert.Empty(Reader.FindByName("added"));
+        Assert.Equal(2, (await NewIndexer().IndexAsync(_repo)).FilesParsed);
+    }
+
+    private sealed class ImmediateProgress(Action<IndexProgress> report) : IProgress<IndexProgress>
+    {
+        public void Report(IndexProgress value) => report(value);
+    }
+
+    private sealed class FailingResolver : IEdgeResolver
+    {
+        public Task ResolveAsync(ResolveContext context, CancellationToken ct) =>
+            throw new InvalidOperationException("resolution failed");
     }
 
     private static void CopyDirectory(string from, string to)

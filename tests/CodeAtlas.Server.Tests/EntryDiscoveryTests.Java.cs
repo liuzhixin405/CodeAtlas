@@ -409,6 +409,109 @@ public partial class EntryDiscoveryTests
         Assert.Contains(entries, e => e.SymbolId == 1085 && e.Route == "/rabbits"); // Rabbit.java 不是 *IT.java
     }
 
+    [Fact]
+    public void Java_GraphQl_DgsAndSpringGraphQl_CodegenConstantsCasedBySchema()
+    {
+        Dictionary<string, string[]> files = new()
+        {
+            ["conduit/src/main/java/org/acme/graphql/ArticleDatafetcher.java"] =
+            [
+                "package org.acme.graphql;",                                                        // 1
+                "import org.acme.graphql.DgsConstants.QUERY;",                                      // 2：codegen 生成的常量类，不在仓库里
+                "import org.acme.graphql.DgsConstants.ARTICLEPAYLOAD;",                             // 3
+                "@DgsComponent",                                                                    // 4
+                "public class ArticleDatafetcher {",                                                // 5
+                "  @DgsQuery(field = QUERY.Feed)",                                                  // 6
+                "  public Object getFeed(@InputArgument(\"first\") Integer first) { return null; }", // 7
+                "  @DgsData(parentType = ARTICLEPAYLOAD.TYPE_NAME, field = ARTICLEPAYLOAD.Article)", // 8：类型名按模式还原大小写
+                "  public Object payloadArticle() { return null; }",                                // 9
+                "  @DgsMutation",                                                                   // 10：没写 field → 方法名
+                "  public Object createArticle() { return null; }",                                 // 11
+                "  @DgsData(parentType = DgsConstants.QUERY_TYPE, field = \"tags\")",               // 12
+                "  public Object getTags() { return null; }",                                       // 13
+                "  public Object helper() { return null; }",                                        // 14
+                "}",                                                                                // 15
+            ],
+            ["conduit/src/main/resources/schema/schema.graphqls"] =
+            [
+                "type Query {",
+                "    feed(first: Int): ArticlesConnection",
+                "    tags: [String]",
+                "}",
+                "type Mutation {",
+                "    createArticle(input: CreateArticleInput!): ArticlePayload",
+                "}",
+                "type ArticlePayload {",
+                "    article: Article",
+                "}",
+            ],
+            ["conduit/src/main/java/org/acme/graphql/BookController.java"] =
+            [
+                "package org.acme.graphql;",                                // 1
+                "@Controller",                                              // 2
+                "public class BookController {",                            // 3
+                "  @QueryMapping",                                          // 4
+                "  public Book bookById(@Argument String id) { return null; }", // 5
+                "  @SchemaMapping(typeName = \"Book\", field = \"author\")", // 6
+                "  public Author author(Book book) { return null; }",       // 7
+                "  @MutationMapping(\"addBook\")",                          // 8
+                "  public Book create() { return null; }",                  // 9
+                "}",                                                        // 10
+            ],
+        };
+        List<MapSymbol> symbols =
+        [
+            Sym(1, SymbolKind.Class, "org.acme.graphql.ArticleDatafetcher", "conduit/src/main/java/org/acme/graphql/ArticleDatafetcher.java", null, 5, 15, "public"),
+            Sym(2, SymbolKind.Method, "org.acme.graphql.ArticleDatafetcher.getFeed(Integer)", "conduit/src/main/java/org/acme/graphql/ArticleDatafetcher.java", 1, 7, 7, "public"),
+            Sym(3, SymbolKind.Method, "org.acme.graphql.ArticleDatafetcher.payloadArticle()", "conduit/src/main/java/org/acme/graphql/ArticleDatafetcher.java", 1, 9, 9, "public"),
+            Sym(4, SymbolKind.Method, "org.acme.graphql.ArticleDatafetcher.createArticle()", "conduit/src/main/java/org/acme/graphql/ArticleDatafetcher.java", 1, 11, 11, "public"),
+            Sym(5, SymbolKind.Method, "org.acme.graphql.ArticleDatafetcher.getTags()", "conduit/src/main/java/org/acme/graphql/ArticleDatafetcher.java", 1, 13, 13, "public"),
+            Sym(6, SymbolKind.Method, "org.acme.graphql.ArticleDatafetcher.helper()", "conduit/src/main/java/org/acme/graphql/ArticleDatafetcher.java", 1, 14, 14, "public"),
+            Sym(7, SymbolKind.Class, "org.acme.graphql.BookController", "conduit/src/main/java/org/acme/graphql/BookController.java", null, 3, 10, "public"),
+            Sym(8, SymbolKind.Method, "org.acme.graphql.BookController.bookById(String)", "conduit/src/main/java/org/acme/graphql/BookController.java", 7, 5, 5, "public"),
+            Sym(9, SymbolKind.Method, "org.acme.graphql.BookController.author(Book)", "conduit/src/main/java/org/acme/graphql/BookController.java", 7, 7, 7, "public"),
+            Sym(10, SymbolKind.Method, "org.acme.graphql.BookController.create()", "conduit/src/main/java/org/acme/graphql/BookController.java", 7, 9, 9, "public"),
+        ];
+        var entries = EntryDiscovery.Discover(symbols, [], [Container("conduit", "java", "conduit")], p => files.TryGetValue(p, out var l) ? l : []);
+        Assert.Equal(new[]
+        {
+            ("java.dgs", "graphql:ArticlePayload.article", 3L, 9),             // ARTICLEPAYLOAD → 模式里的 ArticlePayload
+            ("java.spring-graphql", "graphql:Book.author", 9L, 7),
+            ("java.spring-graphql", "graphql:Mutation.addBook", 10L, 9),       // @MutationMapping("addBook")
+            ("java.dgs", "graphql:Mutation.createArticle", 4L, 11),
+            ("java.spring-graphql", "graphql:Query.bookById", 8L, 5),          // 没写名字 → 方法名
+            ("java.dgs", "graphql:Query.feed", 2L, 7),                         // QUERY.Feed → feed
+            ("java.dgs", "graphql:Query.tags", 5L, 13),                        // DgsConstants.QUERY_TYPE → Query
+        }, entries.OrderBy(e => e.Route, StringComparer.Ordinal).Select(e => (e.RuleId, e.Route!, e.SymbolId, e.Line)));
+        Assert.All(entries, e => Assert.Equal(("http", (string?)null, "conduit"), (e.Kind, e.HttpMethod, e.ContainerKey)));
+    }
+
+    [Fact]
+    public void Java_Hosted_SampleClientMainDroppedWhenTheServerMainIsThere()
+    {
+        Dictionary<string, string[]> files = new()
+        {
+            ["ads/src/main/java/demo/AdServer.java"] = ["package demo;", "public class AdServer {", "  public static void main(String[] args) { }", "}"],
+            ["ads/src/main/java/demo/AdServiceClient.java"] = ["package demo;", "public class AdServiceClient {", "  public static void main(String[] args) { }", "}"],
+            ["tool/src/main/java/demo/SyncClient.java"] = ["package demo;", "public class SyncClient {", "  public static void main(String[] args) { }", "}"],
+        };
+        List<MapSymbol> symbols =
+        [
+            Sym(1, SymbolKind.Class, "demo.AdServer", "ads/src/main/java/demo/AdServer.java", null, 2, 4, "public"),
+            Sym(2, SymbolKind.Method, "demo.AdServer.main(String[])", "ads/src/main/java/demo/AdServer.java", 1, 3, 3, "public"),
+            Sym(3, SymbolKind.Class, "demo.AdServiceClient", "ads/src/main/java/demo/AdServiceClient.java", null, 2, 4, "public"),
+            Sym(4, SymbolKind.Method, "demo.AdServiceClient.main(String[])", "ads/src/main/java/demo/AdServiceClient.java", 3, 3, 3, "public"),
+            Sym(5, SymbolKind.Class, "demo.SyncClient", "tool/src/main/java/demo/SyncClient.java", null, 2, 4, "public"),
+            Sym(6, SymbolKind.Method, "demo.SyncClient.main(String[])", "tool/src/main/java/demo/SyncClient.java", 5, 3, 3, "public"),
+        ];
+        var entries = EntryDiscovery.Discover(symbols, [], [Container("ads", "java", "ads"), Container("tool", "java", "tool")], p => files.TryGetValue(p, out var l) ? l : []);
+        Assert.Equal(new[]
+        {
+            ("ads", "java.main", 2L),  // AdServiceClient.main 是调本服务的示例客户端
+            ("tool", "java.main", 6L), // 容器里只有它：照旧是入口
+        }, entries.Where(e => e.Kind == "hosted").Select(e => (e.ContainerKey, e.RuleId, e.SymbolId)));
+    }
+
     [Theory]
     [InlineData("shop/src/test/java/org/acme/A.java", true)]
     [InlineData("shop/src/main/java/org/acme/OwnerControllerTests.java", true)]

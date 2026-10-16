@@ -15,6 +15,7 @@ namespace CodeAtlas.Core.Roslyn;
 [JsonDerivedType(typeof(ProgressRec), "progress")]
 [JsonDerivedType(typeof(ErrorRec), "error")]
 [JsonDerivedType(typeof(DoneRec), "done")]
+[JsonDerivedType(typeof(TimingRec), "timing")]
 public abstract record RoslynRecord;
 
 /// <summary>开始输出某个文件的符号。Path 相对仓库根，'/' 分隔。</summary>
@@ -41,6 +42,9 @@ public sealed record ProgressRec(string Phase, int Done, int Total, string? Curr
 public sealed record ErrorRec(string Scope, string Message) : RoslynRecord;
 
 public sealed record DoneRec(int Projects, int Documents, int Errors) : RoslynRecord;
+
+/// <summary>worker 内部一个阶段的耗时（open / compile / handlers / walk），父进程收进报告的阶段耗时。</summary>
+public sealed record TimingRec(string Phase, double Seconds) : RoslynRecord;
 
 public static class RecordJson
 {

@@ -13,3 +13,7 @@ esbuild.mjs
 .gitignore
 **/*.pdb
 images/*.svg
+# 别把别的包、压缩包打进去
+*.vsix
+*.7z
+*.zip

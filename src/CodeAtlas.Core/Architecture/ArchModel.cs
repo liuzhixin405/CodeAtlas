@@ -10,7 +10,7 @@ public enum ArchSource { Discovered, Declared }
 public sealed record Evidence(string File, int? Line = null, string? Note = null);
 
 /// <param name="Key">稳定键：容器用项目 / 目录相对路径，外部系统用 "kind:name"。</param>
-/// <param name="SubKind">container：dotnet-web / dotnet-worker / dotnet-exe / frontend / go-service / python-service / node-service / node-cli / java-service；
+/// <param name="SubKind">container：dotnet-web / dotnet-worker / dotnet-exe / frontend / go-service / python-service / node-service / node-cli / vscode-extension / java-service；
 /// external：database / cache / broker / http-service / grpc-service / native-sdk / storage / observability / email / identity / other。</param>
 /// <param name="Members">容器的成员项目目录（相对仓库根，'/' 分隔），含自身；外部系统为空。</param>
 /// <param name="Ports">容器声明的监听端口（launchSettings / Dockerfile EXPOSE / ASPNETCORE_URLS / Helm）。</param>

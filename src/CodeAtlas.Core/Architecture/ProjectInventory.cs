@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
@@ -12,11 +12,12 @@ namespace CodeAtlas.Core.Architecture;
 /// <param name="Packages">&lt;PackageReference&gt; 与同目录 packages.config（旧式 .NET Framework 项目）的包。</param>
 /// <param name="TargetFramework">TargetFramework(s)，旧式项目是 TargetFrameworkVersion（v4.5）。</param>
 /// <param name="LegacyWeb">旧式 ASP.NET Web 应用：ProjectTypeGuids 里有 Web Application 类型（OutputType 是 Library）。</param>
+/// <param name="AssemblyName">&lt;AssemblyName&gt;（可执行文件名，codeatlas）；没写为 null（= 项目名）。</param>
 public sealed record CsProject(
     string Dir, string File, string Name, string? Sdk, string? OutputType, bool IsTest,
     IReadOnlyList<string> ProjectRefs, IReadOnlyList<PackageRef> Packages, IReadOnlyList<LocalRef> LocalReferences,
     IReadOnlyList<int> Ports, IReadOnlyList<Evidence> DeployEvidence, string? Dockerfile,
-    string? TargetFramework = null, bool LegacyWeb = false);
+    string? TargetFramework = null, bool LegacyWeb = false, string? AssemblyName = null);
 
 /// <param name="File">包声明所在文件；null 表示就是 csproj 本身（PackageReference）。packages.config 的包指向 packages.config。</param>
 public sealed record PackageRef(string Name, int Line, string? File = null);
@@ -113,11 +114,7 @@ public sealed partial class ProjectInventory
             var name = info.Name;
             if (info is DirectoryInfo)
             {
-                // 点目录（.git / .claude 的 worktrees / .vs …）一律跳过：里面是工具状态或仓库副本，不是部署单元；
-                // 另一个根的目录（它自己遍历）、worktree、--no-nested 时的嵌套仓库也跳过
-                if (IgnoredDirectories.Contains(name) || name.StartsWith('.')) continue;
-                if (IsPolyglotNoise(entry, name) || IsMavenOutput(entry, name)) continue;
-                if (!roots.ShouldDescend(entry, currentRoot)) continue;
+                if (!ShouldEnter(roots, currentRoot, entry, name)) continue;
                 Walk(roots, currentRoot, entry, csprojs, packageJsons, sources, manifests, javaManifests);
                 continue;
             }
@@ -130,6 +127,67 @@ public sealed partial class ProjectInventory
             var ext = System.IO.Path.GetExtension(name).ToLowerInvariant();
             if (ext is ".cs" or ".ts" or ".tsx" or ".js" or ".jsx" or ".mts" or ".cts" or ".go" or ".py" or ".java") sources.Add(rel);
         }
+    }
+
+    /// <summary>
+    /// 清单遍历进不进这个子目录。点目录（.git / .claude 的 worktrees / .vs …）一律跳过：里面是工具状态或仓库副本，不是部署单元；
+    /// 另一个根的目录（它自己遍历）、worktree、--no-nested 时的嵌套仓库也跳过。<see cref="InputFingerprint"/> 用同一套规则。
+    /// </summary>
+    private static bool ShouldEnter(ProjectRoots roots, string currentRoot, string entry, string name) =>
+        !(IgnoredDirectories.Contains(name) || name.StartsWith('.'))
+        && !(IsPolyglotNoise(entry, name) || IsMavenOutput(entry, name))
+        && roots.ShouldDescend(entry, currentRoot);
+
+    /// <summary>
+    /// 清单与规则可能读到的全部输入的指纹：按清单遍历的规则走一遍（只 stat，不读内容），每个文件记 相对路径 + 大小 + 修改时间，
+    /// 再加 .codeatlas/architecture.yaml（点目录不遍历）。任何源码、csproj、package.json、appsettings*.json、launchSettings.json、Dockerfile、
+    /// k8s / compose 清单的增删改都会改变它。ccs-backend（7 千个源码文件）上约 0.25s（子目录并行）。
+    /// </summary>
+    public static string InputFingerprint(ProjectRoots roots)
+    {
+        using var hash = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+        void Add(string s) => hash.AppendData(System.Text.Encoding.UTF8.GetBytes(s + "\n"));
+        Add("roots|" + roots.Main + "|" + string.Join("|", roots.Externals) + "|" + roots.IncludeNested);
+        // 子目录并行走（每个目录还要判断嵌套仓库 / vendor / target，系统调用多），结果按名字顺序拼回，指纹与串行一致
+        List<string> WalkStat(string currentRoot, string dir, int depth)
+        {
+            List<FileSystemInfo> infos;
+            try { infos = new DirectoryInfo(dir).EnumerateFileSystemInfos().OrderBy(i => i.Name, StringComparer.Ordinal).ToList(); }
+            catch (UnauthorizedAccessException) { return []; }
+            catch (IOException) { return []; }
+            var lines = new List<string>();
+            var subdirs = new List<(int At, string Dir)>();
+            foreach (var info in infos)
+            {
+                if (info.Attributes.HasFlag(FileAttributes.ReparsePoint)) continue;
+                if (info is DirectoryInfo)
+                {
+                    if (ShouldEnter(roots, currentRoot, info.FullName, info.Name)) subdirs.Add((lines.Count, info.FullName));
+                    continue;
+                }
+                var f = (FileInfo)info;
+                lines.Add(roots.Relative(f.FullName) + "|" + f.Length + "|" + f.LastWriteTimeUtc.Ticks);
+            }
+            var nested = new List<string>[subdirs.Count];
+            if (depth < 3) Parallel.For(0, subdirs.Count, i => nested[i] = WalkStat(currentRoot, subdirs[i].Dir, depth + 1));
+            else for (var i = 0; i < subdirs.Count; i++) nested[i] = WalkStat(currentRoot, subdirs[i].Dir, depth + 1);
+            // 目录排在它在名字顺序里的位置上（与文件交错），和逐个递归时的顺序相同
+            var result = new List<string>(lines.Count + nested.Sum(n => n.Count));
+            var next = 0;
+            for (var i = 0; i < subdirs.Count; i++)
+            {
+                for (; next < subdirs[i].At; next++) result.Add(lines[next]);
+                result.Add("dir|" + roots.Relative(subdirs[i].Dir));
+                result.AddRange(nested[i]);
+            }
+            for (; next < lines.Count; next++) result.Add(lines[next]);
+            return result;
+        }
+        foreach (var r in roots.All)
+            foreach (var line in WalkStat(r, r, 0)) Add(line);
+        var declarations = new FileInfo(System.IO.Path.Combine(roots.Main, ArchitectureDeclarations.RelativePath.Replace('/', System.IO.Path.DirectorySeparatorChar)));
+        Add("declarations|" + (declarations.Exists ? declarations.Length + "|" + declarations.LastWriteTimeUtc.Ticks : "-"));
+        return Convert.ToHexString(hash.GetHashAndReset());
     }
 
     internal static string Rel(string root, string full)
@@ -167,14 +225,16 @@ public sealed partial class ProjectInventory
                      // 测试包写在共享 props 里（<Import Project="..\framework.tests.props" />）：名字以 Tests 结尾且导入了带 test 的 props
                      || Regex.IsMatch(name, @"Tests?$", RegexOptions.IgnoreCase) && doc.Descendants(ns + "Import").Any(e => e.Attribute("Project")?.Value.Contains("test", StringComparison.OrdinalIgnoreCase) == true);
         var (ports, deploy, dockerfile) = ReadDeployment(roots, dir);
-        return new CsProject(dir, relFile, name, sdk, outputType, isTest, refs, packages, locals, ports, deploy, dockerfile, targetFramework, legacyWeb);
+        var assemblyName = doc.Descendants(ns + "AssemblyName").Select(e => e.Value.Trim()).FirstOrDefault(v => v.Length > 0);
+        return new CsProject(dir, relFile, name, sdk, outputType, isTest, refs, packages, locals, ports, deploy, dockerfile, targetFramework, legacyWeb, assemblyName);
     }
 
     private static int Line(XElement e) => ((IXmlLineInfo)e).HasLineInfo() ? ((IXmlLineInfo)e).LineNumber : 0;
 
     /// <summary>旧式 ASP.NET Web Application 的项目类型 GUID。</summary>
     private const string WebApplicationGuid = "349c5851-65df-11da-9384-00065b846f21";
-    private static readonly Regex NuGetPackagesHint = new(@"(^|[\\/])packages[\\/]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex SharedCodeAssembly = new(@"(?:Contracts?|Shared|Common|Abstractions|Dtos?|Models|Messages)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex NuGetPackagesHint =new(@"(^|[\\/])packages[\\/]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly HashSet<string> FrameworkAssemblies = new(StringComparer.OrdinalIgnoreCase)
         { "mscorlib", "netstandard", "WindowsBase", "PresentationCore", "PresentationFramework", "UIAutomationProvider", "UIAutomationTypes", "ReachFramework" };
 
@@ -187,6 +247,8 @@ public sealed partial class ProjectInventory
     /// </summary>
     private static bool IsFrameworkOrNuGetReference(LocalRef r)
     {
+        // 托管的共享契约 / 公共库 DLL（libs/ 下的 XxxSharedContracts.dll、Xxx.Common.dll）是代码依赖，不是运行时连接的外部系统
+        if (SharedCodeAssembly.IsMatch(r.Name)) return true;
         if (r.HintPath is not null) return NuGetPackagesHint.IsMatch(r.HintPath);
         return r.Name.Equals("System", StringComparison.OrdinalIgnoreCase) || r.Name.StartsWith("System.", StringComparison.OrdinalIgnoreCase)
                || r.Name.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) || FrameworkAssemblies.Contains(r.Name);

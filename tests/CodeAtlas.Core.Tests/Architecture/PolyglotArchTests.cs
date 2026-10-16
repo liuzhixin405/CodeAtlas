@@ -18,7 +18,8 @@ public class PolyglotArchTests : IDisposable
     public void Inventory_GoModules_DirectRequiresOnly_MainPackages_AndPorts()
     {
         var inv = ProjectInventory.Load(_fx.Root);
-        Assert.Equal(["go/gw", "go/shop", "go/single"], inv.GoModules.Select(m => m.Dir));
+        // 清单照常列出测试树下的模块（成员、边要用），出不出容器由 ContainerDiscovery 判
+        Assert.Equal(["go/gw", "go/shop", "go/single", "tests/fixtures/go/shop"], inv.GoModules.Select(m => m.Dir));
         var shop = inv.GoModules.Single(m => m.Dir == "go/shop");
         Assert.Equal(("example.com/shop", "go/shop/go.mod"), (shop.ModulePath, shop.File));
         // require ( … ) 块与单行 require 都读；// indirect 的不算
@@ -80,7 +81,11 @@ public class PolyglotArchTests : IDisposable
         Assert.Empty(inv.PythonProjects.Single(p => p.Dir == "py/ws").DeployEvidence);
         Assert.Equal(("flask", "py/ws/svc/svc/app.py", 2), (inv.PythonProjects.Single(p => p.Dir == "py/ws/svc").Framework, inv.PythonProjects.Single(p => p.Dir == "py/ws/svc").DeployEvidence.Single().File, inv.PythonProjects.Single(p => p.Dir == "py/ws/svc").DeployEvidence.Single().Line!.Value));
 
-        var node = Assert.Single(inv.NodeServices);
+        Assert.Equal(["node/api", "node/payment"], inv.NodeServices.Select(n => n.Dir).Order(StringComparer.Ordinal));
+        // 没有 Dockerfile 但有 start 脚本：按服务算，Server 取依赖里第一个认识的框架
+        var nest = inv.NodeServices.Single(n => n.Dir == "node/api");
+        Assert.Equal(("api", "@nestjs/core", (string?)null), (nest.Name, nest.Server, nest.Dockerfile));
+        var node = inv.NodeServices.Single(n => n.Dir == "node/payment");
         Assert.Equal(("node/payment", "payment", "@grpc/grpc-js", "node/payment/Dockerfile"), (node.Dir, node.Name, node.Server, node.Dockerfile));
         Assert.Equal([50052], node.Ports);
     }
@@ -89,7 +94,7 @@ public class PolyglotArchTests : IDisposable
     public void Containers_GoMainsPythonAppsNodeServices_WithMembersAndPorts()
     {
         var containers = ContainerDiscovery.Discover(ProjectInventory.Load(_fx.Root));
-        Assert.Equal(["dotnet/Ledger", "go/gw", "go/shop/cmd/api", "go/shop/cmd/worker", "go/single", "node/payment", "py/blog", "py/cart", "py/mailer", "py/ws/svc", "web"], containers.Select(c => c.Key));
+        Assert.Equal(["dotnet/Ledger", "go/gw", "go/shop/cmd/api", "go/shop/cmd/worker", "go/single", "node/api", "node/payment", "py/blog", "py/cart", "py/mailer", "py/ws/svc", "web"], containers.Select(c => c.Key));
 
         var api = containers.Single(c => c.Key == "go/shop/cmd/api");
         Assert.Equal(("go-service", "api", "go/shop/cmd/api"), (api.SubKind, api.Name, api.Path));
@@ -197,9 +202,9 @@ public class PolyglotArchTests : IDisposable
         Assert.Equal(
         [
             "external:broker:celery-任务队列", "external:broker:kafka", "external:broker:rabbitmq", "external:cache:redis",
-            "external:database:postgresql", "external:database:sqlite", "external:database:数据库-gorm", "external:email:smtp-邮件服务",
+            "external:database:postgresql", "external:database:sqlite-内嵌", "external:database:数据库-gorm", "external:email:smtp-邮件服务",
             "external:grpc-service:adservice", "external:grpc-service:auditservice", "external:grpc-service:collector-service-addr", "external:grpc-service:unknownservice",
-            "external:http-service:api-api-v1", "external:http-service:api-github-com", "external:http-service:assistant-addr", "external:http-service:billing-url", "external:http-service:catalog-url", "external:http-service:hooks-slack-com",
+            "external:http-service:api-api-v1", "external:http-service:assistant-addr", "external:http-service:billing-url", "external:http-service:catalog-url", "external:http-service:github-api", "external:http-service:slack", // 认得出的主机按服务名（api.github.com → GitHub API）
             "external:observability:google-cloud-profiler", "external:observability:opentelemetry-collector", "external:observability:sentry",
         ], model.Nodes.Where(n => n.Kind == ArchNodeKind.External).Select(n => n.Key));
         Assert.Equal(39, model.Edges.Count); // gw 3、api 14、worker 6、pricing 1、cart 10、mailer 2、blog 1、Ledger 1、web 1

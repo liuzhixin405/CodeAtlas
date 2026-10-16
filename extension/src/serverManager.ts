@@ -268,6 +268,7 @@ export function buildServeLaunch(
 /** 一个工作区文件夹对应一个服务进程。token 由扩展生成，服务要求每个 /api 请求都带它。 */
 export class ServerProcess implements ProcessLike {
   private child: ChildProcess | null = null;
+  private stopped = false;
   apiBase: string | null = null;
 
   /**
@@ -293,6 +294,7 @@ export class ServerProcess implements ProcessLike {
     if (this.ai?.enabled) {
       try { apiKey = await this.getApiKey(); } catch (e) { this.log.error(`读取 AI API Key 失败，按未设置处理：${e instanceof Error ? e.message : String(e)}`); }
     }
+    if (this.stopped) throw new Error("服务启动已取消");
     const launch = buildServeLaunch(this.exe, this.repoRoot, this.token, process.pid, this.ai, apiKey, process.env, this.projects);
     const secrets = [this.token, apiKey?.trim(), launch.env[ApiKeyEnvVar]];
     const scrub = (s: string) => redactSecrets(s, secrets);
@@ -304,10 +306,11 @@ export class ServerProcess implements ProcessLike {
     child.on("error", (e) => this.log.error(`服务进程错误：${scrub(e.message)}`));
     child.on("exit", (code) => {
       this.log.info(`服务退出，code=${code}`);
-      this.apiBase = null;
+      if (this.child === child) this.apiBase = null;
     });
     try {
       const port = await waitForPortLine(child.stdout!, timeoutMs);
+      if (this.stopped || this.child !== child || !this.alive) throw new Error("服务启动已取消");
       this.apiBase = `http://127.0.0.1:${port}`;
       child.stdout!.on("data", (d: Buffer) => this.log.info(scrub(d.toString().trimEnd())));
       return this.apiBase;
@@ -318,6 +321,7 @@ export class ServerProcess implements ProcessLike {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.child && this.child.exitCode === null) {
       try { this.child.kill(); } catch { /* 已退出 */ }
     }
@@ -363,7 +367,12 @@ export class ServerManager {
     if (!exe) return Promise.reject(new ServerNotFoundError());
     const proc = this.createProcess(exe, repoRoot);
     this.servers.set(repoRoot, proc);
-    const p = proc.start().finally(() => this.starting.delete(repoRoot));
+    const p = proc.start().then(base => {
+      if (this.servers.get(repoRoot) !== proc) { proc.stop(); throw new Error("服务启动已取消"); }
+      return base;
+    }).finally(() => {
+      if (this.starting.get(repoRoot) === p) this.starting.delete(repoRoot);
+    });
     this.starting.set(repoRoot, p);
     return p;
   }
@@ -373,25 +382,27 @@ export class ServerManager {
     const used = this.restartBudget.get(repoRoot) ?? 0;
     if (used >= 1) return Promise.reject(new Error("CodeTrail Graph 服务已重启过一次仍不可用，请用命令「CodeTrail Graph: 重启服务」手动重启"));
     this.restartBudget.set(repoRoot, used + 1);
-    this.servers.get(repoRoot)?.stop();
-    this.servers.delete(repoRoot);
+    this.invalidate(repoRoot);
     return this.ensure(repoRoot);
   }
 
   /** 用户显式重启：重置自动重启预算。 */
   restart(repoRoot: string): Promise<string> {
     this.restartBudget.delete(repoRoot);
-    this.servers.get(repoRoot)?.stop();
-    this.servers.delete(repoRoot);
+    this.invalidate(repoRoot);
     return this.ensure(repoRoot);
   }
 
   /** 停掉一个仓库的服务（多根工作区换了主根时用）；下次 ensure 会重新拉起。 */
   stop(repoRoot: string): void {
+    this.invalidate(repoRoot);
+    this.restartBudget.delete(repoRoot);
+  }
+
+  private invalidate(repoRoot: string): void {
     this.servers.get(repoRoot)?.stop();
     this.servers.delete(repoRoot);
     this.starting.delete(repoRoot);
-    this.restartBudget.delete(repoRoot);
   }
 
   stopAll(): void {

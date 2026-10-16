@@ -11,7 +11,10 @@ namespace CodeAtlas.Core.Resolution;
 /// 没有绑定的裸名字 → 只在本文件按词法作用域找（0.9），找不到就是全局 / 局部变量 → external，不再按全仓库同名去猜；
 /// this.x() → 本类成员，没有再找仓库里的父类，0.9；this.svc.x()（svc 是构造注入 / 带类型的字段）→ 类型的成员 0.9，
 /// 类型是接口 / 抽象类且只有一个实现类时再加 via = "impl" 0.9 到实现；
-/// NS.x()（NS 是 import 进来的）→ 那个模块里的 x；其他接收者 → 本文件 0.9、import 范围 0.7，否则 external。
+/// NS.x()（NS 是 import 进来的）→ 那个模块里的 x；
+/// 适配器推得出接收者形态时（见 ScriptAdapterBase.Inference.cs）：带类型的变量 / 参数 / new 出来的实例 → 类型的成员 0.9；
+/// 函数的返回值（const api = useApi()）→ 顺着 via = returns 的提示找到返回的类，再取成员 0.9；内建 / 宿主对象（Set、Map、Promise、vscode 对象）→ external；
+/// 推不出的接收者 → 只按方法名：本文件 0.6、import 范围 0.5，否则 external。
 /// </summary>
 public sealed partial class HeuristicEdgeResolver
 {
@@ -40,8 +43,17 @@ public sealed partial class HeuristicEdgeResolver
         private readonly Dictionary<long, List<(string Target, bool IsPath)>> _importsByFile;
         private readonly Dictionary<long, HashSet<long>> _scopeCache = [];
 
+        private readonly IReadOnlyList<PendingReference> _pending;
+        private readonly IndexReader? _reader;
+        private ILookup<long, PendingReference>? _returnHints;
+        private HashSet<string>? _repoTypeNames;
+        private readonly Dictionary<long, ReturnInfo?> _returnCache = [];
+
+        /// <param name="pending">本次要解析的全部引用：函数的返回值提示（via = returns）从这里取；为空时只读库里已有的 returns 边。</param>
+        /// <param name="reader">读库里没重新解析的文件的 returns 边（增量索引）。</param>
         public ScriptIndex(IReadOnlyList<SymbolRecord> all, Dictionary<long, SymbolRecord> byId, Dictionary<long, FileRecord> files,
-            Dictionary<string, SymbolRecord> modulesByPathNoExt, Dictionary<long, List<(string Target, bool IsPath)>> importsByFile, IReadOnlyList<ScriptPathConfig> configs)
+            Dictionary<string, SymbolRecord> modulesByPathNoExt, Dictionary<long, List<(string Target, bool IsPath)>> importsByFile, IReadOnlyList<ScriptPathConfig> configs,
+            IReadOnlyList<PendingReference>? pending = null, IndexReader? reader = null)
         {
             _modules = new ScriptModuleResolver(modulesByPathNoExt, configs);
             _children = all.Where(s => s.ParentId is not null).ToLookup(s => s.ParentId!.Value);
@@ -49,6 +61,106 @@ public sealed partial class HeuristicEdgeResolver
             _files = files;
             _byId = byId;
             _importsByFile = importsByFile;
+            _pending = pending ?? [];
+            _reader = reader;
+        }
+
+        public SymbolRecord? Symbol(long id) => _byId.GetValueOrDefault(id);
+
+        /// <summary>仓库里（TS / JS 文件）有没有叫 name 的类 / 接口 / 类型别名 / 枚举；没有就是语言 / DOM / 宿主类型。</summary>
+        public bool HasRepoType(string name)
+        {
+            _repoTypeNames ??= _byId.Values
+                .Where(s => s.Kind is SymbolKind.Class or SymbolKind.Interface or SymbolKind.TypeAlias or SymbolKind.Enum
+                            && _files.TryGetValue(s.FileId, out var f) && LanguageFamily(f.Language) == "js")
+                .Select(s => s.Name).ToHashSet(StringComparer.Ordinal);
+            return _repoTypeNames.Contains(name);
+        }
+
+        private static bool IsFunctionLike(SymbolRecord s) => s.Kind is SymbolKind.Function or SymbolKind.Method;
+
+        /// <summary>
+        /// 引用处可见的函数 name：source 不为 null 时是那个模块的导出（"default" 找默认导出）；
+        /// 否则按词法作用域在本文件里找（调用点祖先链上某一层的直接子符号，类成员不算）。
+        /// </summary>
+        public SymbolRecord? ResolveFunction(PendingReference r, string? source, string name)
+        {
+            if (source is not null)
+                return ResolveModule(r.FilePath, source) is { } module ? FindExport(module, name, IsFunctionLike)?.Symbol : null;
+            foreach (var id in ScopeChain(r.FromSymbolId))
+            {
+                if (_byId[id].Kind is SymbolKind.Class or SymbolKind.Interface) continue;
+                if (_children[id].Where(s => s.Name == name && IsFunctionLike(s)).OrderBy(s => s.StartLine).FirstOrDefault() is { } hit) return hit;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// "返回值" 绑定里的路径指向的函数：f（import 的导出名 / 本文件的函数名）或 X.m（类 X 的静态方法 m；X 是 import 的导出名或本文件的类）。
+        /// </summary>
+        public SymbolRecord? ResolveReturnTarget(PendingReference r, string? source, string path)
+        {
+            var dot = path.LastIndexOf('.');
+            if (dot < 0) return ResolveFunction(r, source, path);
+            return ResolveType(r, source, path[..dot]) is { } owner ? DirectMember(owner, path[(dot + 1)..], IsFunctionLike) : null;
+        }
+
+        /// <summary>
+        /// 函数 fn 的返回值：仓库里的类 / 接口，或外部对象（External 是外部名字）；推不出返回 null。
+        /// 先看本次解析的 via = returns 提示（一条函数返回值提示会顺着被调函数接着推，最多 6 层），没有再读库里的 returns 边。
+        /// </summary>
+        public ReturnInfo? ReturnOf(SymbolRecord fn, int depth = 0)
+        {
+            if (depth > 6) return null;
+            if (_returnCache.TryGetValue(fn.Id, out var cached)) return cached;
+            _returnCache[fn.Id] = null; // 递归保护：a 返回 b()、b 返回 a()
+            ReturnInfo? result = null;
+            _returnHints ??= _pending.Where(p => p.Via == ScriptReturnsVia).ToLookup(p => p.FromSymbolId);
+            if (_returnHints.Contains(fn.Id))
+            {
+                foreach (var hint in _returnHints[fn.Id])
+                    if ((result = ResolveReturnHint(hint, depth)) is not null) break;
+            }
+            else if (_reader is not null)
+            {
+                foreach (var n in _reader.GetNeighbors(fn.Id, Direction.Outgoing, new HashSet<EdgeKind> { EdgeKind.References }))
+                {
+                    if (n.Edge.Via != ScriptReturnsVia || n.Other is not { } other) continue;
+                    if (other.Kind == SymbolKind.External) { result = new ReturnInfo(null, n.Edge.ToName["external:".Length..]); break; }
+                    if (other.Kind is SymbolKind.Class or SymbolKind.Interface) { result = new ReturnInfo(other, null); break; }
+                }
+            }
+            _returnCache[fn.Id] = result;
+            return result;
+        }
+
+        /// <summary>
+        /// 一条返回值提示指向什么：内建 / npm 包 → 外部；类型名 → 仓库里的类 / 接口；函数名（导出名后缀 "()"）→ 那个函数的返回值。
+        /// </summary>
+        public ReturnInfo? ResolveReturnHint(PendingReference h, int depth)
+        {
+            if (h.Script is not { } b) return null;
+            if (b.Receiver == ScriptReceiver.Other)
+            {
+                if (b.ImportSource == ScriptBuiltinMarker) return new ReturnInfo(null, b.ImportedName ?? h.Name);
+                if (b.ImportSource is { } marked && marked.StartsWith(ScriptPackageMarker, StringComparison.Ordinal))
+                {
+                    var package = marked[ScriptPackageMarker.Length..];
+                    return ResolveModule(h.FilePath, package) is null ? new ReturnInfo(null, package) : null;
+                }
+                return null;
+            }
+            var imported = b.ImportedName;
+            if (imported is not null && imported.EndsWith(ScriptReturnSuffix, StringComparison.Ordinal))
+            {
+                var path = imported[..^ScriptReturnSuffix.Length];
+                if (ResolveReturnTarget(h, b.ImportSource, path) is { } fn) return ReturnOf(fn, depth + 1);
+                return b.ImportSource is { } src && ResolveModule(h.FilePath, src) is null ? new ReturnInfo(null, PackageExternalName(src, path)) : null;
+            }
+            if (ResolveType(h, b.ImportSource, imported ?? h.Name) is { } type) return new ReturnInfo(type, null);
+            return b.ImportSource is { } typeSource && ResolveModule(h.FilePath, typeSource) is null
+                ? new ReturnInfo(null, PackageExternalName(typeSource, imported))
+                : null;
         }
 
         public SymbolRecord? ResolveModule(string fromFile, string specifier) => _modules.Resolve(fromFile, specifier);
@@ -165,6 +277,9 @@ public sealed partial class HeuristicEdgeResolver
         }
     }
 
+    /// <summary>函数返回值：仓库里的类 / 接口（Type），或外部对象（External 是外部名字，如 "Set"、"@tanstack/react-query.useQuery"）。</summary>
+    internal sealed record ReturnInfo(SymbolRecord? Type, string? External);
+
     private static readonly Regex ScriptExtendsPattern = new(@"\bextends\s+([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)", RegexOptions.Compiled);
     private static readonly Regex ScriptImplementsPattern = new(@"\bimplements\s+([^{]+)", RegexOptions.Compiled);
 
@@ -209,21 +324,60 @@ public sealed partial class HeuristicEdgeResolver
     /// <summary>
     /// 带绑定信息的脚本引用。返回 null 表示交给通用启发式（只有没有绑定、本文件也没有的类型名会这样：.d.ts 里的全局类型常见）。
     /// via = "event"（作为 onXxx 传出去的处理函数）：只保留解析到仓库符号的边，置信度封顶 0.9；解析不到（多半是 prop）不建边。
+    /// via = "callback"（作为实参 / 实参对象的属性值传出去的函数）：只保留连到仓库函数 / 方法的边，置信度封顶 0.85。
+    /// via = "returns"（函数的返回值提示）：存一条 函数 → 返回的类（或外部对象）的 references 边，推不出不存。
     /// </summary>
     private List<NewEdge>? ResolveScript(PendingReference r, List<SymbolRecord> candidates, ScriptIndex index, IndexWriter writer)
     {
+        if (r.Via == ScriptReturnsVia) return ResolveReturnHintEdge(r, index, writer);
         var edges = ResolveScriptBinding(r, candidates, index, writer);
+        if (r.Via == ScriptCallbackVia)
+            return edges?.Where(e => e.ToId is { } id && index.Symbol(id) is { Kind: SymbolKind.Function or SymbolKind.Method })
+                .Select(e => e with { Confidence = Math.Min(e.Confidence, ScriptCallbackConfidence) }).ToList() ?? [];
         if (r.Via != ScriptEventVia) return edges;
         return edges?.Select(e => e with { Confidence = Math.Min(e.Confidence, ScriptEventConfidence) }).ToList() ?? [];
     }
 
     public const string ScriptEventVia = "event";
     public const double ScriptEventConfidence = 0.9;
+    public const string ScriptCallbackVia = "callback";
+    public const double ScriptCallbackConfidence = 0.85;
+    public const string ScriptReturnsVia = "returns";
+    /// <summary>
+    /// returns 边是解析用的辅助边（增量索引时没重新解析的函数的返回值从库里读它），置信度压在各视图的 0.4 门槛以下：
+    /// 它表达的依赖本来就有（返回类型标注有 references 边、new X() / f() 有 calls 边），不该让 DSM / 模块关系多算一遍。
+    /// </summary>
+    public const double ScriptReturnsConfidence = 0.3;
+
+    /// <summary>接收者是内建 / 宿主对象（ScriptBinding.ImportSource 取这个值，ImportedName 是类型名）：方法调用归外部，不按名字连仓库方法。</summary>
+    public const string ScriptBuiltinMarker = "#builtin";
+    /// <summary>接收者是 import 进来的模块的 API 返回值（ImportSource = 这个前缀 + 模块说明符）：模块在仓库外归外部，在仓库里推不出。</summary>
+    public const string ScriptPackageMarker = "#pkg:";
+    /// <summary>Receiver = Typed 且 ImportedName 以它结尾：接收者是那个函数（import 的导出名 / 本文件的函数名）的返回值。</summary>
+    public const string ScriptReturnSuffix = "()";
+
+    /// <summary>接收者类型推不出、只能按方法名猜时的置信度：同文件唯一 0.6、import 范围唯一 0.5（以前是 0.9 / 0.7，Set.has 连到仓库的 has 就是这么来的）。</summary>
+    public const double ScriptUnknownReceiverSameFile = 0.6;
+    public const double ScriptUnknownReceiverImportScope = 0.5;
+
+    private static List<NewEdge> ResolveReturnHintEdge(PendingReference r, ScriptIndex index, IndexWriter writer)
+    {
+        switch (index.ResolveReturnHint(r, 0))
+        {
+            case { Type: { } type }:
+                return [Edge(r, type, ScriptReturnsConfidence)];
+            case { External: { } name }:
+                var ext = writer.GetOrCreateExternal(name);
+                return [new NewEdge(r.FromSymbolId, ext, "external:" + name, r.Kind, IndexSource.TreeSitter, ScriptReturnsConfidence, r.FileId, r.Line, Via: r.Via)];
+            default:
+                return [];
+        }
+    }
 
     private List<NewEdge>? ResolveScriptBinding(PendingReference r, List<SymbolRecord> candidates, ScriptIndex index, IndexWriter writer)
     {
         var b = r.Script!;
-        var isEvent = r.Via == ScriptEventVia;
+        var isEvent = r.Via is ScriptEventVia or ScriptCallbackVia;
         bool Accept(SymbolRecord s) => KindCompatible(r.Kind, s.Kind);
         List<NewEdge> External(string name)
         {
@@ -285,38 +439,69 @@ public sealed partial class HeuristicEdgeResolver
                 if (isEvent) return [];
                 goto default; // 更远的祖先 / 框架基类的成员：按未知接收者处理
             }
+            case ScriptReceiver.Typed when b.ImportedName is { } returned && returned.EndsWith(ScriptReturnSuffix, StringComparison.Ordinal):
+            {
+                // const api = useApi(); api.post()：接收者是 useApi 的返回值，看 useApi 返回什么（见 ScriptIndex.ReturnOf）
+                var fn = index.ResolveReturnTarget(r, b.ImportSource, returned[..^ScriptReturnSuffix.Length]);
+                if (fn is null)
+                {
+                    if (b.ImportSource is not null && index.ResolveModule(r.FilePath, b.ImportSource) is null) return External(r.Name); // npm 包函数的返回值
+                    goto default;
+                }
+                var ret = index.ReturnOf(fn);
+                if (ret is { External: not null }) return External(r.Name);
+                if (ret?.Type is not { } retType || MemberOfType(retType) is not { } viaReturn) goto default;
+                return viaReturn;
+            }
             case ScriptReceiver.Typed:
             {
-                // this.svc.x()：svc 的类型由构造参数属性 / 字段的类型标注给出
+                // this.svc.x() / panel.show()：类型由构造参数属性 / 字段 / 变量 / 参数的类型标注或 new X() 给出
                 var type = index.ResolveType(r, b.ImportSource, b.ImportedName!);
                 if (type is null)
                 {
                     if (b.ImportSource is not null && index.ResolveModule(r.FilePath, b.ImportSource) is null)
                         return External(PackageExternalName(b.ImportSource, b.ImportedName) + "." + r.Name); // 类型来自 npm 包
+                    // 本文件没有、仓库里也没有这个类型：语言 / DOM / 宿主类型（HTMLElement、Event），方法不是仓库的
+                    if (b.ImportSource is null && !index.HasRepoType(b.ImportedName!)) return External(r.Name);
                     goto default;
                 }
-                var member = index.DirectMember(type, r.Name, Accept);
-                if (member is null) goto default;
-                var edges = One(member, 0.9);
-                // 接口 / 抽象类且仓库里只有一个实现类：补一条到实现的派生边（与 C# / Java 的 impl 一致）
-                if (index.SingleImplementation(type) is { } impl && index.DirectMember(impl, r.Name, Accept) is { } implMember)
-                    edges.Add(Edge(r, implMember, 0.9) with { Via = ImplementationLinker.Via, EvidenceLine = r.Line });
-                return edges;
+                if (MemberOfType(type) is not { } typed) goto default;
+                return typed;
             }
+            case ScriptReceiver.Other when b.ImportSource == ScriptBuiltinMarker:
+                if (isEvent) return [];
+                return External(r.Name); // new Set().has()、Promise.resolve()、字面量：内建对象的方法
+            case ScriptReceiver.Other when b.ImportSource is { } marked && marked.StartsWith(ScriptPackageMarker, StringComparison.Ordinal)
+                                           && index.ResolveModule(r.FilePath, marked[ScriptPackageMarker.Length..]) is null:
+                return External(r.Name); // vscode.window.createStatusBarItem() 的返回值：npm 包 / 宿主 API 的对象
             default:
             {
                 if (r.Kind == EdgeKind.Calls && ScriptBuiltinMethodNames.Contains(r.Name)) return External(r.Name);
                 // x.y()：y 只能是对象 / 类的成员（方法）。组件里的局部函数 const has = …、顶层函数都不是谁的属性，不当候选
                 if (r.Kind == EdgeKind.Calls) candidates = candidates.Where(c => c.Kind == SymbolKind.Method).ToList();
+                // 接收者类型推不出（局部变量、参数、调用结果）：只凭方法名，置信度降一档，免得 has / get / show 这类常见名字连错后长出整棵调用方树
+                var unknown = b.Receiver == ScriptReceiver.Other
+                              || (b.Receiver == ScriptReceiver.Typed && b.ImportedName?.EndsWith(ScriptReturnSuffix, StringComparison.Ordinal) == true);
                 var sameFile = candidates.Where(c => c.FileId == r.FileId).ToList();
-                if (sameFile.Count == 1) return One(sameFile[0], 0.9);
+                if (sameFile.Count == 1) return One(sameFile[0], unknown ? ScriptUnknownReceiverSameFile : 0.9);
                 if (sameFile.Count > 1) return Many(sameFile);
                 var scope = index.ImportScope(r.FileId, r.FilePath);
                 var inScope = candidates.Where(c => scope.Contains(c.FileId)).ToList();
-                if (inScope.Count == 1) return One(inScope[0], 0.7);
+                if (inScope.Count == 1) return One(inScope[0], unknown ? ScriptUnknownReceiverImportScope : 0.7);
                 if (inScope.Count > 1) return Many(inScope);
                 return External(r.Name);
             }
+        }
+
+        // 类型的直接成员 0.9；接口 / 抽象类且仓库里只有一个实现类：补一条到实现的派生边（与 C# / Java 的 impl 一致）
+        List<NewEdge>? MemberOfType(SymbolRecord type)
+        {
+            var member = index.DirectMember(type, r.Name, Accept);
+            if (member is null) return null;
+            var edges = One(member, 0.9);
+            if (index.SingleImplementation(type) is { } impl && index.DirectMember(impl, r.Name, Accept) is { } implMember)
+                edges.Add(Edge(r, implMember, 0.9) with { Via = ImplementationLinker.Via, EvidenceLine = r.Line });
+            return edges;
         }
     }
 

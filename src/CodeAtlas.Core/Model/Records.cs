@@ -1,6 +1,7 @@
 namespace CodeAtlas.Core.Model;
 
-public sealed record FileRecord(long Id, string Path, string Language, string Hash, long Size, DateTimeOffset IndexedAt, FileStatus Status, DateTimeOffset? RoslynAt = null);
+public sealed record FileRecord(long Id, string Path, string Language, string Hash, long Size, DateTimeOffset IndexedAt, FileStatus Status, DateTimeOffset? RoslynAt = null,
+    long? Mtime = null);
 
 public sealed record SymbolRecord(
     long Id, long FileId, SymbolKind Kind, string Name, string QualifiedName, string? Signature,

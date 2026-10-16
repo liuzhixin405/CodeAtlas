@@ -4,7 +4,8 @@ namespace CodeAtlas.Core.Architecture;
 
 /// <summary>
 /// 容器 = 可部署单元：非测试的可执行 .NET 项目（Web / Worker / Exe，成员 = 传递项目引用）、前端应用、
-/// Go 的 main 包目录（成员 = 所在模块）、可部署的 Python 项目、Node 后端服务与命令行工具（package.json 的 bin）、可部署的 Java 模块（成员 = 自己 + 依赖的本仓库模块）。
+/// Go 的 main 包目录（成员 = 所在模块）、可部署的 Python 项目、Node 后端服务与命令行工具（package.json 的 bin）、VS Code 扩展（engines.vscode）、
+/// 可部署的 Java 模块（成员 = 自己 + 依赖的本仓库模块）。
 /// </summary>
 public static class ContainerDiscovery
 {
@@ -54,9 +55,12 @@ public static class ContainerDiscovery
         }
         foreach (var n in inv.NodeServices)
         {
-            var evidence = new List<Evidence> { new(n.File, null, n.IsCli ? "bin（命令行）" : $"server={n.Server}") };
+            var evidence = new List<Evidence> { new(n.File, null, n.IsVsCodeExtension ? "engines.vscode（VS Code 扩展）" : n.IsCli ? "bin（命令行）" : $"server={n.Server}") };
             if (n.Dockerfile is not null) evidence.Add(new Evidence(n.Dockerfile));
-            AddUnique(nodes, new ArchNode(Key(n.Dir, n.Name), ArchNodeKind.Container, n.IsCli ? "node-cli" : "node-service", n.Name, n.Dir, ArchSource.Discovered, evidence, [n.Dir], n.Ports));
+            evidence.AddRange(n.PortEvidence ?? []);
+            // VS Code 扩展：扩展宿主与 webview 在同一目录下，合成一个容器
+            var subKind = n.IsVsCodeExtension ? "vscode-extension" : n.IsCli ? "node-cli" : "node-service";
+            AddUnique(nodes, new ArchNode(Key(n.Dir, n.Name), ArchNodeKind.Container, subKind, n.Name, n.Dir, ArchSource.Discovered, evidence, [n.Dir], n.Ports));
         }
         var javaRefs = inv.JavaModules.ToDictionary(m => m.Dir, m => m.ModuleRefs, StringComparer.Ordinal);
         foreach (var m in inv.JavaModules.Where(m => m.DeployEvidence.Count > 0))
@@ -75,8 +79,12 @@ public static class ContainerDiscovery
             }
             AddUnique(nodes, new ArchNode(Key(m.Dir, m.Name), ArchNodeKind.Container, "java-service", m.Name, m.Dir, ArchSource.Discovered, evidence, members.ToList(), m.Ports));
         }
-        return nodes.OrderBy(n => n.Key, StringComparer.Ordinal).ToList();
+        // 测试树下的"服务"（tests/…/Fixtures/go 的 main、测试夹具里的 Exe）不是可部署单元：目录按测试路径规则判（与测试文件同一条）
+        return nodes.Where(n => !InTestTree(n.Path)).OrderBy(n => n.Key, StringComparer.Ordinal).ToList();
     }
+
+    /// <summary>目录在测试树下：某一段是 tests / test / __tests__ / spec / specs，或 Xxx.Tests 这类项目目录。</summary>
+    public static bool InTestTree(string? dir) => !string.IsNullOrEmpty(dir) && RuleContext.IsTestFile(dir.TrimEnd('/') + "/");
 
     /// <summary>可执行判定：Sdk.Web → dotnet-web；Sdk.Worker → dotnet-worker；OutputType Exe / WinExe → dotnet-exe；其余是库。</summary>
     internal static string? SubKindOf(CsProject p)

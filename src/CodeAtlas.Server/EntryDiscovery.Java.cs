@@ -81,6 +81,38 @@ public static partial class EntryDiscovery
             foreach (var c in Owners(m.Path)) scan.Add(new EntryPoint(m.Id, c.Key, ruleId, kind, route, method, m.Path, m.StartLine));
         }
 
+        // GraphQL 模式文件（DGS 默认 src/main/resources/schema/）：codegen 的常量 PROFILE.TYPE_NAME / QUERY.Feed 不在仓库里，按模式把大小写还原成 Profile / feed
+        var schemaCache = new Dictionary<string, Dictionary<string, (string Name, Dictionary<string, string> Fields)>>(StringComparer.Ordinal);
+        Dictionary<string, (string Name, Dictionary<string, string> Fields)> SchemaOf(string javaFile)
+        {
+            var at = javaFile.IndexOf("src/main/java/", StringComparison.Ordinal);
+            var root = at >= 0 ? javaFile[..at] : "";
+            if (schemaCache.TryGetValue(root, out var cached)) return cached;
+            var types = new Dictionary<string, (string Name, Dictionary<string, string> Fields)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rel in new[] { "schema/schema.graphqls", "schema/schema.graphql", "graphql/schema.graphqls", "graphql/schema.graphql" })
+            {
+                string? current = null;
+                foreach (var line in scan.ReadLines(root + "src/main/resources/" + rel))
+                {
+                    var t = line.Trim();
+                    if (Regex.Match(t, @"^(?:extend\s+)?(?:type|interface|input)\s+(\w+)") is { Success: true } head)
+                    {
+                        current = head.Groups[1].Value;
+                        if (!types.ContainsKey(current)) types[current] = (current, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+                        if (t.Contains('}')) current = null; // type X {} 一行写完
+                        continue;
+                    }
+                    if (t.StartsWith('}')) { current = null; continue; }
+                    if (current is not null && Regex.Match(t, @"^(\w+)\s*[(:]") is { Success: true } f) types[current].Fields.TryAdd(f.Groups[1].Value, f.Groups[1].Value);
+                }
+            }
+            return schemaCache[root] = types;
+        }
+        string SchemaTypeName(string javaFile, string token) =>
+            SchemaOf(javaFile).TryGetValue(token, out var t) ? t.Name : token.All(c => !char.IsLower(c)) ? token[..1] + token[1..].ToLowerInvariant() : token;
+        string SchemaFieldName(string javaFile, string typeToken, string token) =>
+            SchemaOf(javaFile).TryGetValue(typeToken, out var t) && t.Fields.TryGetValue(token, out var f) ? f : char.ToLowerInvariant(token[0]) + token[1..];
+
         var hosted = new List<(MapSymbol Main, bool SpringBoot)>();
         var picocli = new List<(MapSymbol Type, string Name, List<string> Subcommands, MapSymbol? Handler, List<(MapSymbol Method, string Name)> Methods)>();
         foreach (var type in javaSymbols.Where(s => s.Kind is SymbolKind.Class or SymbolKind.Interface or SymbolKind.Enum).OrderBy(s => s.Path, StringComparer.Ordinal).ThenBy(s => s.StartLine))
@@ -129,6 +161,32 @@ public static partial class EntryDiscovery
                 foreach (var m in methods.Where(m => m.Visibility is null or "public"))
                     if (JavaSource.Signature(lines, m.StartLine, m.Name).Contains("StreamObserver", StringComparison.Ordinal))
                         AddAll(m, "java.grpc", "grpc", service + "/" + JavaSource.Pascal(m.Name), null);
+            }
+
+            // ── GraphQL：Netflix DGS（@DgsComponent 类的 @DgsQuery / @DgsMutation / @DgsSubscription / @DgsData）与 Spring for GraphQL（@Controller 类的 @QueryMapping / @MutationMapping / @SchemaMapping …）──
+            if (type.Kind == SymbolKind.Class && (Has(typeAnnotations, "DgsComponent") || typeAnnotations.Any(a => SpringControllers.Contains(a.Name))))
+            {
+                var classSchemaType = Find(typeAnnotations, "SchemaMapping") is { } csm ? GraphQlName(csm.Args, constant, keywordOnly: true, "typeName") : null;
+                foreach (var m in methods)
+                    foreach (var a in fileAnnotations.Of(m.StartLine))
+                    {
+                        string? parent = a.Name switch
+                        {
+                            "DgsQuery" or "QueryMapping" => "Query",
+                            "DgsMutation" or "MutationMapping" => "Mutation",
+                            "DgsSubscription" or "SubscriptionMapping" => "Subscription",
+                            "DgsData" => GraphQlName(a.Args, constant, keywordOnly: true, "parentType"),
+                            "SchemaMapping" or "BatchMapping" => GraphQlName(a.Args, constant, keywordOnly: true, "typeName") ?? classSchemaType,
+                            _ => null,
+                        };
+                        if (parent is null) continue;
+                        // field 没写时是方法名（DGS 与 Spring 都这么约定）；Spring 的 @QueryMapping("x") 位置参数也是字段名
+                        var field = a.Name.StartsWith("Dgs", StringComparison.Ordinal)
+                            ? GraphQlName(a.Args, constant, keywordOnly: false, "field")
+                            : GraphQlName(a.Args, constant, keywordOnly: false, a.Name is "SchemaMapping" or "BatchMapping" ? "field" : "name", "value", "field");
+                        AddAll(m, a.Name.StartsWith("Dgs", StringComparison.Ordinal) ? "java.dgs" : "java.spring-graphql", "http",
+                            "graphql:" + SchemaTypeName(type.Path, parent) + "." + SchemaFieldName(type.Path, parent, field ?? m.Name), null);
+                    }
             }
 
             // ── 定时任务与消息监听（任意类）──
@@ -256,12 +314,35 @@ public static partial class EntryDiscovery
             foreach (var (m, name) in p.Methods) AddAll(m, "java.picocli", "command", path.Length > 0 ? path + " " + name : name, null);
         }
 
-        // 容器里有 Spring Boot 的 main 就只认它；没有才认其余的 static main（工具类的 main 不抢启动入口）
+        // 容器里有 Spring Boot 的 main 就只认它；没有才认其余的 static main（工具类的 main 不抢启动入口）。
+        // XxxClient 类的 main 是调本服务的示例 / 测试客户端（AdServiceClient）：同容器里另有别的 main（真正的服务端）时不算入口
+        bool IsClientMain(MapSymbol main) => main.ParentId is { } p && scan.ById.TryGetValue(p, out var t) && t.Name.EndsWith("Client", StringComparison.Ordinal);
         foreach (var (main, springBoot) in hosted)
             foreach (var c in Owners(main.Path))
             {
                 if (!springBoot && hosted.Any(h => h.SpringBoot && Owners(h.Main.Path).Any(o => o.Key == c.Key))) continue;
+                if (IsClientMain(main) && hosted.Any(h => !IsClientMain(h.Main) && Owners(h.Main.Path).Any(o => o.Key == c.Key))) continue;
                 scan.Add(new EntryPoint(main.Id, c.Key, springBoot ? "java.spring-boot" : "java.main", "hosted", c.Name, null, main.Path, main.StartLine));
             }
+    }
+
+    /// <summary>
+    /// GraphQL 注解里的类型名 / 字段名：字面量（"Query"）与仓库内常量照常求值；codegen 常量（不在仓库里）取名字本身——
+    /// PROFILE.TYPE_NAME → PROFILE、DgsConstants.QUERY_TYPE → Query、QUERY.Feed → Feed（大小写由调用方按模式还原）。keywordOnly 时不取位置参数。
+    /// </summary>
+    private static string? GraphQlName(string? args, Func<string, string?> constant, bool keywordOnly, params string[] keys)
+    {
+        string? expr = null;
+        if (keywordOnly) { foreach (var k in keys) if ((expr = JavaSource.Keyword(args, k)) is not null) break; }
+        else expr = JavaSource.Values(args, _ => null, keys).Select(v => v.Raw).FirstOrDefault();
+        if (expr is null) return null;
+        expr = expr.Trim();
+        if (JavaSource.Eval(expr, constant) is { Length: > 0 } value) return value;
+        var parts = expr.Split('.', StringSplitOptions.TrimEntries);
+        if (!parts.All(p => Regex.IsMatch(p, @"^\w+$"))) return null;
+        var last = parts[^1];
+        if (last == "TYPE_NAME" && parts.Length >= 2) return parts[^2];
+        if (last.EndsWith("_TYPE", StringComparison.Ordinal) && last.Length > 5) return last[..1] + last[1..^5].ToLowerInvariant();
+        return last;
     }
 }

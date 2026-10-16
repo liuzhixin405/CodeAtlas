@@ -47,8 +47,11 @@ public sealed class IndexDatabase : IDisposable
     /// 9：加入 Java；TS/JS 认 CommonJS require / exports、memo / forwardRef、onX 事件边、this.字段 按类型；Go / Python 按字段、链式、局部变量类型解析，
     ///    外部调用带包名；C# 的 tree-sitter 解析修正；Roslyn 绑不上的行保留 ≥0.7 的启发式调用边。已有语言的边都变了，必须全量重建。
     /// 10：edges.pos / edges.ctx——调用名的字符偏移与所在控制结构（循环 / 条件 / try / catch / 回调），调用大纲按偏移排序并在行尾标注。旧边没有这两列的值，必须全量重建。
+    /// 11：handles 只认分派器的 Handler 接口（后台作业 / 对比 Handler 不算），DI 闭合注册的开放泛型 Handler、转发参数的分派、按基类型 Publish 的分派；
+    ///     TS 按接收者类型解析（内建 / 宿主对象不连仓库同名方法）、回调传出的函数建 via=callback 边、函数返回值提示（via=returns）。已有语言的边都变了，必须全量重建。
+    /// 12：持久化原始引用，增量重绑定与精确边失效处理；旧索引缺少原始引用，必须全量重建。
     /// </summary>
-    public const long CurrentIndexVersion = 10;
+    public const long CurrentIndexVersion = 12;
 
     /// <summary>库是旧版本建的，内容与当前解析规则不一致。</summary>
     public bool NeedsRebuild { get; private set; }
@@ -69,6 +72,13 @@ public sealed class IndexDatabase : IDisposable
     {
         var fileColumns = Query<string>("SELECT name FROM pragma_table_info('files')");
         if (!fileColumns.Contains("roslyn_at")) Execute("ALTER TABLE files ADD COLUMN roslyn_at TEXT");
+        // 增量索引用（不改解析规则，旧库补列即可，不需要重建）：
+        // mtime——上次读到的最后修改时间（UTC ticks），大小与 mtime 都没变就不读文件、不算哈希；
+        // roslyn_sln——最近一次覆盖这个文件的解决方案（相对主根，'/' 分隔），增量时只开它；
+        // roslyn_miss——Roslyn 试过、不在任何解决方案里时的文件哈希；哈希没变就不再算"待 Roslyn"
+        if (!fileColumns.Contains("mtime")) Execute("ALTER TABLE files ADD COLUMN mtime INTEGER");
+        if (!fileColumns.Contains("roslyn_sln")) Execute("ALTER TABLE files ADD COLUMN roslyn_sln TEXT");
+        if (!fileColumns.Contains("roslyn_miss")) Execute("ALTER TABLE files ADD COLUMN roslyn_miss TEXT");
         var edgeColumns = Query<string>("SELECT name FROM pragma_table_info('edges')");
         if (!edgeColumns.Contains("pos")) Execute("ALTER TABLE edges ADD COLUMN pos INTEGER");
         if (!edgeColumns.Contains("ctx")) Execute("ALTER TABLE edges ADD COLUMN ctx TEXT");

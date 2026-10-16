@@ -3,7 +3,8 @@ using CodeAtlas.Core.Workspace;
 namespace CodeAtlas.Indexing.TreeSitter;
 
 /// <param name="RelativePath">相对主根，'/' 分隔；外部根的文件形如 ../other/src/a.ts。</param>
-public sealed record ScannedFile(string RelativePath, string FullPath, string Language, long Size);
+/// <param name="Mtime">最后修改时间（UTC ticks）；0 = 未知。</param>
+public sealed record ScannedFile(string RelativePath, string FullPath, string Language, long Size, long Mtime = 0);
 
 /// <summary>
 /// 按扩展名枚举仓库文件，跳过排除目录与重解析点（符号链接、junction）。
@@ -44,7 +45,7 @@ public sealed class RepositoryScanner(IReadOnlyDictionary<string, string> extens
                     if (entry is not FileInfo file) continue;
                     if (!extensionToLanguage.TryGetValue(file.Extension, out var language)) continue;
                     if (!seen.Add(file.FullName)) continue;
-                    yield return new ScannedFile(roots.Relative(file.FullName), file.FullName, language, file.Length);
+                    yield return new ScannedFile(roots.Relative(file.FullName), file.FullName, language, file.Length, file.LastWriteTimeUtc.Ticks);
                 }
             }
         }

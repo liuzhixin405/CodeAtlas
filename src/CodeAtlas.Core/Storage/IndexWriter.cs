@@ -1,4 +1,5 @@
 using CodeAtlas.Core.Model;
+using CodeAtlas.Core.Resolution;
 
 namespace CodeAtlas.Core.Storage;
 
@@ -6,24 +7,39 @@ public sealed class IndexWriter(IndexDatabase db)
 {
     public const string ExternalFilePath = "<external>";
 
-    public long UpsertFile(string path, string language, string hash, long size, FileStatus status)
+    /// <param name="mtime">读到内容时文件的最后修改时间（UTC ticks）；null = 未知，下次增量照常读文件算哈希。</param>
+    public long UpsertFile(string path, string language, string hash, long size, FileStatus status, long? mtime = null)
     {
         return db.Scalar<long>("""
-            INSERT INTO files (path, language, hash, size, indexed_at, status)
-            VALUES ($path, $language, $hash, $size, $now, $status)
+            INSERT INTO files (path, language, hash, size, indexed_at, status, mtime)
+            VALUES ($path, $language, $hash, $size, $now, $status, $mtime)
             ON CONFLICT(path) DO UPDATE SET
                 language = excluded.language, hash = excluded.hash, size = excluded.size,
-                indexed_at = excluded.indexed_at, status = excluded.status,
+                indexed_at = excluded.indexed_at, status = excluded.status, mtime = excluded.mtime,
                 roslyn_at = NULL
             RETURNING id;
             """,
             ("$path", path), ("$language", language), ("$hash", hash), ("$size", size),
-            ("$now", DateTimeOffset.UtcNow.ToString("O")), ("$status", DbNames.ToDb(status)));
+            ("$now", DateTimeOffset.UtcNow.ToString("O")), ("$status", DbNames.ToDb(status)), ("$mtime", mtime));
     }
+
+    /// <summary>内容没变（哈希一致）但 mtime 不同或旧库没有 mtime：只补写 mtime，下次就能不读文件直接跳过。</summary>
+    public void SetMtime(long fileId, long mtime) =>
+        db.Execute("UPDATE files SET mtime = $m WHERE id = $id", ("$m", mtime), ("$id", fileId));
 
     /// <summary>删除文件的符号、import 和从它出发的边（级联）；指向它的边变为悬空（to_id 置 NULL）。文件行保留。</summary>
     public void DeleteFileContents(long fileId)
     {
+        db.Execute("""
+            UPDATE files SET roslyn_at = NULL WHERE id IN (
+                SELECT e.file_id FROM edges e JOIN symbols s ON s.id = e.to_id
+                WHERE s.file_id = $f AND e.source = 'roslyn'
+                UNION
+                -- DI 注册（AddScoped<IRepo, Repo>()）没有指向实现的边，删符号会级联删掉注册行，注册所在文件要重走 Roslyn 才补得回来
+                SELECT d.file_id FROM di_registrations d JOIN symbols s ON s.id = d.interface_id OR s.id = d.impl_id
+                WHERE s.file_id = $f
+            )
+            """, ("$f", fileId));
         db.Execute("DELETE FROM symbols WHERE file_id = $f", ("$f", fileId));
         db.Execute("DELETE FROM imports WHERE file_id = $f", ("$f", fileId));
     }
@@ -80,6 +96,31 @@ public sealed class IndexWriter(IndexDatabase db)
         }
     }
 
+    public void WriteReferences(IEnumerable<PendingReference> references)
+    {
+        using var cmd = db.CreateCommand("""
+            INSERT INTO source_references (from_id, file_id, name, kind, line, via, receiver, import_source, imported_name, pos, ctx)
+            VALUES ($from, $file, $name, $kind, $line, $via, $receiver, $source, $imported, $pos, $ctx)
+            """);
+        foreach (var name in new[] { "$from", "$file", "$name", "$kind", "$line", "$via", "$receiver", "$source", "$imported", "$pos", "$ctx" })
+            cmd.Parameters.AddWithValue(name, DBNull.Value);
+        foreach (var reference in references)
+        {
+            cmd.Parameters["$from"].Value = reference.FromSymbolId;
+            cmd.Parameters["$file"].Value = reference.FileId;
+            cmd.Parameters["$name"].Value = reference.Name;
+            cmd.Parameters["$kind"].Value = DbNames.ToDb(reference.Kind);
+            cmd.Parameters["$line"].Value = reference.Line;
+            cmd.Parameters["$via"].Value = (object?)reference.Via ?? DBNull.Value;
+            cmd.Parameters["$receiver"].Value = reference.Script is { } script ? (int)script.Receiver : DBNull.Value;
+            cmd.Parameters["$source"].Value = (object?)reference.Script?.ImportSource ?? DBNull.Value;
+            cmd.Parameters["$imported"].Value = (object?)reference.Script?.ImportedName ?? DBNull.Value;
+            cmd.Parameters["$pos"].Value = reference.Pos;
+            cmd.Parameters["$ctx"].Value = (object?)reference.Context ?? DBNull.Value;
+            cmd.ExecuteNonQuery();
+        }
+    }
+
     public void WriteEdges(IEnumerable<NewEdge> edges)
     {
         using var cmd = db.CreateCommand("""
@@ -111,6 +152,38 @@ public sealed class IndexWriter(IndexDatabase db)
             INSERT INTO symbols (file_id, kind, name, qualified_name, start_line, start_col, end_line, end_col, source)
             VALUES ($f, 'external', $n, $q, 0, 0, 0, 0, 'treesitter') RETURNING id;
             """, ("$f", fileId), ("$n", name), ("$q", qname));
+    }
+
+    /// <summary>
+    /// 同一调用处（from, kind, line, pos）既有悬空边又解析出了仓库内目标：删悬空边；只解析出 external：删 external、留悬空边等目标回来再挂。
+    /// fileIds 给出时只处理这些文件里的边（增量只重解析了它们）。
+    /// </summary>
+    public void ReconcileResolvedReferences(IReadOnlyCollection<long>? fileIds = null)
+    {
+        var dangling = "";
+        var fallback = "";
+        if (fileIds is not null)
+        {
+            IndexReader.FillTempIds(db, "reconcile_files", fileIds);
+            dangling = "AND dangling.file_id IN (SELECT id FROM temp.reconcile_files)";
+            fallback = "AND fallback.file_id IN (SELECT id FROM temp.reconcile_files)";
+        }
+        db.Execute($"""
+            DELETE FROM edges AS dangling WHERE dangling.to_id IS NULL AND dangling.kind <> 'contains' {dangling}
+                AND EXISTS (
+                    SELECT 1 FROM edges bound JOIN symbols target ON target.id = bound.to_id
+                    WHERE bound.from_id = dangling.from_id AND bound.kind = dangling.kind
+                        AND bound.line = dangling.line AND COALESCE(bound.pos, -1) = COALESCE(dangling.pos, -1)
+                        AND target.kind <> 'external'
+                );
+            DELETE FROM edges AS fallback WHERE fallback.source = 'treesitter' {fallback}
+                AND fallback.to_id IN (SELECT id FROM symbols WHERE kind = 'external')
+                AND EXISTS (
+                    SELECT 1 FROM edges dangling WHERE dangling.to_id IS NULL
+                        AND dangling.from_id = fallback.from_id AND dangling.kind = fallback.kind
+                        AND dangling.line = fallback.line AND COALESCE(dangling.pos, -1) = COALESCE(fallback.pos, -1)
+                );
+            """);
     }
 
     /// <summary>把悬空边按 to_name 重新挂到唯一匹配的符号上。返回重挂数量。</summary>

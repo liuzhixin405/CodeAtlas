@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 using CodeAtlas.Core.Workspace;
 
@@ -6,7 +6,9 @@ namespace CodeAtlas.Core.Architecture;
 
 /// <param name="Path">相对仓库根，'/' 分隔；嵌套 git 仓库的文件带子目录前缀。</param>
 /// <param name="Revisions">改过它的提交数。</param>
-public sealed record GitFileStats(string Path, int Revisions, int Added, int Deleted, DateOnly FirstCommit, DateOnly LastCommit, int Authors);
+/// <param name="Commits">改过它的提交（短哈希，嵌套仓库带路径前缀以免撞号）；从库里读回的统计没有，为 null。
+/// 多个文件合起来算"涉及多少次提交"要按它去重——各文件 Revisions 相加是"文件修订合计"，同一次提交改了 N 个文件会算 N 次。</param>
+public sealed record GitFileStats(string Path, int Revisions, int Added, int Deleted, DateOnly FirstCommit, DateOnly LastCommit, int Authors, IReadOnlyList<string>? Commits = null);
 
 /// <param name="Degree">共同修订 ÷ 两个文件的平均修订数。</param>
 public sealed record GitCoupling(string PathA, string PathB, int Shared, double Degree);
@@ -29,6 +31,7 @@ public static class GitHistory
     {
         public int Revisions; public int Added; public int Deleted; public DateOnly First = DateOnly.MaxValue; public DateOnly Last = DateOnly.MinValue;
         public HashSet<string> Authors = new(StringComparer.Ordinal);
+        public List<string> Commits = [];
     }
 
     /// <summary>解析一段 git log 文本。prefix 加在每个路径前（嵌套仓库）。</summary>
@@ -41,6 +44,7 @@ public static class GitHistory
         var current = new List<string>();
         DateOnly date = default;
         string author = "";
+        string hash = "";
 
         void Flush()
         {
@@ -65,6 +69,7 @@ public static class GitHistory
                 var parts = line.Split("--", StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length < 2 || !DateOnly.TryParseExact(parts[1], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out date)) { date = default; continue; }
                 author = parts.Length > 2 ? parts[2] : "";
+                hash = prefix + parts[0];
                 commits++;
                 continue;
             }
@@ -79,11 +84,12 @@ public static class GitHistory
             if (date < acc.First) acc.First = date;
             if (date > acc.Last) acc.Last = date;
             if (author.Length > 0) acc.Authors.Add(author);
+            acc.Commits.Add(hash);
             current.Add(path);
         }
         Flush();
 
-        var stats = files.Select(p => new GitFileStats(p.Key, p.Value.Revisions, p.Value.Added, p.Value.Deleted, p.Value.First, p.Value.Last, p.Value.Authors.Count))
+        var stats = files.Select(p => new GitFileStats(p.Key, p.Value.Revisions, p.Value.Added, p.Value.Deleted, p.Value.First, p.Value.Last, p.Value.Authors.Count, p.Value.Commits))
             .OrderBy(s => s.Path, StringComparer.Ordinal).ToList();
         var coupling = new List<GitCoupling>();
         foreach (var ((a, b), shared) in pairs)
@@ -113,27 +119,106 @@ public static class GitHistory
     public static GitHistoryResult Run(ProjectRoots roots, TimeSpan? timeout = null) =>
         RunTargets(roots.Repositories().Select(r => (r.FullPath, r.Prefix, IsMain: r.Prefix.Length == 0)).ToList(), timeout);
 
+    /// <summary>各仓库并行跑 git log 与解析（ccs-backend 主仓库 + 两个嵌套仓库），结果按 targets 的顺序合并，与串行时一致。</summary>
     private static GitHistoryResult RunTargets(IReadOnlyList<(string Dir, string Prefix, bool IsMain)> targets, TimeSpan? timeout)
     {
+        var results = new (GitHistoryResult? Result, string? Error)[targets.Count];
+        Parallel.For(0, targets.Count, i =>
+        {
+            var (dir, prefix, _) = targets[i];
+            var (output, error) = RunGit(dir, LogArguments, timeout ?? TimeSpan.FromMinutes(2));
+            results[i] = error is null ? (Parse(output, prefix), null) : (null, error);
+        });
         var all = new List<GitFileStats>();
         var coupling = new List<GitCoupling>();
         var commits = 0;
         var skipped = 0;
-        foreach (var (dir, prefix, isMain) in targets)
+        for (var i = 0; i < targets.Count; i++)
         {
-            var (output, error) = RunGit(dir, LogArguments, timeout ?? TimeSpan.FromMinutes(2));
-            if (error is not null) { if (isMain) return new GitHistoryResult([], [], 0, 0, error); continue; }
-            var r = Parse(output, prefix);
+            var (r, error) = results[i];
+            if (r is null) { if (targets[i].IsMain) return new GitHistoryResult([], [], 0, 0, error); continue; }
             all.AddRange(r.Files); coupling.AddRange(r.Coupling); commits += r.Commits; skipped += r.CommitsSkippedForCoupling;
         }
         return new GitHistoryResult(all, coupling, commits, skipped, null);
+    }
+
+    /// <summary>
+    /// git 统计的输入指纹：每个仓库（主根、外部根、被纳入的嵌套仓库）里决定 <c>git log --all</c> 结果的东西——HEAD 与全部 ref
+    /// （分支 / 标签 / 远端 / stash；只看 HEAD 不够：fetch 下来的远端分支、别的本地分支也在 --all 里）、浅克隆边界、grafts，
+    /// 加上仓库根 .mailmap（%aN 按它归并作者名）。统计只看提交历史，工作区里没提交的改动不影响结果，所以不进指纹。
+    /// 不起 git 进程：读 .git 里的 HEAD、packed-refs、refs/**、reftable/**、shallow、info/grafts 的内容（任何 ref 变动都会改写这些文件；
+    /// Windows 上起一次 git 进程要 0.3s 以上）。.git 认不出时退回 <c>git show-ref --head</c>；那也失败（没有 git、不是仓库）返回 null，调用方照常全量重算。
+    /// </summary>
+    public static string? RefsFingerprint(ProjectRoots roots, TimeSpan? timeout = null)
+    {
+        var repos = roots.Repositories().ToList();
+        var parts = new string?[repos.Count];
+        Parallel.For(0, repos.Count, i =>
+        {
+            var state = RefFilesState(repos[i].FullPath);
+            if (state is null)
+            {
+                var (output, error) = RunGit(repos[i].FullPath, "show-ref --head", timeout ?? TimeSpan.FromSeconds(30), okExitCodes: [0, 1]); // 1 = 没有任何 ref（空仓库）
+                if (error is not null) return;
+                state = "show-ref|" + output.Replace("\r", "");
+            }
+            var mailmap = new FileInfo(Path.Combine(repos[i].FullPath, ".mailmap"));
+            parts[i] = repos[i].Prefix + "\n" + state + "\nmailmap " + (mailmap.Exists ? mailmap.Length + " " + mailmap.LastWriteTimeUtc.Ticks : "-");
+        });
+        if (parts.Any(p => p is null)) return null;
+        var bytes = System.Text.Encoding.UTF8.GetBytes(LogArguments + "\n" + string.Join("\n--\n", parts));
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes));
+    }
+
+    /// <summary>
+    /// 仓库的 ref 文件状态（路径 + 内容哈希）。.git 是目录（普通克隆）或 "gitdir: …" 文件（子模块 / worktree，后者再按 commondir 找共享的 ref）。
+    /// 认不出返回 null。
+    /// </summary>
+    private static string? RefFilesState(string repoDir)
+    {
+        try
+        {
+            var dotGit = Path.Combine(repoDir, ".git");
+            string gitDir;
+            if (Directory.Exists(dotGit)) gitDir = dotGit;
+            else if (File.Exists(dotGit))
+            {
+                var line = File.ReadAllText(dotGit).Trim();
+                if (!line.StartsWith("gitdir:", StringComparison.Ordinal)) return null;
+                gitDir = Path.GetFullPath(Path.Combine(repoDir, line["gitdir:".Length..].Trim()));
+            }
+            else return null;
+            if (!File.Exists(Path.Combine(gitDir, "HEAD"))) return null;
+            var commonFile = Path.Combine(gitDir, "commondir");
+            var common = File.Exists(commonFile) ? Path.GetFullPath(Path.Combine(gitDir, File.ReadAllText(commonFile).Trim())) : gitDir;
+            var sb = new System.Text.StringBuilder();
+            void Stat(string full)
+            {
+                // 读内容而不是看修改时间：ref 文件只有几十字节，连续两次提交写出的大小相同、修改时间在 Windows 上可能落在同一个时钟刻度里
+                sb.Append(full).Append('|').Append(File.Exists(full) ? Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(full))) : "-").Append('\n');
+            }
+            void StatTree(string dir)
+            {
+                if (!Directory.Exists(dir)) { sb.Append(dir).Append("|-\n"); return; }
+                foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal)) Stat(f);
+            }
+            Stat(Path.Combine(gitDir, "HEAD"));
+            if (!string.Equals(gitDir, common, StringComparison.OrdinalIgnoreCase)) StatTree(Path.Combine(gitDir, "refs"));
+            Stat(Path.Combine(common, "packed-refs"));
+            StatTree(Path.Combine(common, "refs"));
+            StatTree(Path.Combine(common, "reftable"));
+            Stat(Path.Combine(common, "shallow"));
+            Stat(Path.Combine(common, "info", "grafts"));
+            return sb.ToString();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return null; }
     }
 
     /// <summary>root 下（不含 root 本身）被纳入的嵌套仓库（独立克隆 / 子模块，不含 worktree），相对路径；跳过点目录与 node_modules 等。</summary>
     public static List<string> FindNestedRepos(string root) =>
         ProjectRoots.Single(root).Repositories().Where(r => r.IsNested).Select(r => r.Prefix.TrimEnd('/')).ToList();
 
-    private static (string Output, string? Error) RunGit(string dir, string args, TimeSpan timeout)
+    private static (string Output, string? Error) RunGit(string dir, string args, TimeSpan timeout, int[]? okExitCodes = null)
     {
         try
         {
@@ -142,10 +227,10 @@ public static class GitHistory
             if (p is null) return ("", "无法启动 git");
             var outTask = p.StandardOutput.ReadToEndAsync();
             var errTask = p.StandardError.ReadToEndAsync();
-            if (!p.WaitForExit((int)timeout.TotalMilliseconds)) { try { p.Kill(true); } catch { } return ("", "git log 超时"); }
+            if (!p.WaitForExit((int)timeout.TotalMilliseconds)) { try { p.Kill(true); } catch { } return ("", $"git {args.Split(' ')[0]} 超时"); }
             var output = outTask.GetAwaiter().GetResult();
             var err = errTask.GetAwaiter().GetResult();
-            if (p.ExitCode != 0) return ("", $"git 退出码 {p.ExitCode}：{err.Trim()}");
+            if (!(okExitCodes ?? [0]).Contains(p.ExitCode)) return ("", $"git 退出码 {p.ExitCode}：{err.Trim()}");
             return (output, null);
         }
         catch (System.ComponentModel.Win32Exception) { return ("", "没有找到 git 可执行文件"); }

@@ -68,7 +68,10 @@ public static class ServerHost
 
         app.MapGet("/api/map", (IndexService s, string? root) => s.Map(root ?? ""));
 
-        app.MapGet("/api/pipeline", (IndexService s, string? root) => s.Pipeline(root ?? ""));
+
+        // 框架流程：中间件 → 控制器 → 分派器 → 行为链 → Handler → 收尾（替换旧的 /api/pipeline）
+        app.MapGet("/api/arch/framework", (IndexService s, string container) =>
+            s.Framework(container) is { } framework ? Results.Ok(framework) : Results.NotFound(new { error = $"没有这个容器：{container}" }));
 
         app.MapGet("/api/arch/containers", (IndexService s) => s.Architecture());
 
@@ -77,8 +80,9 @@ public static class ServerHost
 
         app.MapGet("/api/arch/entries", (IndexService s, string container, string? kind, string? q) => s.Entries(container, kind, q));
 
-        app.MapGet("/api/arch/flow", (IndexService s, long entry, int? depth) =>
-            s.Flow(entry, depth) is { } flow ? Results.Ok(flow) : Results.NotFound(new { error = $"没有这个入口：{entry}" }));
+        // 同一个方法上挂着几条路由（lambda 体里没有单一调用时留在外层方法上）：route / method 选其中一条，流程只取那条路由的那段
+        app.MapGet("/api/arch/flow", (IndexService s, long entry, int? depth, string? route, string? method) =>
+            s.Flow(entry, depth, route, method) is { } flow ? Results.Ok(flow) : Results.NotFound(new { error = $"没有这个入口：{entry}" }));
 
         // 本地 AI 叙述：读（没有缓存时自动排队）/ 触发 / 队列状态 / 停 / 续
         app.MapGet("/api/arch/narrative", (Narration.NarrationService n, string kind, string key) =>
@@ -106,6 +110,10 @@ public static class ServerHost
 
         app.MapGet("/api/symbols/{id:long}/outline", (IndexService s, long id, bool? externals, bool? tests) =>
             s.Outline(id, new OutlineOptions(externals ?? true, tests ?? false)) is { } outline ? Results.Ok(outline) : Results.NotFound());
+
+        // 从任意方法出发的时序图（面板"调用图"的默认视图）：入口与 /api/arch/flow 相同；类型 / 字段等不可执行的给只有根的流程，note 说明
+        app.MapGet("/api/symbols/{id:long}/flow", (IndexService s, long id, int? depth) =>
+            s.SymbolFlow(id, depth) is { } flow ? Results.Ok(flow) : Results.NotFound(new { error = $"没有这个符号：{id}" }));
 
         app.MapGet("/api/symbols/{id:long}/relations", (IndexService s, long id, int? depth, bool? tests) =>
             s.Relations(id, new RelationsOptions(depth ?? 1, tests ?? false)) is { } relations ? Results.Ok(relations) : Results.NotFound());

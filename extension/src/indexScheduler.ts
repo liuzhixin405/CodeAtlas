@@ -5,10 +5,11 @@
 export class IndexScheduler {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
+  private fullRequested = false;
   private current: Promise<void> | null = null;
 
   constructor(
-    private readonly run: () => Promise<void>,
+    private readonly run: (full: boolean) => Promise<void>,
     private readonly delayMs: number,
     private readonly onError: (e: unknown) => void = () => {},
   ) {}
@@ -23,23 +24,25 @@ export class IndexScheduler {
     this.timer = setTimeout(() => { this.timer = null; void this.execute(); }, this.delayMs);
   }
 
-  /** 立即执行（例如用户点了"索引"按钮）；若正在跑则置脏并等待当前这次。 */
-  runNow(): Promise<void> {
+  runNow(full = false): Promise<void> {
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+    this.fullRequested ||= full;
     if (this.current) { this.dirty = true; return this.current; }
     return this.execute();
   }
 
-  private async execute(): Promise<void> {
-    this.dirty = false;
-    this.current = (async () => {
-      try { await this.run(); }
-      catch (e) { this.onError(e); }
-    })();
-    try { await this.current; }
-    finally {
+  private execute(): Promise<void> {
+    this.current = Promise.resolve().then(async () => {
+      do {
+        const full = this.fullRequested;
+        this.fullRequested = false;
+        this.dirty = false;
+        try { await this.run(full); }
+        catch (e) { this.onError(e); }
+      } while (this.dirty);
+    }).finally(() => {
       this.current = null;
-      if (this.dirty) void this.execute();
-    }
+    });
+    return this.current;
   }
 }

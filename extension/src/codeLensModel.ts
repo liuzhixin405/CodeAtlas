@@ -21,6 +21,8 @@ export interface MethodLenses {
 }
 
 export const StaleSuffix = "（索引已过期）";
+/** 每行第一条前面的标识：和语言插件自己的 CodeLens（"2 个引用"）区分开。ctg = Codetrail Graph 的简写，比全名短。 */
+export const BrandPrefix = "ctg: ";
 const StaleTooltip = "文件在索引之后改过，数字和行号可能对不上；保存后会增量索引。";
 
 /** "被 N 处调用" 那一条的标题：调用方个数和处数不同时两个都写；都是 0 写"没有调用方"（找死代码用）。 */
@@ -54,10 +56,14 @@ export function lensSpecs(item: SymbolLensDto, stale: boolean): LensSpec[] {
     out.push({ kind: "tests", title: `测试 ${item.testCallers}`, tooltip: `测试代码里有 ${item.testCallers} 个调用方。点开列出全部调用方（含测试）。`, clickable: true });
   }
 
+  const dispatches = item.dispatches ?? 0;
   out.push({
     kind: "callees",
-    title: `调用 ${item.callees} 个`,
-    tooltip: item.callees > 0 ? `按源码顺序调用了 ${item.callees} 个（调用大纲第一层，含框架调用）。点开选一个跳到调用处。` : "这个方法里没有找到调用。",
+    title: `调用 ${item.callees} 个` + (dispatches > 0 ? ` · 分派 ${dispatches}` : ""),
+    tooltip: item.callees > 0
+      ? `按源码顺序调用了 ${item.callees} 个（调用大纲第一层，含框架调用）。点开选一个跳到调用处。` +
+        (dispatches > 0 ? `\n经分派（Send / Publish 一类，不是直接引用）到 ${dispatches} 个 Handler：列表里的「↳ … · 经分派」一项直接跳到 Handler。` : "")
+      : "这个方法里没有找到调用。",
     clickable: item.callees > 0,
   });
 
@@ -101,9 +107,15 @@ export function fileLenses(dto: FileLensDto, opts: { checkLines: boolean; lineTe
     const s = item.symbol;
     if (!(s.startLine >= 1)) continue;
     if (opts.checkLines && !declarationIntact(s, opts.lineText)) continue;
-    out.push({ symbol: s, line: s.startLine, lenses: lensSpecs(item, dto.stale) });
+    out.push({ symbol: s, line: s.startLine, lenses: withBrand(lensSpecs(item, dto.stale)) });
   }
   return out;
+}
+
+/** 第一条加 ctg: 标识（一行只加一次）。 */
+export function withBrand(specs: LensSpec[]): LensSpec[] {
+  if (specs.length === 0) return specs;
+  return [{ ...specs[0]!, title: BrandPrefix + specs[0]!.title }, ...specs.slice(1)];
 }
 
 // ---------- 缓存 ----------

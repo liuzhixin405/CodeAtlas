@@ -1,8 +1,8 @@
 {
   "name": "codetrail-graph",
   "displayName": "CodeTrail Graph",
-  "description": "代码地图：点开一个符号，看它调了谁、被谁调。",
-  "version": "0.1.0",
+  "description": "本地代码地图：从项目全貌（容器、框架流程、请求入口）一路看到单个方法（调用时序、调用大纲、影响范围、模块关系）。",
+  "version": "0.1.1",
   "private": true,
   "license": "MIT",
   "icon": "images/icon.png",
@@ -71,7 +71,7 @@
     "commands": [
       {
         "command": "codeatlas.showSymbol",
-        "title": "在 CodeTrail Graph 中查看",
+        "title": "在调用图中查看",
         "category": "CodeTrail Graph"
       },
       {
@@ -225,7 +225,7 @@
       },
       {
         "command": "codeatlas.showRelations",
-        "title": "在 CodeTrail Graph 模块关系中查看",
+        "title": "在模块关系中查看",
         "category": "CodeTrail Graph"
       },
       {
@@ -308,17 +308,40 @@
         "when": "codeatlas.impact.state == error"
       }
     ],
+    "submenus": [
+      {
+        "id": "codeatlas.editorContext",
+        "label": "CodeTrail Graph"
+      }
+    ],
     "menus": {
       "editor/context": [
         {
-          "command": "codeatlas.showSymbol",
-          "group": "navigation@1",
+          "submenu": "codeatlas.editorContext",
+          "group": "0_codeatlas@1",
           "when": "editorTextFocus"
+        }
+      ],
+      "codeatlas.editorContext": [
+        {
+          "command": "codeatlas.showSymbol",
+          "group": "1_view@1"
         },
         {
           "command": "codeatlas.showRelations",
-          "group": "navigation@2",
-          "when": "editorTextFocus"
+          "group": "1_view@2"
+        },
+        {
+          "command": "codeatlas.gotoCallers",
+          "group": "2_jump@1"
+        },
+        {
+          "command": "codeatlas.gotoCallees",
+          "group": "2_jump@2"
+        },
+        {
+          "command": "codeatlas.gotoEntries",
+          "group": "2_jump@3"
         }
       ],
       "commandPalette": [

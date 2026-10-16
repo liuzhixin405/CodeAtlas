@@ -190,16 +190,25 @@ public static class OutlineBuilder
             var ownerName = Map(owner).Name;
             return IsConstructor(s, owner) ? ownerName : ownerName + "." + name;
         }
-        return FlowBuilder.GoReceiver(Map(s)) is { } recv ? recv + "." + name : name;
+        // 局部函数（父符号是外层方法）只显示自己的名字；顶级语句显示 Program.Main；父符号是命名空间（分部类的方法有时这样入库）时类型名从限定名里取
+        if (FlowBuilder.GoReceiver(Map(s)) is { } recv) return recv + "." + name;
+        if (MapBuilder.TopLevelLabel(s.QualifiedName) is { } top) return top;
+        return s.ParentId is { } nsId && symbols.TryGetValue(nsId, out var ns) && ns.Kind == SymbolKind.Namespace
+            && MapBuilder.DeclaringTypeSegment(s.QualifiedName) is { } type && type != name ? type + "." + name : name;
     }
 
-    /// <summary>都有 pos 时按 pos；否则行优先、同一行内 pos（没有 pos 的排在该行后面），再按边 id。</summary>
-    private static IEnumerable<Step> Sort(IEnumerable<Step> steps)
+    private static IEnumerable<Step> Sort(IEnumerable<Step> steps) => SortBySite(steps, s => s.Line, s => s.Pos, s => s.Edge.Id);
+
+    /// <summary>
+    /// 调用处的源码顺序：都有 pos 时按 pos；否则行优先、同一行内 pos（没有 pos 的排在该行后面），再按 tiebreak（边 id）。
+    /// 调用大纲与流程（选进来的分支怎么排）共用；LINQ 排序是稳定的，键全相同时保持输入顺序。
+    /// </summary>
+    internal static IEnumerable<T> SortBySite<T>(IEnumerable<T> items, Func<T, int> line, Func<T, int?> pos, Func<T, long> tiebreak)
     {
-        var list = steps.ToList();
-        if (list.All(s => s.Pos is not null))
-            return list.OrderBy(s => s.Pos!.Value).ThenBy(s => s.Line).ThenBy(s => s.Edge.Id);
-        return list.OrderBy(s => s.Line).ThenBy(s => s.Pos ?? int.MaxValue).ThenBy(s => s.Edge.Id);
+        var list = items.ToList();
+        if (list.All(s => pos(s) is not null))
+            return list.OrderBy(s => pos(s)!.Value).ThenBy(line).ThenBy(tiebreak);
+        return list.OrderBy(line).ThenBy(s => pos(s) ?? int.MaxValue).ThenBy(tiebreak);
     }
 
     private static bool SameStep(Step a, Step b) =>

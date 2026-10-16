@@ -34,6 +34,49 @@ export interface NeighborDto {
   ctx?: OutlineCtx | null;
 }
 
+// ---- 框架流程（GET /api/arch/framework?container=），与 src/CodeAtlas.Server/Dtos.cs 的 FrameworkFlowDto 对应 ----
+
+/**
+ * .NET 的六个阶段之外，各语言有自己的阶段（interceptor / aspect / dependency / provider / route / page / request ……），
+ * 列名与顺序都以服务端为准，页面不按键分支（只有 handler 用来数 Handler 总数）。
+ */
+export type FrameworkStageKey = "middleware" | "controller" | "dispatcher" | "behavior" | "handler" | "tail" | (string & {});
+
+export interface FrameworkStageDto {
+  key: FrameworkStageKey;
+  /** 中间件 / 控制器 / 分派器 / 行为链 / Handler / 收尾 */
+  label: string;
+  /** 阶段内部的先后有没有依据（中间件：app.UseXxx 书写顺序；行为：DI 注册顺序）。 */
+  orderKnown: boolean;
+  symbols: SymbolDto[];
+}
+
+export interface FrameworkHandlerDto {
+  /** Handler 的入口方法。 */
+  handler: SymbolDto;
+  messageType: string | null;
+  /** command / query / event */
+  messageKind: string | null;
+  /** 会分派到它的入口；点一个打开它的入口流程。 */
+  entries: EntryDto[];
+}
+
+export interface FrameworkHandlerGroupDto {
+  module: string;
+  items: FrameworkHandlerDto[];
+}
+
+export interface FrameworkFlowDto {
+  containerKey: string;
+  containerName: string;
+  /** 骨架时序图：actors 是阶段（kind = "stage"），handlers / controllers 是占位节点。 */
+  flow: FlowDto;
+  stages: FrameworkStageDto[];
+  handlers: FrameworkHandlerGroupDto[];
+  /** 识别不到的阶段、顺序未知的原因等。 */
+  notes: string[];
+}
+
 // ---- 快速跳转（GET /api/files/lens），与 src/CodeAtlas.Server/Dtos.cs 的 FileLensDto 对应 ----
 
 export interface SymbolLensDto {
@@ -46,6 +89,8 @@ export interface SymbolLensDto {
   testCallers: number;
   /** 调用大纲第一层步骤数。 */
   callees: number;
+  /** 经分派到的 Handler 个数（Send / Publish 一类，不是直接引用）；老服务没有这个字段。 */
+  dispatches?: number;
   /** 本身是入口。 */
   isEntry: boolean;
 }
@@ -225,84 +270,6 @@ export interface MapDto {
   edges: MapEdgeDto[];
 }
 
-// ---- 管道视图（PipelineBuilder.cs）----
-
-export interface PipelineItemDto {
-  name: string;
-  qualifiedName: string;
-  symbolId: number;
-  weight: number;
-}
-
-export interface PipelineCellDto {
-  count: number;
-  items: PipelineItemDto[];
-}
-
-export interface PipelineMessagesDto {
-  count: number;
-  commands: number;
-  queries: number;
-  events: number;
-  /** 没有任何非测试入口分发过的消息数。 */
-  orphans: number;
-}
-
-export interface PipelineGroupDto {
-  key: string;
-  label: string;
-  weight: number;
-}
-
-export interface PipelineRowDto {
-  key: string;
-  label: string;
-  /** 命名空间行可钻；叶子行（消息行）为 false。 */
-  hasChildren: boolean;
-  /** 叶子行对应的消息类型 id。 */
-  symbolId: number | null;
-  entries: PipelineCellDto;
-  messages: PipelineMessagesDto;
-  handlers: PipelineCellDto;
-  /** 本行 Handler 发出的分发条数。 */
-  nested: number;
-  /** 非 Handler、非测试代码直接调用本行 Handler 方法的条数（绕过管道）。 */
-  bypass: number;
-  externalCalls: number;
-  downstream: PipelineGroupDto[];
-}
-
-export interface PipelineFlowDto {
-  from: string;
-  to: string;
-  kind: "nested" | "bypass";
-  weight: number;
-}
-
-export interface PipelineBehaviorDto {
-  name: string;
-  qualifiedName: string;
-  symbolId: number;
-  order: number;
-}
-
-export interface PipelineDto {
-  /** 实际使用的 root；没有分发数据时为空串且 rows 为空。 */
-  root: string;
-  leaf: boolean;
-  /** 每个 Behavior 都有 DI 注册记录时为 true；否则按名字排，顺序不可信。 */
-  behaviorsOrdered: boolean;
-  testEntriesSkipped: number;
-  messagesOutsideRoot: number;
-  behaviors: PipelineBehaviorDto[];
-  rows: PipelineRowDto[];
-  flows: PipelineFlowDto[];
-  /** 自动推导出的业务模块层；面包屑以它为底。 */
-  defaultRoot: string;
-  /** 测试代码里的消息（含其 Handler）被整体排除的个数。 */
-  testMessagesSkipped: number;
-}
-
 // ---- 容器图 L1（ArchDto）----
 
 export interface EvidenceDto {
@@ -361,6 +328,8 @@ export interface DsmHotDto {
   deleted: number;
   ageMonths: number;
   lastCommit: string;
+  /** 涉及的提交数（去重）；库里没存提交号时为空，此时 revisions 是各文件修订之和。 */
+  commits?: number | null;
 }
 
 export interface DsmComponentDto {
@@ -420,7 +389,8 @@ export interface EntryDto {
 export interface FlowActorDto {
   key: string;
   label: string;
-  kind: "project" | "container" | "external";
+  /** stage：框架流程（/api/arch/framework）里的阶段列，key 是阶段 key。 */
+  kind: "project" | "container" | "external" | "stage";
 }
 
 export interface FlowNodeDto {
@@ -431,7 +401,8 @@ export interface FlowNodeDto {
    * http：前端 hook 里没对上后端路由的接口调用（label 如 "GET /api/v5/mt5/groups"，qualifiedName 是原始 URL，
    * actor 指向 kind=external 的列，没有 symbolId 与 children，note 说明为什么没对上）。
    */
-  kind: "entry" | "call" | "dispatch" | "hop" | "external-group" | "more" | "function" | "http";
+  /** handlers / controllers：框架流程里的占位（count = 个数），只在 /api/arch/framework 的结果里出现。 */
+  kind: "entry" | "call" | "dispatch" | "hop" | "external-group" | "more" | "function" | "http" | "handlers" | "controllers";
   /** 所属 actor 的 key。 */
   actor: string;
   via: string | null;
@@ -442,6 +413,13 @@ export interface FlowNodeDto {
   /** 被折掉没下发的孩子数。 */
   hidden: number;
   note: string | null;
+  // 以下为 /api/symbols/{id}/flow 可能带的可选字段；没有时页面按 symbolId 查符号再定位
+  /** 符号所在文件（仓库相对路径）。 */
+  path?: string | null;
+  /** 1 起的行号。 */
+  line?: number | null;
+  /** UTF-16 字符偏移；有值时打开编辑器优先用它。 */
+  pos?: number | null;
 }
 
 export interface FlowDto {
@@ -469,6 +447,8 @@ export interface IndexReportDto {
   totalEdges: number;
   elapsedSeconds: number;
   roslyn?: RoslynReportDto | null;
+  /** 各阶段耗时，按发生顺序（ts.* / roslyn[解决方案].* / roslyn.finish.* / arch / git / entries）。 */
+  timings?: { phase: string; seconds: number }[] | null;
 }
 
 export interface RoslynReportDto {

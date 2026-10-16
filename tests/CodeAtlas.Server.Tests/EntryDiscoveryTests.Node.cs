@@ -52,7 +52,7 @@ public partial class EntryDiscoveryTests
             "import { createOrder } from '../services/orders.js';",                    // 2：TS 的 ESM 写法，实际文件是 .ts
             "const router = Router();",                                                // 3
             "router.post('/', createOrder);",                                          // 4
-            "router.delete('/:id', async (req, res) => { await cancel(req.params.id); });", // 5：内联、顶层 → 文件模块
+            "router.delete('/:id', async (req, res) => { await cancel(req.params.id); });", // 5：内联 → 体里转调的仓库函数 cancel
             "export default router;",                                                  // 6
         ],
         ["api/services/orders.ts"] =
@@ -226,12 +226,12 @@ public partial class EntryDiscoveryTests
         Assert.Equal(new (string, string, string?, long, string, int)[]
         {
             ("api", "/api/orders", "POST", 4009, "api/routes/orders.ts", 4),             // import 的默认导出路由器 + services/orders.js → .ts
-            ("api", "/api/orders/:id", "DELETE", 4007, "api/routes/orders.ts", 5),       // 内联处理器在顶层 → 文件模块
+            ("api", "/api/orders/:id", "DELETE", 4010, "api/routes/orders.ts", 5),       // 内联处理器 → 体里第一个仓库函数调用 cancel（services/orders.ts），不是整个文件模块
             ("api", "/api/users", "GET", 4005, "api/routes/users.js", 4),                // require 的路由器（module.exports = router）；ctrl.list
             ("api", "/api/users/:id", "POST", 4006, "api/routes/users.js", 5),           // asyncHandler(ctrl.update)
             ("api", "/api/users/:id/avatar", "GET", 4002, "api/routes/users.js", 6),     // router.route('/:id/avatar').get(…).put(…)
             ("api", "/api/users/:id/avatar", "PUT", 4003, "api/routes/users.js", 6),
-            ("api", "/health", "GET", 4000, "api/app.js", 5),
+            ("api", "/health", "GET", 4000, "api/app.js", 5),                            // 内联、体里只有 res.send → 退回文件模块
         }, NodeRows("node.express"));
         Assert.DoesNotContain(NodeEntries(), e => e.Route is "/static" or "/not-a-route" or "/commented" or "/mock" || e.ContainerKey == "web");
     }
@@ -284,5 +284,94 @@ public partial class EntryDiscoveryTests
             ("grpcsvc", "ShippingService/ShipOrder", null, 4057, "grpcsvc/impl.js", 1),  // impl.shipOrder → require 的模块
         }, NodeRows("node.grpc"));
         Assert.DoesNotContain(grpc, e => e.Route!.StartsWith("Health/", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Node_Express_MultiLineRoutes_ChainedMountPrefix_InlineHandlersLandOnTheServiceTheyCall()
+    {
+        // 一种常见的 TS 写法（prettier 排版）：路由注册跨行且末尾带逗号；routes.ts 用链式 Router().use(…) 汇总各控制器，再匿名默认导出挂到 /api
+        Dictionary<string, string[]> files = new()
+        {
+            ["shop/package.json"] = ["{ \"dependencies\": { \"express\": \"4.19.0\" } }"],
+            ["shop/src/main.ts"] =
+            [
+                "import express from 'express';",     // 1
+                "import routes from './app/routes';", // 2
+                "const app = express();",             // 3
+                "app.use(routes);",                   // 4
+                "app.get('/', (req, res) => {",       // 5：体里只有 res.json → 退回文件模块
+                "  res.json({ status: 'up' });",      // 6
+                "});",                                // 7
+                "app.listen(3000);",                  // 8
+            ],
+            ["shop/src/app/routes.ts"] =
+            [
+                "import { Router } from 'express';",                            // 1
+                "import ordersController from './orders/orders.controller';",  // 2
+                "import cartController from './cart/cart.controller';",        // 3
+                "const api = Router()",                                         // 4
+                "  .use(ordersController)",                                     // 5：链式 use，接收者是链头赋给的 api
+                "  .use(cartController);",                                      // 6
+                "export default Router().use('/api', api);",                    // 7：匿名默认导出的路由器
+            ],
+            ["shop/src/app/orders/orders.controller.ts"] =
+            [
+                "import { Router } from 'express';",                          // 1
+                "import auth from '../auth';",                                // 2
+                "import { listOrders, placeOrder } from './orders.service';", // 3
+                "const router = Router();",                                   // 4
+                "router.get('/orders', auth.optional, async (req, res, next) => {", // 5
+                "  try {",                                                    // 6
+                "    res.json(await listOrders(req.query));",                 // 7：res.json 跳过，落在 listOrders
+                "  } catch (e) { next(e); }",                                 // 8
+                "});",                                                        // 9
+                "router.post(",                                               // 10：多行
+                "  '/orders/:id/place',",                                     // 11
+                "  auth.required,",                                           // 12
+                "  async (req, res, next) => {",                              // 13
+                "    try {",                                                  // 14
+                "      res.status(201).json(await placeOrder(req.params.id));", // 15：res.status(…).json 都跳过
+                "    } catch (e) {",                                          // 16
+                "      next(e);",                                             // 17
+                "    }",                                                      // 18
+                "  },",                                                       // 19：末尾逗号
+                ");",                                                         // 20
+                "export default router;",                                     // 21
+            ],
+            ["shop/src/app/orders/orders.service.ts"] =
+            [
+                "export async function listOrders(q) {}", // 1
+                "export async function placeOrder(id) {}", // 2
+            ],
+            ["shop/src/app/cart/cart.controller.ts"] =
+            [
+                "import { Router } from 'express';",    // 1
+                "const router = Router();",             // 2
+                "router.delete(",                       // 3
+                "  '/cart',",                           // 4
+                "  (req, res) => res.sendStatus(204),", // 5：没有仓库函数调用 → 文件模块
+                ");",                                   // 6
+                "export default router;",               // 7
+            ],
+        };
+        List<MapSymbol> symbols =
+        [
+            Sym(4100, SymbolKind.Module, "shop/src/main.ts", "shop/src/main.ts", null, 1, 8),
+            Sym(4101, SymbolKind.Module, "shop/src/app/routes.ts", "shop/src/app/routes.ts", null, 1, 7),
+            Sym(4102, SymbolKind.Module, "shop/src/app/orders/orders.controller.ts", "shop/src/app/orders/orders.controller.ts", null, 1, 21),
+            Sym(4103, SymbolKind.Module, "shop/src/app/orders/orders.service.ts", "shop/src/app/orders/orders.service.ts", null, 1, 2),
+            Sym(4104, SymbolKind.Function, "shop/src/app/orders/orders.service.ts:listOrders", "shop/src/app/orders/orders.service.ts", 4103, 1, 1, "export"),
+            Sym(4105, SymbolKind.Function, "shop/src/app/orders/orders.service.ts:placeOrder", "shop/src/app/orders/orders.service.ts", 4103, 2, 2, "export"),
+            Sym(4106, SymbolKind.Module, "shop/src/app/cart/cart.controller.ts", "shop/src/app/cart/cart.controller.ts", null, 1, 7),
+        ];
+        var entries = EntryDiscovery.Discover(symbols, [], [Container("shop", "node-service", "shop")], p => files.TryGetValue(p, out var l) ? l : []);
+        Assert.Equal(new (string, string, string?, long, string, int)[]
+        {
+            ("shop", "/", "GET", 4100, "shop/src/main.ts", 5),
+            ("shop", "/api/cart", "DELETE", 4106, "shop/src/app/cart/cart.controller.ts", 3),                // 多行 + 末尾逗号；前缀 /api 经 main → routes 默认导出 → api → 控制器
+            ("shop", "/api/orders", "GET", 4104, "shop/src/app/orders/orders.controller.ts", 5),            // 落在 listOrders，不是控制器文件模块
+            ("shop", "/api/orders/:id/place", "POST", 4105, "shop/src/app/orders/orders.controller.ts", 10), // 两条内联路由各落在自己调的函数上，不再共用一个符号
+        }, Rows(entries.Where(e => e.RuleId == "node.express")));
+        Assert.All(entries, e => Assert.Equal("http", e.Kind));
     }
 }

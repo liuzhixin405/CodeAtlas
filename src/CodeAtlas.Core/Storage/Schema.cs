@@ -11,7 +11,10 @@ internal static class Schema
             size INTEGER NOT NULL,
             indexed_at TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'ok',
-            roslyn_at TEXT
+            roslyn_at TEXT,
+            mtime INTEGER,
+            roslyn_sln TEXT,
+            roslyn_miss TEXT
         );
 
         CREATE TABLE IF NOT EXISTS symbols (
@@ -62,6 +65,23 @@ internal static class Schema
             line INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS ix_imports_file ON imports(file_id);
+
+        CREATE TABLE IF NOT EXISTS source_references (
+            id INTEGER PRIMARY KEY,
+            from_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+            file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            via TEXT,
+            receiver INTEGER,
+            import_source TEXT,
+            imported_name TEXT,
+            pos INTEGER NOT NULL,
+            ctx TEXT
+        );
+        CREATE INDEX IF NOT EXISTS ix_source_references_file ON source_references(file_id);
+        CREATE INDEX IF NOT EXISTS ix_source_references_from ON source_references(from_id);
 
         CREATE TABLE IF NOT EXISTS di_registrations (
             id INTEGER PRIMARY KEY,

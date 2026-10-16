@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using CodeAtlas.Core.Diagnostics;
 using CodeAtlas.Core.Storage;
 using CodeAtlas.Core.Workspace;
 
@@ -91,6 +92,7 @@ public static class RoslynRunner
             timeout.CancelAfter(TimeSpan.FromSeconds(60));
             try { await process.WaitForExitAsync(timeout.Token); }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested) { TryKill(process); return $"{WorkerName} 探测超时。{FallbackNote}"; }
+            catch (OperationCanceledException) { TryKill(process); throw; }
             await stdout;
             return DescribeProbeFailure(process.ExitCode, await stderr);
         }
@@ -131,12 +133,15 @@ public static class RoslynRunner
     /// 每个要单独处理的仓库（主根、外部根、被纳入的嵌套仓库，见 ProjectRoots.Repositories）各找一个解决方案，按仓库顺序、去重。
     /// 一个仓库里的查找不进嵌套仓库与其他根（它们各找各的）。
     /// </summary>
-    public static IReadOnlyList<string> DiscoverSolutions(ProjectRoots roots)
+    public static IReadOnlyList<string> DiscoverSolutions(ProjectRoots roots) =>
+        DiscoverSolutionsByRepository(roots).Select(x => x.Solution).Distinct(ProjectRoots.PathComparer).ToList();
+
+    /// <summary>每个仓库（见 ProjectRoots.Repositories）与它的解决方案，按仓库顺序；没有解决方案的仓库不出现。</summary>
+    public static IReadOnlyList<(RepoDir Repo, string Solution)> DiscoverSolutionsByRepository(ProjectRoots roots)
     {
-        var result = new List<string>();
-        var seen = new HashSet<string>(ProjectRoots.PathComparer);
+        var result = new List<(RepoDir, string)>();
         foreach (var repo in roots.Repositories())
-            if (DiscoverSolution(repo.FullPath, dir => roots.IsRoot(dir.FullName)) is { } sln && seen.Add(sln)) result.Add(sln);
+            if (DiscoverSolution(repo.FullPath, dir => roots.IsRoot(dir.FullName)) is { } sln) result.Add((repo, sln));
         return result;
     }
 
@@ -194,9 +199,10 @@ public static class RoslynRunner
     /// 多根版本：repoRoots 是"算仓库内"的目录（主根 + 外部根），落在它们之下的源码文件才输出、指向它们的边才不算外部；
     /// basePath（主根）是输出路径的基准，外部根的文件输出成 ../other/…，与 tree-sitter 入库的路径一致。
     /// </summary>
+    /// <param name="onlyListPath">只输出这些文件（列表文件里每行一个绝对路径，见 worker 的 --only）；null = 解决方案里的全部文件。</param>
     public static async IAsyncEnumerable<RoslynRecord> RunAsync(
         string workerPath, string solutionPath, IReadOnlyList<string> repoRoots, string basePath, Action<string>? log, TimeSpan? stallTimeout,
-        [EnumeratorCancellation] CancellationToken ct)
+        [EnumeratorCancellation] CancellationToken ct, string? onlyListPath = null)
     {
         var repoRoot = basePath;
         var psi = new ProcessStartInfo
@@ -215,6 +221,7 @@ public static class RoslynRunner
         psi.ArgumentList.Add("--sln"); psi.ArgumentList.Add(solutionPath);
         foreach (var r in repoRoots) { psi.ArgumentList.Add("--repo"); psi.ArgumentList.Add(r); }
         psi.ArgumentList.Add("--base"); psi.ArgumentList.Add(basePath);
+        if (onlyListPath is not null) { psi.ArgumentList.Add("--only"); psi.ArgumentList.Add(onlyListPath); }
 
         using var process = Process.Start(psi) ?? throw new RoslynWorkerException($"无法启动 {workerPath}");
         var stderrTail = new Queue<string>();
@@ -238,6 +245,7 @@ public static class RoslynRunner
                 if (finished != readLine)
                 {
                     TryKill(process);
+                    ct.ThrowIfCancellationRequested();
                     throw new RoslynWorkerException($"Roslyn worker {timeout.TotalMinutes:F0} 分钟没有输出，已终止。");
                 }
                 var line = await readLine;
@@ -272,35 +280,143 @@ public static class RoslynRunner
     /// 多解决方案：依次各起一次 worker（隔离崩溃、MSBuildLocator 每进程只注册一次），记录流进同一个 RoslynApplier——
     /// 前一个解决方案的符号能给后一个的跨仓库边挂接；同一个文件出现在多个解决方案里只写第一次。
     /// 某个解决方案失败（打不开、崩溃、挂死）只记进 FailedSolutions，其余照常写回；全部失败才抛 RoslynWorkerException（整体回滚）。
+    /// <para>
+    /// pendingFiles（相对主根的路径，通常是 IndexReader.GetRoslynPendingFiles）：非 null 时增量——每个文件交给上次覆盖它的解决方案（files.roslyn_sln），
+    /// 新文件交给所在仓库的解决方案；只启动分到了文件的解决方案，worker 只走这些文件（外加新 Handler 影响到的发送方，见 worker 的 --only）。
+    /// 待更新文件超过 C# 文件总数一半时直接走全量。null = 全量。
+    /// </para>
+    /// 跑完后，交给成功的解决方案却没被输出的文件（不在任何项目里、项目加载失败）记 roslyn_miss，内容不变就不再算待更新；失败的解决方案的文件不记。
     /// </summary>
     public static async Task<RoslynApplyReport> RunAndApplyAsync(
         IndexDatabase db, string workerPath, IReadOnlyList<string> solutions, ProjectRoots roots,
-        Action<ProgressRec>? progress, Action<string>? log, CancellationToken ct, TimeSpan? stallTimeout = null)
+        Action<ProgressRec>? progress, Action<string>? log, CancellationToken ct, TimeSpan? stallTimeout = null, IReadOnlyCollection<string>? pendingFiles = null)
     {
-        using var applier = new RoslynApplier(db);
-        var failures = new List<string>();
-        foreach (var solution in solutions)
+        var timings = new PhaseTimings();
+        var byRepository = DiscoverSolutionsByRepository(roots);
+        if (pendingFiles is not null)
         {
-            if (solutions.Count > 1) log?.Invoke($"解决方案 {solution}");
+            var csharp = db.Scalar<long>("SELECT COUNT(*) FROM files WHERE language = 'csharp'");
+            if (pendingFiles.Count * 2L > csharp)
+            {
+                log?.Invoke($"待更新 {pendingFiles.Count}/{csharp} 个 C# 文件，超过一半，走全量");
+                pendingFiles = null;
+            }
+        }
+
+        // 计划：(解决方案, 交给它的文件；null = 全部)
+        List<(string Solution, List<string>? Files)> runs;
+        var unassigned = new List<string>();
+        if (pendingFiles is null) runs = solutions.Select(s => (s, (List<string>?)null)).ToList();
+        else
+        {
+            var assigned = Assign(db, pendingFiles, solutions, roots, byRepository, unassigned);
+            runs = solutions.Where(assigned.ContainsKey).Select(s => (s, (List<string>?)assigned[s])).ToList();
+        }
+        timings.Lap("roslyn.plan");
+
+        using var applier = new RoslynApplier(db, incremental: pendingFiles is not null);
+        var failures = new List<string>();
+        var succeeded = new List<(string Solution, List<string>? Files)>();
+        foreach (var (solution, files) in runs)
+        {
+            if (runs.Count > 1 || files is not null) log?.Invoke($"解决方案 {solution}{(files is null ? "" : $"（{files.Count} 个待更新文件）")}");
+            // 阶段名带解决方案名：嵌套仓库各有一个解决方案，分开看才知道慢在哪个
+            var prefix = $"roslyn[{Path.GetFileNameWithoutExtension(solution)}]";
+            var wall = Stopwatch.StartNew();
+            var applying = new Stopwatch();
+            applier.Solution = RelativeToMain(roots, solution);
+            string? onlyList = null;
             try
             {
-                await foreach (var record in RunAsync(workerPath, solution, roots.All, roots.Main, log, stallTimeout, ct))
+                if (files is not null)
+                {
+                    onlyList = Path.Combine(Path.GetTempPath(), $"codeatlas-roslyn-only-{Guid.NewGuid():N}.txt");
+                    await File.WriteAllLinesAsync(onlyList, files.Select(f => Path.GetFullPath(Path.Combine(roots.Main, f))), ct);
+                }
+                await foreach (var record in RunAsync(workerPath, solution, roots.All, roots.Main, log, stallTimeout, ct, onlyList))
                 {
                     if (record is ProgressRec p) progress?.Invoke(p);
                     else if (record is ErrorRec e) log?.Invoke($"[{e.Scope}] {e.Message}");
+                    else if (record is TimingRec t) timings.Add($"{prefix}.{t.Phase}", t.Seconds);
+                    applying.Start();
                     applier.Apply(record);
+                    applying.Stop();
                 }
+                succeeded.Add((solution, files));
             }
-            catch (RoslynWorkerException ex) when (solutions.Count > 1)
+            catch (RoslynWorkerException ex) when (runs.Count > 1)
             {
                 failures.Add($"{solution}: {ex.Message}");
                 log?.Invoke($"解决方案失败，跳过：{solution}：{ex.Message}");
             }
+            finally
+            {
+                if (onlyList is not null) try { File.Delete(onlyList); } catch (IOException) { }
+            }
+            // apply 是父进程逐条写回的累计时间，与 worker 的 walk 重叠；total 是这个解决方案从起进程到读完输出的墙钟时间
+            timings.Add($"{prefix}.apply", applying.Elapsed.TotalSeconds);
+            timings.Add($"{prefix}.total", wall.Elapsed.TotalSeconds);
         }
-        if (solutions.Count > 0 && failures.Count == solutions.Count)
+        if (runs.Count > 0 && failures.Count == runs.Count)
             throw new RoslynWorkerException("全部解决方案都失败：\n" + string.Join("\n", failures));
-        return applier.Finish() with { Solutions = solutions.Count, FailedSolutions = failures };
+
+        timings.Lap("roslyn.run");
+        applier.MarkMisses(Misses(db, pendingFiles, unassigned, succeeded, runs, solutions, roots, byRepository, applier.ProcessedFiles));
+        timings.Lap("roslyn.misses");
+        var report = applier.Finish();
+        timings.AddRange(report.Timings ?? []);
+        return report with { Solutions = runs.Count, FailedSolutions = failures, Timings = timings.Items };
     }
+
+    /// <summary>
+    /// 把待更新文件分给解决方案：files.roslyn_sln（在本次的解决方案里）→ 所在仓库（最深的前缀）的解决方案 → 只有一个解决方案时给它；
+    /// 都不行的进 unassigned。
+    /// </summary>
+    private static Dictionary<string, List<string>> Assign(IndexDatabase db, IEnumerable<string> files, IReadOnlyList<string> solutions, ProjectRoots roots,
+        IReadOnlyList<(RepoDir Repo, string Solution)> byRepository, List<string> unassigned)
+    {
+        var available = new HashSet<string>(solutions, ProjectRoots.PathComparer);
+        var recorded = new Dictionary<string, string>(StringComparer.Ordinal);
+        using (var cmd = db.CreateCommand("SELECT path, roslyn_sln FROM files WHERE language = 'csharp' AND roslyn_sln IS NOT NULL"))
+        using (var r = cmd.ExecuteReader())
+            while (r.Read()) recorded[r.GetString(0)] = r.GetString(1);
+        // 最深的前缀优先：主根的前缀是 ""，嵌套仓库 "mt4proxy/"，外部根 "../other/"
+        var repos = byRepository.OrderByDescending(x => x.Repo.Prefix.Length).ToList();
+        var result = new Dictionary<string, List<string>>(ProjectRoots.PathComparer);
+        foreach (var file in files)
+        {
+            string? solution = null;
+            if (recorded.TryGetValue(file, out var rel) && Path.GetFullPath(Path.Combine(roots.Main, rel)) is var abs && available.Contains(abs)) solution = abs;
+            solution ??= repos.FirstOrDefault(x => file.StartsWith(x.Repo.Prefix, StringComparison.Ordinal) && available.Contains(x.Solution)).Solution;
+            if (solution is null && solutions.Count == 1) solution = solutions[0];
+            if (solution is null) { unassigned.Add(file); continue; }
+            if (!result.TryGetValue(solution, out var list)) result[solution] = list = [];
+            list.Add(file);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// 要记 roslyn_miss 的文件。增量：交给成功的解决方案却没输出的，加上分不到解决方案的。
+    /// 全量：所有仍未被覆盖的 C# 文件，除了按 Assign 规则归属失败的解决方案的。
+    /// </summary>
+    private static List<string> Misses(IndexDatabase db, IReadOnlyCollection<string>? pendingFiles, List<string> unassigned,
+        List<(string Solution, List<string>? Files)> succeeded, List<(string Solution, List<string>? Files)> runs, IReadOnlyList<string> solutions, ProjectRoots roots,
+        IReadOnlyList<(RepoDir Repo, string Solution)> byRepository, IReadOnlySet<string> processed)
+    {
+        if (pendingFiles is not null)
+            return [.. unassigned, .. succeeded.SelectMany(s => s.Files!).Where(f => !processed.Contains(f))];
+        var uncovered = db.Query<string>("SELECT path FROM files WHERE language = 'csharp' AND roslyn_at IS NULL");
+        if (succeeded.Count == runs.Count) return uncovered;
+        var ok = new HashSet<string>(succeeded.Select(s => s.Solution), ProjectRoots.PathComparer);
+        var result = new List<string>();
+        foreach (var (solution, files) in Assign(db, uncovered, solutions, roots, byRepository, result))
+            if (ok.Contains(solution)) result.AddRange(files);
+        return result;
+    }
+
+    /// <summary>解决方案相对主根的路径（'/' 分隔），存进 files.roslyn_sln。</summary>
+    private static string RelativeToMain(ProjectRoots roots, string solution) => Path.GetRelativePath(roots.Main, solution).Replace('\\', '/');
 
     private static void TryKill(Process process)
     {

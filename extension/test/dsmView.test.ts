@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bucket, buildModel, cellClass, cellText, heat, ruleLine, rulesSummary } from "../webview/dsmView";
+import { bucket, buildModel, cellClass, cellText, heat, hotRevisionsText, ruleLine, rulesSummary } from "../webview/dsmView";
 import type { DsmDto } from "../webview/types";
 
 const dto: DsmDto = {
@@ -113,5 +113,14 @@ describe("dsm rules overlay", () => {
     expect(m.rows[1]![2]!.violations.map((v) => v.rule.id)).toEqual([0, 3]);
     expect(m.rows[3]![1]!.requireUnmet).toBe(true);
     expect(m.violationCells).toBe(3);
+  });
+});
+
+describe("组件修订数文案", () => {
+  it("有去重后的提交数写「N 次提交」，没有就照实写「文件修订合计 N」（同一提交改几个文件算几次）", () => {
+    const hot = { revisions: 38, added: 1, deleted: 1, ageMonths: 0, lastCommit: "2026-10-16" };
+    expect(hotRevisionsText({ ...hot, commits: 18 })).toBe("18 次提交");
+    expect(hotRevisionsText(hot)).toBe("文件修订合计 38");
+    expect(hotRevisionsText({ ...hot, commits: null })).toBe("文件修订合计 38");
   });
 });

@@ -1,25 +1,29 @@
-import { Api, DefaultKinds, KindsWithReferences } from "./api";
+import { Api, neighborKinds } from "./api";
 import { SubKindLabels } from "./archLayout";
 import { ArchRenderer } from "./archRenderer";
+import { CallView, type CallViewMode, type SeqViewState } from "./callView";
 import { reorderDsm } from "./dsmOrder";
-import { DsmView, type DsmCellModel } from "./dsmView";
+import { DsmView, hotRevisionsText, type DsmCellModel } from "./dsmView";
 import { findSameEntry, hasDsmContent, isRepoContainer, MaxDefaultEntryTries, NoServiceHint, pickDefaultEntry, repoContainerNode, RepoDsmKey, shouldOpenRepoDsm, soleContainer } from "./firstScreen";
-import { EntryKindLabels, FlowView, entryTitle } from "./flowView";
+import { appendFlowHeadExtras, EntryKindLabels, FlowView, entryTitle } from "./flowView";
+import { frameworkJumpTarget, frameworkSummary, FrameworkTabTitle, pickFrameworkContainer, stageOfActor } from "./frameworkModel";
+import { FrameworkView } from "./frameworkView";
 import { NarrationCard, parseEdgeEvidence, type EvidenceRef } from "./narrationCard";
 import { DefaultPreset, LayoutPresets, presetLabel } from "./presets";
 import { GraphState, type ExpandOptions, type GraphEdge, type GraphNode } from "./graphState";
 import { MapRenderer } from "./mapRenderer";
-import { MapState } from "./mapState";
+import { MapState, saveMapViewChoice } from "./mapState";
+import { NavHistory, navTitle } from "./navHistory";
 import { host } from "./messaging";
+import { isTestSymbol, moduleOf, nodeLabel, qualifiedLabel, rankNeighbor } from "./neighborRank";
 import { collapseImplementations } from "./neighborRules";
-import type { CellKind } from "./pipelineLayout";
-import { PipelineRenderer } from "./pipelineRenderer";
 import { resolveRefreshedSymbol } from "./refresh";
 import { fileName, kindsSummary, RelationKindLabels, relationToCenter, reverseNote, unitKindLabel, unitLabel } from "./relationsLayout";
 import { RelationsRenderer } from "./relationsRenderer";
 import { RelationsHistory } from "./relationsState";
 import { Renderer } from "./renderer";
-import type { ArchDto, ArchEdgeDto, ArchNodeDto, DsmComponentDto, DsmDto, EntryDto, EvidenceDto, FlowDto, FlowNodeDto, MapEdgeDto, MapGroupDto, NarrativeKind, NeighborDto, PipelineBehaviorDto, PipelineDto, PipelineFlowDto, PipelineItemDto, PipelineRowDto, RelationComponentDto, RelationEdgeDto, RelationNodeDto, RelationsDto, SymbolDto } from "./types";
+import { isFocusableNode, SequenceDiagram } from "./seqDiagram";
+import type { ArchDto, ArchEdgeDto, ArchNodeDto, DsmComponentDto, DsmDto, EntryDto, EvidenceDto, FlowDto, FlowNodeDto, FrameworkFlowDto, MapEdgeDto, MapGroupDto, NarrativeKind, NeighborDto, RelationComponentDto, RelationEdgeDto, RelationNodeDto, RelationsDto, SymbolDto } from "./types";
 
 // ---------- DOM 骨架 ----------
 
@@ -27,26 +31,30 @@ const app = document.getElementById("app")!;
 const RelationsHint = "在编辑器里右键一个方法或类，或在调用图里选一个节点";
 app.innerHTML = `
   <header>
+    <span id="nav" class="seg"><button id="nav-back" class="tab" disabled title="没有可后退的（Alt+←）">←</button><button id="nav-fwd" class="tab" disabled title="没有可前进的（Alt+→）">→</button></span>
     <div id="mode"><button id="mode-graph" class="tab active">调用图</button><button id="mode-rel" class="tab" title="以一个类为中心看类与类之间的依赖，按组件分框">模块关系</button><button id="mode-map" class="tab">项目地图</button></div>
+    <span id="call-view" class="seg"><button class="tab" data-view="seq" title="时序：从焦点方法往下，按调用顺序从上往下、按项目分列（和入口流程同一种图）">时序</button><button class="tab" data-view="graph" title="网状：焦点的调用与被调用画成一张网，可以往上追调用者">网状</button></span>
     <input id="search" placeholder="搜索符号（前缀，多个词用空格）" autocomplete="off" />
     <div id="dropdown"></div>
     <nav id="crumbs"></nav>
     <span id="rel-opts" style="display:none"><span id="rel-depth" class="seg" title="1 = 只看与中心直接相连的类；2 = 再往外一层"><span class="seg-label">深度</span><button class="tab active" data-depth="1">1</button><button class="tab" data-depth="2">2</button></span><span id="rel-trunc" class="warn" style="display:none" title="服务端按与中心之间的边权重保留了前若干个">节点过多，只显示最相关的 40 个</span></span>
     <label class="opt" title="聚焦时自动沿调用/分发边向下展开到叶子"><input type="checkbox" id="auto-chain" checked /> 自动向下</label>
-    <label class="opt" title="每个节点自动展开几个最像主流程的分支，其余折成「还有 N 个」"><select id="branch-width"><option value="1">主线</option><option value="2" selected>2 分支</option><option value="3">3 分支</option><option value="5">5 分支</option><option value="30">全部</option></select></label>
+    <label class="opt" title="每个节点自动展开几个最像主流程的分支（调用与分发合计），其余折成「还有 N 个」"><select id="branch-width"><option value="1">主线</option><option value="2" selected>2 分支</option><option value="3">3 分支</option><option value="5">5 分支</option><option value="30">全部</option></select></label>
     <button id="chain-down" class="secondary" title="从焦点沿调用链向下展开到底">↓ 到底</button>
     <button id="chain-up" class="secondary" title="从焦点沿调用者向上追到源头">↑ 到源头</button>
+    <label class="opt" title="把继承 / 实现（类型之间的关系）也画进调用图。默认不画：它们不是「它调谁」；看类与类之间的关系请用「模块关系」视图"><input type="checkbox" id="show-types" /> 类型关系</label>
     <label class="opt" title="显示参数/字段等类型引用"><input type="checkbox" id="show-refs" /> 类型引用</label>
     <label class="opt" title="把测试项目里的调用者/被调用者也画出来"><input type="checkbox" id="show-tests" /> 测试代码</label>
     <label class="opt" title="显示分发管道本身：对 QueryAsync/SendAsync 的调用和消息对象的构造"><input type="checkbox" id="show-conduit" /> 分发细节</label>
     <label class="opt" title="编辑器光标移进哪个方法，调用图就以它为焦点（停下约 0.4 秒后换）"><input type="checkbox" id="follow-cursor" /> 跟随光标</label>
     <button id="reindex" class="secondary" title="增量索引">⟳ 索引</button>
   </header>
-  <main id="cy"><div id="hint">在编辑器里右键"在 CodeTrail Graph 中查看"，或在上面搜索一个符号。</div></main>
+  <main id="cy"><div id="hint">在编辑器里右键「CodeTrail Graph → 在调用图中查看」，或在上面搜索一个符号。</div></main>
+  <main id="seq" style="display:none"><div id="seq-diagram" class="flow-diagram"></div></main>
   <main id="rel" style="display:none"><div id="rel-cy"></div><div id="rel-hint">${RelationsHint}</div></main>
   <main id="map" style="display:none">
-    <nav id="map-crumbs"><span id="map-crumb-list"></span><span id="map-view"><button id="view-arch" class="tab" title="容器图：可部署单元、外部系统与它们之间的边">容器</button><button id="view-pipeline" class="tab" title="按管道角色（入口 → 消息 → 行为链 → Handler → 下游）分泳道">管道</button><button id="view-ns" class="tab" title="按命名空间 / 目录分组">命名空间</button></span><label class="opt" id="map-layout-wrap" title="版式预设：AI 的排版建议也只在这些里选" style="display:none"><span>版式</span><select id="map-layout"></select></label></nav>
-    <div id="arch-cy" style="display:none"></div><div id="dsm-view" style="display:none"></div><div id="flow-view" style="display:none"></div><div id="pipe-cy" style="display:none"></div><div id="map-cy"></div>
+    <nav id="map-crumbs"><span id="map-crumb-list"></span><span id="map-view"><button id="view-arch" class="tab" title="容器图：可部署单元、外部系统与它们之间的边">容器</button><button id="view-framework" class="tab" title="${FrameworkTabTitle}">框架流程</button><button id="view-ns" class="tab" title="按命名空间 / 目录分组">命名空间</button></span><label class="opt" id="map-layout-wrap" title="版式预设：AI 的排版建议也只在这些里选" style="display:none"><span>版式</span><select id="map-layout"></select></label></nav>
+    <div id="arch-cy" style="display:none"></div><div id="dsm-view" style="display:none"></div><div id="flow-view" style="display:none"></div><div id="fw-view" style="display:none"></div><div id="map-cy"></div>
     <aside id="narration"></aside>
   </main>
   <footer id="details"><span class="muted">未选中</span></footer>
@@ -84,11 +92,12 @@ const hintEl = $("hint");
 
 const state = new GraphState();
 const mapState = new MapState();
-const pipeState = new MapState();
 let api: Api | null = null;
+let graphSeq = 0;
+let symbolRequestSeq = 0;
+let dsmSeq = 0;
 let renderer: Renderer | null = null;
 let mapRenderer: MapRenderer | null = null;
-let pipelineRenderer: PipelineRenderer | null = null;
 let archRenderer: ArchRenderer | null = null;
 let archDto: ArchDto | null = null;
 let dsmView: DsmView | null = null;
@@ -102,6 +111,12 @@ let flowContainerKey: string | null = null;
 let flowEntries: EntryDto[] = [];
 let flowEntry: EntryDto | null = null;
 let flowDto: FlowDto | null = null;
+/** 框架流程视图：看的容器、取到的数据、请求批次号；各容器 HTTP 入口数（挑默认容器用，按需取一次）。 */
+let fwView: FrameworkView | null = null;
+let fwContainer: ArchNodeDto | null = null;
+let fwDto: FrameworkFlowDto | null = null;
+let fwSeq = 0;
+let httpCounts: Map<string, number> | null = null;
 /** 实际画出来的 DSM（按预设重排过的）；证据定位按它的下标找行列。 */
 let dsmShown: DsmDto | null = null;
 /** 右侧叙述卡（M5d）与三类对象当前用的版式预设。 */
@@ -122,8 +137,8 @@ let relSyncedFromGraph: number | null = null;
 let relSeq = 0;
 /** init 之前宿主发来的 showRelations。 */
 let pendingRelations: { symbolId: number; depth?: 1 | 2 } | null = null;
-type MapViewKind = "arch" | "dsm" | "flow" | "pipeline" | "ns";
-/** 地图模式下看哪个视图；null = 还没问过服务。有容器就从容器图开始，否则管道，再否则命名空间。 */
+type MapViewKind = "arch" | "dsm" | "flow" | "framework" | "ns";
+/** 地图模式下看哪个视图；null = 还没问过服务。有容器就从容器图开始（用户上次在顶层点的是框架流程 / 命名空间就进那个），否则命名空间。 */
 let mapView: MapViewKind | null = null;
 /**
  * 第一屏「只有一个容器就直接进它的入口流程」还没判过。每个仓库只自动跳一次：
@@ -133,6 +148,100 @@ let mapView: MapViewKind | null = null;
 let autoFlowPending = true;
 let selectedNode: GraphNode | null = null;
 
+/** 调用图的时序模式：渲染器与入口流程共用（SequenceDiagram）；单击行选中看详情，双击换焦点，点 ▸ 展开折叠。 */
+const seqDiagram = new SequenceDiagram($("seq-diagram"), {
+  header: seqHeader,
+  toggleOnRowClick: false,
+  onRowSelect: (node) => showSeqNodeDetails(node),
+  onRowDoubleClick: (node) => focusSeqNode(node),
+});
+/** 时序图里选中的行，与查到的它的符号（定位、带进模块关系用）。 */
+let seqSelected: FlowNodeDto | null = null;
+let seqSelectedSymbol: SymbolDto | null = null;
+/** 时序数据是退到入口流程接口拿到的（服务还没有 /api/symbols/{id}/flow）。 */
+const seqFromEntryFlow = new Set<number>();
+
+const callView = new CallView({
+  storage: () => window.localStorage,
+  loadFlow: loadSeqFlow,
+  showSeq,
+  focusGraph: (s) => focusSymbol(s),
+  chainUpGraph: (s) => expandChain(GraphState.nodeIdFor(s), "in"),
+  graphFocus: () => (state.focusNodeId ? state.getNode(state.focusNodeId)?.symbol ?? null : null),
+  onModeChange: (m: CallViewMode) => { graphSeq++; symbolRequestSeq++; applyCallViewChrome(); showCallDetails(); if (m === "graph" && graphStale) void refreshFocus(); },
+  onHistoryChange: () => renderCrumbs(),
+  onVisit: (s) => recordCall(s, "seq"),
+});
+
+// ---------- 后退 / 前进（跨模式的一条时间线，见 navHistory.ts）----------
+
+const nav = new NavHistory(() => renderNavButtons());
+
+function renderNavButtons(): void {
+  const back = document.getElementById("nav-back") as HTMLButtonElement | null;
+  const fwd = document.getElementById("nav-fwd") as HTMLButtonElement | null;
+  if (!back || !fwd) return;
+  back.disabled = !nav.canBack || nav.isRestoring;
+  fwd.disabled = !nav.canForward || nav.isRestoring;
+  back.title = navTitle("back", nav.backTarget);
+  fwd.title = navTitle("forward", nav.forwardTarget);
+}
+
+/** 调用图：焦点 + 画法（时序 / 网状）。 */
+function recordCall(s: SymbolDto, view: CallViewMode): void {
+  nav.record({ key: `call:${view}:${s.id}`, label: `调用图（${view === "seq" ? "时序" : "网状"}）· ${nodeLabel(s)}`, restore: () => restoreCall(s, view) });
+}
+
+async function restoreCall(s: SymbolDto, view: CallViewMode): Promise<void> {
+  if (mode !== "graph") setMode("graph");
+  if (callView.mode !== view) await callView.setMode(view, false);
+  if (callView.focusId() !== s.id) await callView.focus(s);
+}
+
+/** 模块关系：中心单元。 */
+function recordRel(center: SymbolDto): void {
+  nav.record({ key: `rel:${center.id}`, label: `模块关系 · ${unitLabel(center)}`, restore: () => showRelationsFor(center.id) });
+}
+
+/** 项目地图：当前视图与它的上下文（容器、入口、框架流程的容器、命名空间路径）拍一张快照。 */
+function recordMap(): void {
+  if (mapView === null) return;
+  const view = mapView;
+  const container = dsmContainer;
+  const entry = view === "flow" ? flowEntry : null;
+  const fw = view === "framework" ? fwContainer : null;
+  const roots = view === "ns" ? mapState.crumbs.slice(1).map((c) => c.root) : [];
+  const key = `map:${view}:${view === "dsm" || view === "flow" ? container?.key ?? "" : ""}:${entry?.symbolId ?? ""}:${fw?.key ?? ""}:${roots.join(">")}`;
+  const label = view === "arch" ? "项目地图 · 容器图"
+    : view === "dsm" ? `组件矩阵 · ${container?.name ?? ""}`
+    : view === "flow" ? (entry ? `入口流程 · ${entryTitle(entry)}` : `入口清单 · ${container?.name ?? ""}`)
+    : view === "framework" ? `框架流程 · ${fw?.name ?? ""}`
+    : `命名空间 · ${roots[roots.length - 1] ?? "项目"}`;
+  nav.record({ key, label, restore: () => restoreMap(view, container, entry, fw, roots) });
+}
+
+async function restoreMap(view: MapViewKind, container: ArchNodeDto | null, entry: EntryDto | null, fw: ArchNodeDto | null, roots: string[]): Promise<void> {
+  autoPickSeq++;
+  if ((view === "dsm" || view === "flow") && container) dsmContainer = container;
+  if (view === "dsm") dsmPath = [];
+  if (view === "flow" && container) {
+    if (flowContainerKey !== container.key) { flowContainerKey = container.key; flowEntries = []; }
+    flowEntry = entry;
+    flowDto = null;
+  }
+  if (view === "framework" && fw) fwContainer = fw;
+  if (view === "ns") { mapState.reset(); for (const r of roots) mapState.drill(r); }
+  if (view === "arch" && card && card.currentKind !== null && card.currentKind !== "container") card.clear();
+  if ((view === "dsm" || view === "flow") && container) { if (isRepoContainer(container)) card?.clear(); else if (!entry) showContainerCard(container); }
+  applyMapView(view);
+  if (mode !== "map") setMode("map", true, false);
+  await loadMapView();
+  if (view === "flow" && entry) await selectFlowEntry(findSameEntry(flowEntries, entry) ?? entry);
+}
+
+function navBack(): void { if (!nav.isRestoring) void nav.back(); }
+function navForward(): void { if (!nav.isRestoring) void nav.forward(); }
+
 /** 链展开的安全阀：深度与每个节点的分支数。超过分支数就停在那个节点，让用户手动展开。 */
 const ChainMaxDepth = 12;
 const ChainMaxFanout = 6;
@@ -141,39 +250,15 @@ function branchWidth(): number {
   return Number($<HTMLSelectElement>("branch-width").value) || 2;
 }
 
-/** 名字一看就是校验/日志/判断类的辅助方法，不太可能是主流程。 */
-const UtilityName = /^(Validate|Ensure|Check|Format|Log[A-Z]|Is[A-Z]|Has[A-Z]|Can[A-Z]|Try[A-Z]|ThrowIf|Assert|Guard|Normalize|Sanitize)/;
-
 let focusModule = "";
-function moduleOf(qname: string): string {
-  const parts = qname.split(/[.:/]/);
-  return parts.slice(0, 2).join(".");
-}
 
-/**
- * 一条边像不像主流程：分发边最像，仓库内普通调用其次；被几十处调用的工具方法、校验/日志类名字、测试代码降权。
- * 外部调用在 GraphState 里单独折叠，这里不用管。
- */
-function rankNeighbor(n: NeighborDto): number {
-  let s = 0;
-  if (n.kind === "dispatches") s += 100;
-  else if (n.kind === "calls") s += 30;
-  else if (n.kind === "implements" || n.kind === "inherits") s += 10;
-  s += n.confidence * 20;
-  const o = n.other;
-  if (o) {
-    if (isTestSymbol(o)) s -= 200;
-    if (UtilityName.test(o.name)) s -= 50;
-    const callers = o.callers ?? 0;
-    if (callers > 40) s -= 60;
-    else if (callers > 15) s -= 25;
-    if (focusModule && moduleOf(o.qualifiedName) === focusModule) s += 15;
-  }
-  return s;
+/** 挑分支的打分见 neighborRank.rankNeighbor（纯函数，有单测）。 */
+function rank(n: NeighborDto): number {
+  return rankNeighbor(n, { focusModule });
 }
 
 function expandOptions(): ExpandOptions {
-  return { limit: branchWidth(), rank: rankNeighbor };
+  return { limit: branchWidth(), rank };
 }
 
 /** 展开时记住每个节点是经哪条边进来的，用来选主干。 */
@@ -183,17 +268,13 @@ function remember(neighbors: NeighborDto[]): void {
 }
 
 function currentKinds(): string {
-  return $<HTMLInputElement>("show-refs").checked ? KindsWithReferences : DefaultKinds;
+  return neighborKinds({ references: $<HTMLInputElement>("show-refs").checked, typeRelations: $<HTMLInputElement>("show-types").checked });
 }
 function autoChainEnabled(): boolean {
   return $<HTMLInputElement>("auto-chain").checked;
 }
 
-/** 测试代码判定：路径或限定名里带 Tests/Test/Spec 段。追源头时测试方法是最大的噪声，默认不画。 */
-const TestPathPattern = /(^|[\/.])(tests?|__tests__|spec|specs)([\/.]|$)|\.(test|spec)\.[tj]sx?$|Tests?\.cs$/i;
-function isTestSymbol(s: SymbolDto): boolean {
-  return TestPathPattern.test(s.path) || /\.Tests?\./.test(s.qualifiedName);
-}
+/** 测试代码（neighborRank.isTestSymbol）：追源头时测试方法是最大的噪声，默认不画。 */
 function filterNeighbors(neighbors: NeighborDto[]): NeighborDto[] {
   const showTests = $<HTMLInputElement>("show-tests").checked;
   const showConduit = $<HTMLInputElement>("show-conduit").checked;
@@ -220,13 +301,14 @@ function render(): void {
 function renderCrumbs(): void {
   crumbsEl.innerHTML = "";
   if (mode === "relations") { renderRelationsCrumbs(); return; }
+  if (mode === "graph" && callView.mode === "seq") { renderSeqCrumbs(); return; }
   state.breadcrumbs.forEach((b, i) => {
     if (i > 0) crumbsEl.insertAdjacentHTML("beforeend", '<span class="sep">›</span>');
     const el = document.createElement("span");
     el.className = "crumb" + (i === state.breadcrumbIndex ? " current" : "");
     el.textContent = b.label;
     el.title = b.focusNodeId;
-    el.onclick = () => { state.goTo(i); render(); };
+    el.onclick = () => { graphSeq++; symbolRequestSeq++; state.goTo(i); render(); };
     crumbsEl.appendChild(el);
   });
 }
@@ -234,7 +316,7 @@ function renderCrumbs(): void {
 function edgeKindText(e: GraphEdge): string {
   if (e.kind === "dispatches") return e.label === "handles" ? "handles（Handler 处理该类型）" : `分发：${e.label} 交给它的 Handler 处理`;
   if (e.label === "conduit") return "calls（分发管道）";
-  if (e.label === "impl") return "calls（接口→唯一实现）";
+  if (e.label === "impl") return e.viaInterface ? `calls（经接口 ${qualifiedLabel(e.viaInterface)} → 唯一实现，已合成一个节点）` : "calls（接口→实现）";
   return e.kind;
 }
 
@@ -258,6 +340,8 @@ function showNodeDetails(n: GraphNode | null): void {
       (s.signature ? `<span class="muted mono" style="margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.signature)}</span>` : "");
     detailsEl.querySelector<HTMLAnchorElement>("#open-link")?.addEventListener("click", () => openInEditor(s));
     if (n.expandedIn && state.chainTargets(n.id, "in").length === 0) detailsEl.insertAdjacentHTML("beforeend", '<span class="kind">入口?</span><span class="muted">没有找到调用者</span>');
+  } else if (n.type === "ambiguous" && n.callers) {
+    detailsEl.innerHTML = `<span class="kind">调用者</span><span>${esc(n.label)}：调用者默认不画（调用图先看它调谁），点一下胶囊加入图</span><span class="muted">谁调了它、一路影响到哪些入口：用「影响范围」视图</span>`;
   } else if (n.type === "ambiguous") {
     detailsEl.innerHTML = `<span class="kind">${n.externalGroup ? "框架调用" : n.overflow ? "已折叠" : "多候选"}</span><span>${n.label}，双击节点选择要加入的</span>`;
   } else {
@@ -284,17 +368,173 @@ function openInEditor(s: SymbolDto): void {
 
 // ---------- 核心动作 ----------
 
+/**
+ * 网状图：以 symbol 为焦点重画。取两侧邻居，但只画「它调谁」；调用者收进一个「被 N 处调用」胶囊，点开再加入。
+ */
 async function focusSymbol(symbol: SymbolDto, replace = false): Promise<void> {
   if (!api) return;
-  const neighbors = filterNeighbors(await api.neighbors(symbol.id, "both", currentKinds()));
+  const a = api;
+  const seq = ++graphSeq;
+  const neighbors = filterNeighbors(await a.neighbors(symbol.id, "both", currentKinds()));
+  if (seq !== graphSeq || a !== api) return;
   focusModule = moduleOf(symbol.qualifiedName);
   arrivedBy.clear();
   remember(neighbors);
-  if (replace) state.replaceFocus(symbol, neighbors, expandOptions());
-  else state.setFocus(symbol, neighbors, expandOptions());
+  const opts = { ...expandOptions(), callersCapsule: true };
+  graphStale = false;
+  if (replace) state.replaceFocus(symbol, neighbors, opts);
+  else { state.setFocus(symbol, neighbors, opts); recordCall(symbol, "graph"); }
   render();
   showNodeDetails(state.getNode(GraphState.nodeIdFor(symbol)) ?? null);
   if (autoChainEnabled()) await expandChain(GraphState.nodeIdFor(symbol), "out");
+}
+
+/** 点开「被 N 处调用」胶囊。 */
+function expandCallersCapsule(node: GraphNode): void {
+  // 单击已经点开过时，双击带来的是旧胶囊：什么都不做
+  if (!state.getNode(node.id)?.callers) return;
+  state.expandCallers(node.id, expandOptions());
+  render();
+  showNodeDetails(node.anchor ? state.getNode(node.anchor.nodeId) ?? null : null);
+}
+
+/** 调用图里所有「设为焦点」的入口：按当前画法（时序 / 网状）重画；不在调用图模式就先切过来。 */
+function focusCall(symbol: SymbolDto, chain?: "in" | "out"): Promise<void> {
+  symbolRequestSeq++;
+  if (mode !== "graph") setMode("graph");
+  return callView.focus(symbol, { chain });
+}
+
+// ---------- 调用图 · 时序 ----------
+
+/** 时序数据：新接口 /api/symbols/{id}/flow；旧服务没有（404）时退到入口流程接口——入口符号还能出图。 */
+async function loadSeqFlow(symbol: SymbolDto): Promise<FlowDto | null> {
+  if (!api) return null;
+  const f = await api.symbolFlow(symbol.id);
+  if (f) { seqFromEntryFlow.delete(symbol.id); return f; }
+  const e = await api.flow(symbol.id);
+  if (e) seqFromEntryFlow.add(symbol.id);
+  return e;
+}
+
+function showSeq(view: SeqViewState): void {
+  seqSelected = null;
+  seqSelectedSymbol = null;
+  hintEl.style.display = "none";
+  switch (view.status) {
+    case "empty":
+      seqDiagram.clear("在编辑器里右键「CodeTrail Graph → 在调用图中查看」，或在上面搜索一个方法：从它出发往下，按调用顺序画时序图。");
+      break;
+    case "loading":
+      seqDiagram.clear(`正在取 ${nodeLabel(view.symbol)} 的调用时序…`);
+      break;
+    case "missing": {
+      seqDiagram.clear(`拿不到 ${nodeLabel(view.symbol)} 的调用时序：服务版本太旧（没有 /api/symbols/{id}/flow，重启服务或更新扩展；入口方法仍能出图），或符号已不在索引里。`);
+      const b = document.createElement("button");
+      b.className = "secondary flow-switch";
+      b.textContent = "切到网状看";
+      b.onclick = () => void callView.setMode("graph");
+      $("seq-diagram").appendChild(b);
+      break;
+    }
+    case "error":
+      seqDiagram.clear(`取调用时序失败：${view.message}`);
+      break;
+    case "ready":
+      seqDiagram.render(view.dto);
+      break;
+  }
+  if (mode === "graph" && callView.mode === "seq") showSeqFocusDetails();
+}
+
+/** 时序图标题：焦点「类型.方法」、文件:行、节点数、是否截断；再加行为链与服务端提示。 */
+function seqHeader(dto: FlowDto): HTMLElement {
+  const v = callView.seqView;
+  const s = v.status === "ready" ? v.symbol : null;
+  const head = document.createElement("div");
+  head.className = "flow-head";
+  const label = s ? nodeLabel(s) : dto.entryLabel;
+  const stats = [`${dto.nodes} 个节点`];
+  if (dto.truncated) stats.push("已截断");
+  const where = s ? `${s.path}:${s.startLine}` : "";
+  head.innerHTML = `<div class="flow-title"><span class="kind">调用</span><span class="label" title="${esc(s?.qualifiedName ?? dto.entryLabel)}">${esc(label)}</span>` +
+    (dto.route && dto.route !== label ? `<span class="muted">${esc(dto.route)}</span>` : "") +
+    (where ? `<a class="flow-where" title="在编辑器中打开">${esc(where)}</a>` : "") +
+    `<span class="muted">${esc(stats.join("，"))}</span></div>`;
+  appendFlowHeadExtras(head, dto, (d) => void gotoFramework(d));
+  head.insertAdjacentHTML("beforeend", (s && seqFromEntryFlow.has(s.id) ? `<div class="flow-note">服务还没有「任意方法的时序」接口，这里用的是入口流程的数据</div>` : "") +
+    `<div class="muted flow-hint">单击行看详情，双击行以它为焦点重画，点 ▸ 展开 / 折叠；要看谁调了它，点「↑ 到源头」或用影响范围视图</div>`);
+  if (s) head.querySelector<HTMLAnchorElement>(".flow-where")?.addEventListener("click", () => openInEditor(s));
+  return head;
+}
+
+function renderSeqCrumbs(): void {
+  callView.history.crumbs.forEach((c, i) => {
+    if (i > 0) crumbsEl.insertAdjacentHTML("beforeend", '<span class="sep">›</span>');
+    const el = document.createElement("span");
+    el.className = "crumb" + (i === callView.history.currentIndex ? " current" : "");
+    el.textContent = c.label;
+    el.title = c.symbol.qualifiedName;
+    el.onclick = () => void callView.goTo(i);
+    crumbsEl.appendChild(el);
+  });
+}
+
+/** 详情条：时序焦点本身。 */
+function showSeqFocusDetails(): void {
+  const v = callView.seqView;
+  if (v.status === "empty") { detailsEl.innerHTML = '<span class="muted">未选中</span>'; return; }
+  const s = v.symbol;
+  const stats = v.status === "ready" ? `<span class="muted">${v.dto.actors.length} 个参与者 · ${v.dto.nodes} 个节点${v.dto.truncated ? " · 已截断" : ""}</span>` : "";
+  detailsEl.innerHTML = `<span class="kind">焦点</span><span class="mono" title="${esc(s.qualifiedName)}">${esc(s.qualifiedName)}</span><span class="muted">${esc(s.path)}:${s.startLine}</span>` +
+    (s.kind !== "external" ? `<a id="open-link">在编辑器中打开</a>` : "") + stats;
+  detailsEl.querySelector<HTMLAnchorElement>("#open-link")?.addEventListener("click", () => openInEditor(s));
+}
+
+const FlowKindLabels: Record<string, string> = { entry: "焦点", call: "调用", dispatch: "分发", hop: "跨服务", "external-group": "框架调用", more: "已折叠", function: "函数", http: "接口调用", handlers: "Handler", controllers: "控制器" };
+
+/**
+ * 详情条：单击的那一行。限定名直接有；文件:行要按 symbolId 查（节点自己带了 path / line 就直接用）。
+ * onFocus 是「设为焦点」做什么：调用图里换焦点；框架流程里传 focusInCallSeq（切到调用图时序模式），链接文字也跟着换。
+ */
+function showSeqNodeDetails(node: FlowNodeDto, onFocus: (node: FlowNodeDto) => void = focusSeqNode, kindLabel?: string): void {
+  seqSelected = node;
+  seqSelectedSymbol = null;
+  const kind = kindLabel ?? FlowKindLabels[node.kind] ?? node.kind;
+  const focusable = isFocusableNode(node);
+  const loc = node.path ? `${node.path}${node.line ? ":" + node.line : ""}` : focusable ? "…" : "";
+  detailsEl.innerHTML = `<span class="kind">${esc(kind)}</span><span class="mono" title="${esc(node.qualifiedName)}">${esc(node.qualifiedName || node.label)}</span>` +
+    (loc ? `<span class="muted" id="seq-loc">${esc(loc)}</span>` : "") +
+    (focusable ? `<a id="open-link">在编辑器中打开</a><a id="seq-focus">${onFocus === focusSeqNode ? "设为焦点" : "在调用图中查看"}</a>` : "") +
+    (node.via ? `<span class="muted">via ${esc(node.via)}</span>` : "") +
+    (node.note ? `<span class="muted">${esc(node.note)}</span>` : "") +
+    (node.confidence < 1 ? `<span class="muted">confidence ${node.confidence.toFixed(2)}（${confidenceText(node.confidence)}）</span>` : "");
+  detailsEl.querySelector<HTMLAnchorElement>("#open-link")?.addEventListener("click", () => openSeqNode(node));
+  detailsEl.querySelector<HTMLAnchorElement>("#seq-focus")?.addEventListener("click", () => onFocus(node));
+  if (!focusable || node.path || node.symbolId === null || !api) return;
+  const id = node.symbolId;
+  void api.symbol(id).then((s) => {
+    if (seqSelected !== node) return;
+    seqSelectedSymbol = s;
+    const el = document.getElementById("seq-loc");
+    if (el) el.textContent = s ? `${s.path}:${s.startLine}` : "符号已不在索引里";
+  });
+}
+
+/** 在编辑器中打开时序图里的一个节点：带 pos 时宿主优先用 pos；没有位置就按 symbolId 查符号。 */
+async function openSeqNode(node: FlowNodeDto): Promise<void> {
+  if (node.path) { openLocation(node.path, node.line ?? 1, 1, node.pos ?? null); return; }
+  if (node.symbolId === null || !api) return;
+  const s = seqSelected === node && seqSelectedSymbol ? seqSelectedSymbol : await api.symbol(node.symbolId);
+  if (!s) { toast("符号在索引里找不到了"); return; }
+  openLocation(s.path, s.startLine, s.startCol, node.pos ?? null);
+}
+
+/** 双击 / 「设为焦点」：以这一行为新焦点重画时序图（记进面包屑）。 */
+function focusSeqNode(node: FlowNodeDto): void {
+  if (!isFocusableNode(node) || node.symbolId === null) return;
+  if (node.symbolId === callView.history.current?.id) { toast("已经是焦点"); return; }
+  void focusSymbolById(node.symbolId);
 }
 
 /** 从焦点出发，每一步选分最高的孩子，直到叶子：这就是主干。 */
@@ -305,7 +545,7 @@ function highlightTrunk(): void {
   for (;;) {
     const targets = state.chainTargets(path[path.length - 1]!, "out").filter((t) => !visited.has(t.id));
     if (targets.length === 0) break;
-    targets.sort((a, b) => (arrivedBy.has(b.id) ? rankNeighbor(arrivedBy.get(b.id)!) : 0) - (arrivedBy.has(a.id) ? rankNeighbor(arrivedBy.get(a.id)!) : 0));
+    targets.sort((a, b) => (arrivedBy.has(b.id) ? rank(arrivedBy.get(b.id)!) : 0) - (arrivedBy.has(a.id) ? rank(arrivedBy.get(a.id)!) : 0));
     const next = targets[0]!;
     visited.add(next.id);
     path.push(next.id);
@@ -319,6 +559,24 @@ function highlightTrunk(): void {
  */
 async function expandChain(startId: string, side: "out" | "in"): Promise<void> {
   if (!api) return;
+  const a = api;
+  const seq = graphSeq;
+  const focus = state.focusNodeId;
+  // 往上追：焦点的调用者还收在「被 N 处调用」胶囊里，先放出来
+  if (side === "in") {
+    const capsule = state.callersCapsule(startId);
+    if (capsule) state.expandCallers(capsule.id, expandOptions());
+    else {
+      const start = state.getNode(startId);
+      if (start?.symbol && !start.expandedIn) {
+        const neighbors = filterNeighbors(await a.neighbors(start.symbol.id, "in", currentKinds()));
+        if (seq !== graphSeq || a !== api || focus !== state.focusNodeId) return;
+        remember(neighbors);
+        state.expand(startId, neighbors, "in", expandOptions());
+      }
+    }
+    render();
+  }
   const visited = new Set<string>([startId]);
   let frontier = state.chainTargets(startId, side);
   const stoppedAt: string[] = [];
@@ -329,7 +587,8 @@ async function expandChain(startId: string, side: "out" | "in"): Promise<void> {
       visited.add(node.id);
       const already = side === "out" ? node.expandedOut : node.expandedIn;
       if (!already) {
-        const neighbors = filterNeighbors(await api.neighbors(node.symbol.id, side, currentKinds()));
+        const neighbors = filterNeighbors(await a.neighbors(node.symbol.id, side, currentKinds()));
+        if (seq !== graphSeq || a !== api || focus !== state.focusNodeId) return;
         remember(neighbors);
         state.expand(node.id, neighbors, side, expandOptions());
       }
@@ -344,19 +603,27 @@ async function expandChain(startId: string, side: "out" | "in"): Promise<void> {
   if (stoppedAt.length > 0) toast(`${stoppedAt.slice(0, 3).join("、")}${stoppedAt.length > 3 ? " 等" : ""} 分支超过 ${ChainMaxFanout} 个，已停止自动展开，双击可继续`, 5000);
 }
 
-async function expandNode(node: GraphNode): Promise<void> {
+/**
+ * 展开一个节点。默认只展开「它调谁」（out）：调用图看的是往下走；「谁调它」用右键「展开调用者」或影响范围视图。
+ * 已经展开过 out 时（再双击）就跳代码，见 Renderer 的双击回调。
+ */
+async function expandNode(node: GraphNode, side: "out" | "in" = "out"): Promise<void> {
   if (!api || node.type !== "symbol" || !node.symbol || !node.expandable) return;
-  const neighbors = filterNeighbors(await api.neighbors(node.symbol.id, "both", currentKinds()));
+  const a = api;
+  const seq = graphSeq;
+  const focus = state.focusNodeId;
+  const neighbors = filterNeighbors(await a.neighbors(node.symbol.id, side, currentKinds()));
+  if (seq !== graphSeq || a !== api || focus !== state.focusNodeId) return;
   remember(neighbors);
   // 超过每侧上限的邻居由 GraphState 自动折成"还有 N 个"胶囊，点开再选；没有邻居也算展开过，再双击就跳代码
-  state.expand(node.id, neighbors, "both", expandOptions());
-  if (neighbors.length === 0) toast("没有更多邻居");
+  state.expand(node.id, neighbors, side, expandOptions());
+  if (neighbors.length === 0) toast(side === "out" ? "它没有再调别的（仓库内）" : "没有找到调用者");
   render();
 }
 
 async function expandCapsule(node: GraphNode): Promise<void> {
   const members = state.getCapsuleMembers(node.id);
-  const title = node.overflow ? `${node.label}，选择要加入图的` : `${node.label}：这些同名符号都可能是真正的目标`;
+  const title = node.callers ? `${node.label}，选择要加入图的调用者` : node.overflow ? `${node.label}，选择要加入图的` : `${node.label}：这些同名符号都可能是真正的目标`;
   const chosen = await chooseNeighbors(title, members);
   if (!chosen || chosen.length === 0) return;
   state.expandAmbiguous(node.id, chosen.map((m) => m.edgeId));
@@ -404,9 +671,18 @@ function showContextMenu(node: GraphNode, x: number, y: number): void {
     const s = node.symbol;
     items.push({ label: "设为焦点", run: () => void focusSymbol(s) });
     if (s.kind !== "external") items.push({ label: "在模块关系中查看", run: () => showRelationsFor(s.id) });
-    if (node.expandable) items.push({ label: node.expanded ? "折叠邻居" : "展开一层", run: () => (node.expanded ? (state.collapse(node.id), render()) : void expandNode(node)) });
+    if (node.expandable) {
+      if (node.expandedOut || node.expandedIn) items.push({ label: "折叠邻居", run: () => { state.collapse(node.id); render(); } });
+      if (!node.expandedOut) items.push({ label: "展开一层（它调谁）", run: () => void expandNode(node, "out") });
+      const capsule = state.callersCapsule(node.id);
+      if (capsule) items.push({ label: `加入调用者（${capsule.label}）`, run: () => expandCallersCapsule(capsule) });
+      else if (!node.expandedIn) items.push({ label: "展开调用者（谁调它）", run: () => void expandNode(node, "in") });
+    }
     if (node.id !== state.focusNodeId) items.push({ label: "从图中隐藏", run: () => { state.hide(node.id); render(); } });
     if (s.kind !== "external") items.push({ label: "在编辑器中打开", run: () => openInEditor(s) });
+  } else if (node.type === "ambiguous" && node.callers) {
+    items.push({ label: "全部加入图", run: () => expandCallersCapsule(node) });
+    items.push({ label: "选择要加入的调用者…", run: () => void expandCapsule(node) });
   } else if (node.type === "ambiguous") {
     items.push({ label: "选择要加入的目标…", run: () => void expandCapsule(node) });
     items.push({ label: "从图中隐藏", run: () => { state.hide(node.id); render(); } });
@@ -428,21 +704,29 @@ function openMenu(items: MenuItem[], x: number, y: number): void {
 document.addEventListener("click", () => ctxmenu.classList.remove("open"));
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") { ctxmenu.classList.remove("open"); chooser.classList.remove("open"); dropdown.classList.remove("open"); }
-  if (e.key === "Enter" && mode === "graph" && selectedNode?.type === "symbol" && selectedNode.symbol && document.activeElement !== searchEl) openInEditor(selectedNode.symbol);
+  if (e.key === "Enter" && mode === "graph" && document.activeElement !== searchEl) {
+    if (callView.mode === "seq") { if (seqSelected) openSeqNode(seqSelected); }
+    else if (selectedNode?.type === "symbol" && selectedNode.symbol) openInEditor(selectedNode.symbol);
+  }
 });
 
 // ---------- 搜索 ----------
 
 let searchTimer = 0;
+let searchSeq = 0;
 let activeIndex = -1;
 let lastHits: SymbolDto[] = [];
 searchEl.addEventListener("input", () => {
   window.clearTimeout(searchTimer);
+  const seq = ++searchSeq;
   const q = searchEl.value.trim();
   if (!q) { dropdown.classList.remove("open"); return; }
   searchTimer = window.setTimeout(async () => {
     if (!api) return;
-    lastHits = await api.search(q, 20);
+    const a = api;
+    const hits = await a.search(q, 20);
+    if (seq !== searchSeq || a !== api || searchEl.value.trim() !== q) return;
+    lastHits = hits;
     activeIndex = -1;
     dropdown.innerHTML = lastHits.length === 0
       ? '<div class="item"><span class="muted">没有匹配</span></div>'
@@ -463,14 +747,14 @@ function highlight(): void {
   dropdown.querySelectorAll<HTMLElement>(".item[data-i]").forEach((el, i) => el.classList.toggle("active", i === activeIndex));
 }
 function pick(i: number): void {
+  searchSeq++;
   const s = lastHits[i];
   dropdown.classList.remove("open");
   if (!s) return;
   searchEl.value = "";
   // 在当前模式下打开：模块关系里以它为中心；调用图（以及项目地图，地图没有"符号焦点"）里聚焦它
   if (mode === "relations") { void openRelations(s.id, "push"); return; }
-  if (mode !== "graph") setMode("graph");
-  void focusSymbol(s);
+  void focusCall(s);
 }
 
 // ---------- 模块关系 ----------
@@ -482,8 +766,12 @@ function relParamKey(): string {
   return `${relDepth}|${relTests()}`;
 }
 
-/** 调用图里能带进模块关系的符号：选中的符号节点优先，其次焦点；外部 / 悬空 / 多候选不算。 */
+/** 调用图里能带进模块关系的符号：选中的符号节点优先，其次焦点；外部 / 悬空 / 多候选不算。时序模式看选中的行与时序焦点。 */
 function graphSymbolForRelations(): SymbolDto | null {
+  if (callView.mode === "seq") {
+    const s = seqSelectedSymbol ?? callView.history.current;
+    return s && s.kind !== "external" ? s : null;
+  }
   const pickable = (n: GraphNode | null | undefined): SymbolDto | null => (n && n.type === "symbol" && n.symbol && n.symbol.kind !== "external" ? n.symbol : null);
   return pickable(selectedNode) ?? pickable(state.focusNodeId ? state.getNode(state.focusNodeId) : null);
 }
@@ -558,7 +846,7 @@ async function openRelations(target: number | SymbolDto, how: "push" | "replace"
   relDto = dto;
   relParams = params;
   const label = unitLabel(dto.focus);
-  if (how === "push") relHistory.visit(dto.focus, label);
+  if (how === "push") { relHistory.visit(dto.focus, label); recordRel(dto.focus); }
   else relHistory.replaceCurrent(dto.focus, label);
   relRenderer!.render(dto);
   renderRelationsChrome();
@@ -660,7 +948,7 @@ function showRelContextMenu(n: RelationNodeDto, x: number, y: number): void {
   const canOpen = !n.external && u.kind !== "external";
   const items: MenuItem[] = [
     { label: "在编辑器中打开", run: canOpen ? () => openInEditor(u) : undefined },
-    { label: "在调用图中查看", run: canOpen ? () => { setMode("graph"); void focusSymbol(u); } : undefined },
+    { label: "在调用图中查看", run: canOpen ? () => void focusCall(u) : undefined },
     { label: "设为中心", run: u.id !== relDto?.focus.id ? () => void openRelations(u, "push") : undefined },
   ];
   openMenu(items, x, y);
@@ -695,43 +983,75 @@ async function refreshRelations(): Promise<void> {
  * 切模式。sync=true（用户点顶部的「模块关系」）时，调用图里有选中 / 焦点符号且和上次带过去的不同，就以它为中心打开；
  * 宿主的 showRelations、右键「在模块关系中查看」自己指定中心，传 false。
  */
-function setMode(next: Mode, sync = true): void {
+/** load=false：只摆界面不取地图数据（后退恢复地图时自己接着取，免得先画一遍旧视图）。 */
+function setMode(next: Mode, sync = true, load = true): void {
+  if (next !== mode) { graphSeq++; symbolRequestSeq++; }
   mode = next;
   app.dataset["mode"] = next;
-  $("cy").style.display = next === "graph" ? "" : "none";
   $("rel").style.display = next === "relations" ? "" : "none";
   $("map").style.display = next === "map" ? "" : "none";
   $("mode-graph").classList.toggle("active", next === "graph");
   $("mode-rel").classList.toggle("active", next === "relations");
   $("mode-map").classList.toggle("active", next === "map");
-  for (const id of ["auto-chain", "chain-down", "chain-up", "show-refs", "show-conduit", "branch-width", "follow-cursor"]) {
-    const el = $(id);
-    (el.closest("label") ?? el).style.display = next === "graph" ? "" : "none";
-  }
-  // 「测试代码」开关两种模式共用：调用图里过滤测试邻居，模块关系里是 tests=true/false
-  $("show-tests").closest("label")!.style.display = next === "map" ? "none" : "";
   $("rel-opts").style.display = next === "relations" ? "" : "none";
-  renderCrumbs();
-  if (next === "map") { mapRenderer?.resize(); pipelineRenderer?.resize(); archRenderer?.resize(); void loadMapView(); }
-  else if (next === "relations") enterRelations(sync);
-  else { renderer?.resize(); showNodeDetails(selectedNode); }
+  applyCallViewChrome();
+  if (next === "map") { mapRenderer?.resize(); archRenderer?.resize(); if (load) void loadMapView(); recordMap(); }
+  else if (next === "relations") { enterRelations(sync); if (relHistory.current) recordRel(relHistory.current); }
+  else {
+    showCallDetails();
+    const s = callView.mode === "seq" ? callView.history.current : (state.focusNodeId ? state.getNode(state.focusNodeId)?.symbol ?? null : null);
+    if (s) recordCall(s, callView.mode);
+  }
 }
 
-/** 第一次进地图模式先问服务：有容器就从容器图开始；没有再看有没有分发数据（管道）；都没有就命名空间视图。 */
+/** 只对网状图有意义的工具栏控件：时序模式下隐藏（时序图由服务端按固定深度 / 分支数建好，这些开关改不了它）。 */
+const GraphOnlyControls = ["auto-chain", "chain-down", "branch-width", "show-types", "show-refs", "show-conduit"];
+
+/** 按「模式 + 时序 / 网状」摆好画布区与工具栏。 */
+function applyCallViewChrome(): void {
+  const graph = mode === "graph";
+  const seq = graph && callView.mode === "seq";
+  $("cy").style.display = graph && !seq ? "" : "none";
+  $("seq").style.display = seq ? "" : "none";
+  $("call-view").style.display = graph ? "" : "none";
+  $("call-view").querySelectorAll<HTMLButtonElement>("button[data-view]").forEach((b) => b.classList.toggle("active", b.dataset["view"] === callView.mode));
+  for (const id of GraphOnlyControls) {
+    const el = $(id);
+    (el.closest("label") ?? el).style.display = graph && !seq ? "" : "none";
+  }
+  // 「↑ 到源头」两种画法都留着：时序图只画往下的调用，在时序模式下点它 = 切到网状再往上追
+  $("chain-up").style.display = graph ? "" : "none";
+  $("chain-up").title = seq ? "切到网状图，从焦点沿调用者向上追到源头（时序图只画往下的调用）" : "从焦点沿调用者向上追到源头";
+  const follow = document.getElementById("follow-cursor");
+  if (follow) follow.closest("label")!.style.display = graph ? "" : "none";
+  // 「测试代码」：网状图里过滤测试邻居，模块关系里是 tests=true/false；时序图不受它影响
+  $("show-tests").closest("label")!.style.display = mode === "relations" || (graph && !seq) ? "" : "none";
+  renderCrumbs();
+}
+
+/** 调用图模式下的详情条：网状显示选中节点，时序显示选中行或焦点。 */
+function showCallDetails(): void {
+  if (callView.mode === "graph") { renderer?.resize(); showNodeDetails(selectedNode); return; }
+  if (seqSelected) showSeqNodeDetails(seqSelected);
+  else showSeqFocusDetails();
+}
+
+/**
+ * 第一次进地图模式先问服务：有容器就从容器图开始（只有一个容器时直接进它的入口流程）；
+ * 一个容器都没有时看整库 DSM，再不行就命名空间视图。
+ */
 async function loadMapView(): Promise<void> {
   if (!api) return;
   if (mapView === null) {
     const a = await api.arch();
     archDto = a;
     const archAvailable = a !== null && a.nodes.length > 0;
+    const hasContainers = a !== null && a.nodes.some((n) => n.kind === "container");
     $<HTMLButtonElement>("view-arch").disabled = !archAvailable;
     $("view-arch").title = a === null ? "服务版本太旧，没有 /api/arch/containers；重启服务或更新扩展" : archAvailable ? "容器图：可部署单元、外部系统与它们之间的边" : (a.note ?? "没有发现可部署单元");
-    const p = await api.pipeline("");
-    const pipelineAvailable = p !== null && p.rows.length > 0;
-    $<HTMLButtonElement>("view-pipeline").disabled = !pipelineAvailable;
-    $("view-pipeline").title = p === null ? "服务版本太旧，没有 /api/pipeline；重启服务或更新扩展"
-      : pipelineAvailable ? "按管道角色（入口 → 消息 → 行为链 → Handler → 下游）分泳道" : "索引里没有分发（dispatches）数据，看不出管道";
-    // 纯类库仓库（没有任何可部署容器）：直接看整库的模块依赖矩阵；DSM 没有组件（还没索引等）才退回管道 / 命名空间视图
+    $<HTMLButtonElement>("view-framework").disabled = !hasContainers;
+    $("view-framework").title = hasContainers ? FrameworkTabTitle : a === null ? "服务版本太旧，没有容器图；重启服务或更新扩展" : "没有发现可部署的容器，框架流程无从谈起";
+    // 纯类库仓库（没有任何可部署容器）：直接看整库的模块依赖矩阵；DSM 没有组件（还没索引等）才退回命名空间视图
     if (autoFlowPending && shouldOpenRepoDsm(a) && hasDsmContent(await api.dsm(RepoDsmKey, ""))) {
       autoFlowPending = false;
       $<HTMLButtonElement>("view-arch").disabled = false;
@@ -740,6 +1060,7 @@ async function loadMapView(): Promise<void> {
       openDsm(repoContainerNode(repoDisplayName()));
       return;
     }
+    // 不恢复"上次点的视图"：第一屏按用户定的规则走（只有一个容器直接进入口流程，否则容器图）
     if (archAvailable) {
       // 只有一个容器（单独打开的前端仓库等）：容器图没什么可看，直接进它的入口流程；没有入口时仍停在容器图
       const sole = autoFlowPending ? soleContainer(a) : null;
@@ -747,13 +1068,12 @@ async function loadMapView(): Promise<void> {
       if (sole && (await api.entries(sole.key)).length > 0) { openFlow(sole); return; }
       applyMapView("arch"); showArch(a!); return;
     }
-    applyMapView(pipelineAvailable ? "pipeline" : "ns");
-    if (p !== null && pipelineAvailable) { showPipeline(p); return; }
+    applyMapView("ns");
   }
   if (mapView === "arch") await loadArch();
   else if (mapView === "dsm") await loadDsm();
   else if (mapView === "flow") await loadFlowEntries();
-  else if (mapView === "pipeline") await loadPipeline();
+  else if (mapView === "framework") await loadFramework();
   else await loadNamespaceMap();
 }
 
@@ -761,16 +1081,17 @@ function applyMapView(view: MapViewKind): void {
   mapView = view;
   // DSM / 入口流程都是容器图往下钻的一层，切换按钮上仍算"容器"
   $("view-arch").classList.toggle("active", view === "arch" || view === "dsm" || view === "flow");
-  $("view-pipeline").classList.toggle("active", view === "pipeline");
+  $("view-framework").classList.toggle("active", view === "framework");
   $("view-ns").classList.toggle("active", view === "ns");
   $("arch-cy").style.display = view === "arch" ? "" : "none";
   $("dsm-view").style.display = view === "dsm" ? "" : "none";
   $("flow-view").style.display = view === "flow" ? "" : "none";
-  $("pipe-cy").style.display = view === "pipeline" ? "" : "none";
+  $("fw-view").style.display = view === "framework" ? "" : "none";
   $("map-cy").style.display = view === "ns" ? "" : "none";
-  // 叙述卡只对容器 / 组件 / 入口流程有意义；管道与命名空间视图不占右侧
+  // 叙述卡只对容器 / 组件 / 入口流程有意义；框架流程（右侧有自己的清单）与命名空间视图不占右侧
   $("narration").style.display = layoutKindFor(view) ? "" : "none";
   renderLayoutSelect();
+  if (mode === "map") recordMap();
 }
 
 // ---------- 版式预设（AI 只在这里面选）----------
@@ -892,7 +1213,7 @@ function setMapView(view: MapViewKind): void {
   // 用户回到容器图时，组件 / 入口的叙述已不在画面上（证据定位走 applyMapView，不清卡片）
   if (view === "arch" && card && card.currentKind !== null && card.currentKind !== "container") card.clear();
   applyMapView(view);
-  if (view === "arch") archRenderer?.resize(); else if (view === "pipeline") pipelineRenderer?.resize(); else if (view === "ns") mapRenderer?.resize();
+  if (view === "arch") archRenderer?.resize(); else if (view === "ns") mapRenderer?.resize();
   void loadMapView();
 }
 
@@ -915,8 +1236,12 @@ function repoDisplayName(): string {
 
 async function loadDsm(): Promise<void> {
   if (!api || !dsmContainer) { setMapView("arch"); return; }
+  const a = api;
+  const container = dsmContainer;
+  const seq = ++dsmSeq;
   const root = dsmPath[dsmPath.length - 1] ?? "";
-  const d = await api.dsm(dsmContainer.key, root);
+  const d = await a.dsm(container.key, root);
+  if (seq !== dsmSeq || a !== api || container !== dsmContainer || root !== (dsmPath[dsmPath.length - 1] ?? "") || mapView !== "dsm") return;
   if (d === null) { toast("服务没有 /api/arch/dsm，或容器已不存在"); setMapView("arch"); return; }
   dsmDto = d;
   dsmView ??= new DsmView($("dsm-view"), {
@@ -940,11 +1265,11 @@ async function loadDsm(): Promise<void> {
 }
 
 /**
- * 容器层的面包屑：项目 › 容器 [组件矩阵 | 入口流程] › …。
+ * 容器层的面包屑：项目 › 容器 [组件矩阵 | 入口流程 | 框架流程] › …。
  * DSM 后面跟钻取路径；入口流程后面只跟选中的入口——子标签已经写着「入口流程」，不再重复一段（用户反馈导航重复）。
  * 在入口流程里再点一次「入口流程」子标签 = 回到入口清单（原来那段面包屑的作用）。
  */
-function renderContainerCrumbs(sub: "dsm" | "flow"): void {
+function renderContainerCrumbs(sub: "dsm" | "flow" | "framework"): void {
   const crumbs = $("map-crumb-list");
   crumbs.innerHTML = "";
   const add = (label: string, current: boolean, onClick: () => void) => {
@@ -975,10 +1300,11 @@ function renderContainerCrumbs(sub: "dsm" | "flow"): void {
     if (mapView !== "flow") openFlow(dsmContainer);
     else if (flowEntry) backToEntryList();
   });
+  if (!repo) tab("框架流程", FrameworkTabTitle, sub === "framework", () => { if (dsmContainer && mapView !== "framework") openFramework(dsmContainer); });
   crumbs.appendChild(tabs);
   if (sub === "dsm") {
     dsmPath.forEach((key, i) => add(key.slice(Math.max(key.lastIndexOf("."), key.lastIndexOf("/")) + 1), i === dsmPath.length - 1, () => { dsmPath = dsmPath.slice(0, i + 1); void loadDsm(); }));
-  } else {
+  } else if (sub === "flow") {
     if (flowEntry) add(entryTitle(flowEntry), true, () => {});
   }
 }
@@ -988,6 +1314,7 @@ function backToEntryList(): void {
   autoPickSeq++;
   flowEntry = null;
   flowDto = null;
+  recordMap();
   if (dsmContainer) showContainerCard(dsmContainer);
   void loadFlowEntries();
 }
@@ -1014,7 +1341,7 @@ async function autoSelectEntry(): Promise<void> {
   const container = flowContainerKey;
   const stale = () => seq !== autoPickSeq || flowEntry !== null || flowContainerKey !== container || mapView !== "flow";
   flowView?.clearFlow("正在挑一个入口…");
-  const pick = await pickDefaultEntry(flowEntries, (e) => a.flow(e.symbolId), MaxDefaultEntryTries, stale);
+  const pick = await pickDefaultEntry(flowEntries, (e) => a.flow(e.symbolId, undefined, e), MaxDefaultEntryTries, stale);
   if (stale()) return;
   if (!pick) { flowView?.clearFlow(); return; }
   await selectFlowEntry(pick.entry, pick.flow);
@@ -1027,6 +1354,7 @@ async function loadFlowEntries(autoPick = false): Promise<void> {
   flowView ??= new FlowView($("flow-view"), {
     onEntrySelect: (e) => void selectFlowEntry(e),
     onNodeFocus: showFlowNodeDetails,
+    onFrameworkJump: (dto) => void gotoFramework(dto),
   });
   flowView.renderEntries(flowEntries, flowEntry);
   if (flowEntry && flowDto) flowView.renderFlow(flowDto);
@@ -1045,12 +1373,13 @@ async function selectFlowEntry(e: EntryDto, preloaded: FlowDto | null = null): P
   if (!api) return;
   flowEntry = e;
   flowDto = null;
+  recordMap();
   flowView?.renderEntries(flowEntries, e);
   if (!preloaded) flowView?.clearFlow("正在加载…");
   renderContainerCrumbs("flow");
   // 流程叙述的 key 是入口 symbolId 的十进制字符串
   card?.show("flow", String(e.symbolId), entryTitle(e));
-  const f = preloaded ?? await api.flow(e.symbolId);
+  const f = preloaded ?? await api.flow(e.symbolId, undefined, e);
   if (flowEntry !== e) return; // 等待期间用户又点了别的
   if (f === null) { toast("服务没有 /api/arch/flow，或入口已不在索引里"); flowView?.clearFlow("拿不到这个入口的流程"); return; }
   flowDto = f;
@@ -1076,7 +1405,7 @@ function showFlowNodeDetails(node: FlowNodeDto): void {
 function showDsmComponentDetails(c: DsmComponentDto): void {
   // 组件叙述的 key = <容器键>|<组件键>，钻入后的命名空间层也一样
   if (dsmContainer) card?.show("component", `${dsmContainer.key}|${c.key}`, c.label);
-  const hot = c.hot ? `<span class="muted">git：修订 ${c.hot.revisions} 次，+${c.hot.added}/−${c.hot.deleted} 行，最近 ${c.hot.lastCommit}（${c.hot.ageMonths} 个月前）</span>` : "";
+  const hot = c.hot ? `<span class="muted">git：${hotRevisionsText(c.hot)}，+${c.hot.added}/−${c.hot.deleted} 行，最近 ${c.hot.lastCommit}（${c.hot.ageMonths} 个月前）</span>` : "";
   const cycle = dsmDto?.cycles.find((cy) => cy.includes(c.key));
   const cyc = cycle ? `<span class="warn">环：${esc(cycle.map((k) => k.slice(Math.max(k.lastIndexOf("."), k.lastIndexOf("/")) + 1)).join(" ↔ "))}</span>` : "";
   detailsEl.innerHTML = `<span class="kind">组件</span><span class="mono">${esc(c.key)}</span><span class="muted">${c.symbols} 个符号 · ${c.files} 个文件${c.hasChildren ? " · 可钻入" : ""}</span>${hot}${cyc}`;
@@ -1146,6 +1475,7 @@ function showArchEdgeDetails(e: ArchEdgeDto | null): void {
 
 // 没有容器的仓库：「容器」按钮回到整库 DSM
 $("view-arch").onclick = () => {
+  saveMapViewChoice(() => window.localStorage, "arch");
   if (archDto && shouldOpenRepoDsm(archDto)) { openDsm(repoContainerNode(repoDisplayName())); return; }
   setMapView("arch");
 };
@@ -1174,6 +1504,7 @@ async function loadNamespaceMap(): Promise<void> {
     onGroupSelect: showMapGroupDetails,
     onEdgeSelect: showMapEdgeDetails,
   });
+  if (mapView === "ns") recordMap();
   const map = await api.map(mapState.root);
   mapRenderer.render(map);
   // 面包屑回到"项目"时，有容器图就回容器图，而不是整库的命名空间顶层
@@ -1182,96 +1513,155 @@ async function loadNamespaceMap(): Promise<void> {
   detailsEl.innerHTML = `<span class="kind">地图</span><span>${esc(mapState.root || "整个项目")}：${map.groups.length} 个${map.groups.some((g) => g.symbolId !== null) ? "节点" : "模块"}，${total} 个符号，${map.edges.length} 条依赖</span><span class="muted">双击模块钻入，双击类型切到调用图</span>`;
 }
 
-// ---------- 管道视图 ----------
-
 function focusSymbolById(id: number): Promise<void> {
-  return api!.symbol(id).then((s) => { if (s) { setMode("graph"); void focusSymbol(s); } else toast("符号在索引里找不到了"); });
+  return api!.symbol(id).then((s) => { if (s) void focusCall(s); else toast("符号在索引里找不到了"); });
 }
 
-async function loadPipeline(): Promise<void> {
+// ---------- 框架流程 ----------
+
+/** 容器图里的容器（标题下拉的选项）。 */
+function containerNodes(): ArchNodeDto[] {
+  return (archDto?.nodes ?? []).filter((n) => n.kind === "container");
+}
+
+/** 各容器的 HTTP 入口数：挑默认容器用，每个仓库取一次（索引刷新后作废）。 */
+async function loadHttpCounts(): Promise<Map<string, number>> {
+  if (httpCounts) return httpCounts;
+  const a = api!;
+  const counts = new Map<string, number>();
+  await Promise.all(containerNodes().map(async (c) => {
+    try { counts.set(c.key, (await a.entries(c.key)).filter((e) => e.kind === "http").length); } catch { counts.set(c.key, 0); }
+  }));
+  httpCounts = counts;
+  return counts;
+}
+
+/**
+ * 顶层「框架流程」：看上次看的容器；没有就看当前 / 最近一次钻进的容器；再没有就挑 HTTP 入口最多的。
+ * 标题里有容器下拉，随时换。
+ */
+async function openFrameworkDefault(): Promise<void> {
   if (!api) return;
-  const p = await api.pipeline(pipeState.root);
-  if (p === null) { toast("服务没有 /api/pipeline，切回命名空间视图"); setMapView("ns"); return; }
-  showPipeline(p);
+  if (!archDto) archDto = await api.arch();
+  const recent = fwContainer?.key ?? (dsmContainer && !isRepoContainer(dsmContainer) ? dsmContainer.key : null);
+  const nodes = archDto?.nodes ?? [];
+  const known = recent !== null && nodes.some((n) => n.kind === "container" && n.key === recent);
+  const c = pickFrameworkContainer(nodes, recent, known ? null : await loadHttpCounts());
+  if (!c) { toast("没有发现可部署的容器，框架流程无从谈起"); return; }
+  openFramework(c);
 }
 
-function showPipeline(p: PipelineDto): void {
-  pipelineRenderer ??= new PipelineRenderer($("pipe-cy"), {
-    onCellSelect: showPipelineCellDetails,
-    onBehaviorsSelect: showPipelineBehaviors,
-    onFlowSelect: showPipelineFlowDetails,
-    onCellDoubleClick: (row, kind) => {
-      if (row.hasChildren) { pipeState.drill(row.key); void loadPipeline(); return; }
-      // 叶子行：消息格子聚焦消息类型；入口 / Handler 格子聚焦第一个代表项，其余在详情条里点
-      const target = kind === "message" || kind === "label" ? row.symbolId
-        : kind === "entry" ? row.entries.items[0]?.symbolId ?? null
-        : kind === "handler" ? row.handlers.items[0]?.symbolId ?? null
-        : null;
-      if (target !== null) void focusSymbolById(target);
+function openFramework(container: ArchNodeDto): void {
+  fwContainer = container;
+  dsmContainer = container;
+  // 框架流程没有叙述卡；回到容器的其他子视图时它们自己再 show
+  applyMapView("framework");
+  void loadFramework();
+}
+
+async function loadFramework(): Promise<void> {
+  if (!api) return;
+  if (!fwContainer) { await openFrameworkDefault(); return; }
+  const c = fwContainer;
+  const seq = ++fwSeq;
+  fwView ??= new FrameworkView($("fw-view"), {
+    onContainerChange: (key) => {
+      const next = containerNodes().find((n) => n.key === key);
+      if (next) openFramework(next);
     },
+    onNodeSelect: (node) => showSeqNodeDetails(node, focusInCallSeq, frameworkNodeKind(node)),
+    onNodeFocus: focusInCallSeq,
+    onOpenEntry: (e) => void openEntryFlow(fwContainer?.key ?? "", e),
+    onOpenHandler: (h) => { toast(`没有找到分派到 ${h.messageType ?? h.handler.name} 的入口，改在调用图里看这个 Handler`, 4000); void focusInCallSeqSymbol(h.handler.id); },
+    loadEntries: (key) => (api ? api.entries(key) : Promise.resolve([])),
   });
-  // root 传空时服务端会自动落到业务模块层（defaultRoot）；面包屑以它为底，上面的项目 / 类库层不显示
-  if (pipeState.root !== p.root) pipeState.goToPathFrom(p.defaultRoot, p.root);
-  pipelineRenderer.render(p);
-  renderMapCrumbs(pipeState, () => void loadPipeline());
-  // items 最多只带 20 个代表项，总数要用 count 累加（同一个 Handler / 入口跨行会重复计，所以叫"按行累计"）
-  const messages = p.rows.reduce((n, r) => n + r.messages.count, 0);
-  const handlers = p.rows.reduce((n, r) => n + r.handlers.count, 0);
-  const entries = p.rows.reduce((n, r) => n + r.entries.count, 0);
-  const nested = p.rows.reduce((n, r) => n + r.nested, 0);
-  const bypass = p.rows.reduce((n, r) => n + r.bypass, 0);
-  const parts = [
-    `${p.rows.length} 条泳道`, `${messages} 个消息`, `${handlers} 个 Handler`, `${entries} 个入口（按行累计）`,
-    `行为链 ${p.behaviors.length}（${p.behaviorsOrdered ? "按注册顺序" : "顺序未知"}）`,
-  ];
-  if (nested > 0) parts.push(`嵌套分发 ${nested}`);
-  if (bypass > 0) parts.push(`绕过管道 ${bypass}`);
-  if (p.testEntriesSkipped > 0 || p.testMessagesSkipped > 0) parts.push(`已排除测试代码：入口 ${p.testEntriesSkipped} 个类型、消息 ${p.testMessagesSkipped} 个`);
-  if (p.messagesOutsideRoot > 0) parts.push(`本级之外还有 ${p.messagesOutsideRoot} 个消息`);
-  detailsEl.innerHTML = `<span class="kind">管道</span><span>${esc(p.root || "整个项目")}：${esc(parts.join("，"))}</span><span class="muted">${p.leaf ? "双击消息切到调用图" : "双击一行钻入"}</span>`;
+  dsmContainer = c;
+  renderContainerCrumbs("framework");
+  if (fwView.current?.containerKey !== c.key) fwView.clear(`正在取 ${c.name} 的框架流程…`);
+  let d: FrameworkFlowDto | null;
+  try {
+    d = await api.framework(c.key);
+  } catch (e) {
+    if (seq === fwSeq) { fwDto = null; fwView.unavailable(`取框架流程失败：${e}`, containerNodes(), c.key, c.name); detailsEl.innerHTML = `<span class="kind">框架流程</span><span class="warn">${esc(String(e))}</span>`; }
+    return;
+  }
+  if (seq !== fwSeq || mapView !== "framework") return;
+  if (d === null) {
+    fwDto = null;
+    fwView.unavailable(`拿不到 ${c.name} 的框架流程：服务版本太旧（没有 /api/arch/framework，重启服务或更新扩展），或容器已不在索引里。可以在上面换一个容器。`, containerNodes(), c.key, c.name);
+    detailsEl.innerHTML = `<span class="kind">框架流程</span><span class="muted">服务没有 /api/arch/framework，或容器已不在索引里</span>`;
+    return;
+  }
+  // 没变就不重画（索引刷新、切回来），免得把展开 / 清单的状态冲掉
+  const unchanged = fwDto !== null && fwView.current !== null && JSON.stringify(fwDto) === JSON.stringify(d);
+  fwDto = d;
+  if (!unchanged) fwView.render(d, containerNodes());
+  showFrameworkSummary(d);
 }
 
-function itemLinks(items: PipelineItemDto[], count: number): string {
-  const links = items.map((i) => `<a data-sym="${i.symbolId}" title="${esc(i.qualifiedName)}">${esc(i.name)}</a>${i.weight > 1 ? `<span class="muted">×${i.weight}</span>` : ""}`).join("，");
-  return count > items.length ? `${links}<span class="muted">…还有 ${count - items.length} 个</span>` : links;
+function showFrameworkSummary(d: FrameworkFlowDto): void {
+  detailsEl.innerHTML = `<span class="kind">框架流程</span><span>${esc(d.containerName)}：${esc(frameworkSummary(d.stages, d.handlers))}</span><span class="muted">点「N 个 Handler ▸」看清单；单击行看详情，双击在调用图里以它为焦点</span>`;
 }
 
-function showPipelineCellDetails(row: PipelineRowDto | null, kind: CellKind | null): void {
-  if (!row || !kind) return;
-  const m = row.messages;
-  const body = kind === "entry" ? `<span class="kind">入口</span><span>${row.entries.count} 个类型向 ${esc(row.label)} 分发过</span><span>${itemLinks(row.entries.items, row.entries.count)}</span>`
-    : kind === "message" ? `<span class="kind">消息</span><span>${esc(row.label)}：${m.count} 个（命令 ${m.commands}、查询 ${m.queries}、事件 ${m.events}）</span>${m.orphans > 0 ? `<span class="warn">${m.orphans} 个没有任何非测试入口分发过</span>` : ""}`
-    : kind === "handler" ? `<span class="kind">Handler</span><span>${row.handlers.count} 个</span><span>${itemLinks(row.handlers.items, row.handlers.count)}</span>${row.nested > 0 ? `<span class="muted">嵌套分发 ${row.nested}</span>` : ""}${row.bypass > 0 ? `<span class="warn">被直接调用 ${row.bypass} 次（绕过管道）</span>` : ""}`
-    : kind === "downstream" ? `<span class="kind">下游</span><span>${row.downstream.map((g) => `<span class="mono" title="${esc(g.key)}">${esc(g.label)}</span> ${g.weight}`).join("，") || "无仓库内下游"}</span>${row.externalCalls > 0 ? `<span class="muted">框架调用 ${row.externalCalls}</span>` : ""}`
-    : `<span class="kind">${row.symbolId !== null ? "消息" : "模块"}</span><span class="mono">${esc(row.key)}</span><span class="muted">${row.hasChildren ? "双击钻入" : "双击切到调用图"}</span>`;
-  detailsEl.innerHTML = body;
+/** 框架流程里一行在详情条上的种类：它所在阶段的名字。 */
+function frameworkNodeKind(node: FlowNodeDto): string | undefined {
+  const actor = fwDto?.flow.actors.find((a) => a.key === node.actor);
+  return actor && fwDto ? stageOfActor(actor, fwDto.stages)?.label : undefined;
 }
 
-function showPipelineBehaviors(behaviors: PipelineBehaviorDto[]): void {
-  const chain = behaviors.map((b) => `<a data-sym="${b.symbolId}" title="${esc(b.qualifiedName)}">${esc(b.name)}</a>`).join(" → ");
-  const ordered = pipelineOrderedNote();
-  detailsEl.innerHTML = `<span class="kind">行为链</span><span>${chain || "没有发现实现 *Behavior 接口的类型"}</span>${ordered}`;
-}
-let lastPipelineOrdered: boolean | null = null;
-function pipelineOrderedNote(): string {
-  if (lastPipelineOrdered === null) return "";
-  return lastPipelineOrdered ? `<span class="muted">顺序来自 DI 注册</span>` : `<span class="warn">没有 DI 注册记录（需要 Roslyn 索引），顺序按名字，不可信</span>`;
+/** 框架流程里双击 / 「在调用图中查看」：切到调用图的时序模式（不改用户记住的画法），以它为焦点。 */
+function focusInCallSeq(node: FlowNodeDto): void {
+  if (!isFocusableNode(node) || node.symbolId === null) return;
+  void focusInCallSeqSymbol(node.symbolId);
 }
 
-function showPipelineFlowDetails(f: PipelineFlowDto | null): void {
-  if (!f) return;
-  const text = f.kind === "nested"
-    ? `${esc(f.from)} 的 Handler 里又分发了 ${esc(f.to)} 的消息，${f.weight} 处`
-    : `${esc(f.from)} 的入口直接调用了 ${esc(f.to)} 的 Handler 方法（绕过管道），${f.weight} 处`;
-  detailsEl.innerHTML = `<span class="kind">${f.kind === "nested" ? "嵌套分发" : "绕过"}</span><span>${text}</span>`;
+async function focusInCallSeqSymbol(id: number): Promise<void> {
+  if (!api) return;
+  const s = await api.symbol(id);
+  if (!s) { toast("符号在索引里找不到了"); return; }
+  if (mode !== "graph") setMode("graph");
+  if (callView.mode !== "seq") await callView.setMode("seq", false);
+  await callView.focus(s);
 }
 
-detailsEl.addEventListener("click", (e) => {
-  const a = (e.target as HTMLElement).closest("a[data-sym]") as HTMLElement | null;
-  if (a && api) void focusSymbolById(Number(a.dataset["sym"]));
-});
-$("view-pipeline").onclick = () => setMapView("pipeline");
-$("view-ns").onclick = () => setMapView("ns");
+/** Handler / 控制器清单里点一个入口：打开它所在容器的入口流程并选中它。 */
+async function openEntryFlow(containerKey: string, entry: EntryDto): Promise<void> {
+  const c = containerNodes().find((n) => n.key === containerKey) ?? fwContainer;
+  if (!c) return;
+  autoPickSeq++;
+  if (flowContainerKey !== c.key) { flowContainerKey = c.key; flowEntries = []; }
+  dsmContainer = c;
+  flowEntry = entry;
+  flowDto = null;
+  applyMapView("flow");
+  await loadFlowEntries();
+  if (flowEntry !== entry) return; // 等待期间用户又点了别的
+  // 换成入口清单里的那一个对象（高亮、索引刷新后找回都按清单里的）
+  await selectFlowEntry(findSameEntry(flowEntries, entry) ?? entry);
+}
+
+/** 入口流程 / 调用图时序标题里的「经框架流程 ▸」：切到流程所在容器的框架流程。 */
+async function gotoFramework(dto: FlowDto): Promise<void> {
+  if (!api) return;
+  if (!archDto) archDto = await api.arch();
+  const c = frameworkJumpTarget(dto, archDto?.nodes ?? []);
+  if (!c) toast(`容器图里找不到容器 ${dto.containerKey}，改看默认容器`);
+  autoFlowPending = false;
+  if (c) fwContainer = c;
+  if (mode !== "map") {
+    // 先定好视图再切模式：loadMapView 看到 mapView 已定，就不走第一屏的决策，直接取框架流程
+    applyMapView("framework");
+    setMode("map");
+    return;
+  }
+  if (c) openFramework(c); else await openFrameworkDefault();
+}
+
+$("view-framework").onclick = () => {
+  saveMapViewChoice(() => window.localStorage, "framework");
+  if (mapView !== "framework") { autoFlowPending = false; void openFrameworkDefault(); }
+};
+$("view-ns").onclick = () => { saveMapViewChoice(() => window.localStorage, "ns"); setMapView("ns"); };
 
 function showMapGroupDetails(g: MapGroupDto | null): void {
   if (!g) return;
@@ -1286,6 +1676,18 @@ function showMapEdgeDetails(e: MapEdgeDto | null): void {
 }
 
 $("mode-graph").onclick = () => setMode("graph");
+$("nav-back").onclick = navBack;
+$("nav-fwd").onclick = navForward;
+// Alt+← / Alt+→（面板有焦点时；编辑器里的 Alt+← 是 VS Code 自己的导航历史）、鼠标侧键
+window.addEventListener("keydown", (e) => {
+  if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (e.key === "ArrowLeft") { e.preventDefault(); navBack(); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); navForward(); }
+});
+window.addEventListener("mouseup", (e) => {
+  if (e.button === 3) { e.preventDefault(); navBack(); }
+  else if (e.button === 4) { e.preventDefault(); navForward(); }
+});
 $("mode-rel").onclick = () => { if (mode !== "relations") setMode("relations"); };
 $("mode-map").onclick = () => setMode("map");
 
@@ -1344,7 +1746,7 @@ function pollStatus(): void {
       if (s.error) toast(`索引失败：${s.error}`, 6000);
       else if (s.lastReport) toast(`索引完成：${s.lastReport.totalSymbols} 个符号，${s.lastReport.elapsedSeconds.toFixed(1)} 秒`);
       refreshMapAfterIndex();
-      await refreshFocus();
+      await refreshCallViews();
       await refreshRelations();
     }
   }, 500);
@@ -1360,7 +1762,7 @@ function refreshMapAfterIndex(): void {
 async function doRefreshMap(): Promise<void> {
   if (!api) return;
   // 第一屏还没判过（索引前容器图是空的）：重新走一遍第一屏决策，只有一个容器就直接进入口流程
-  if (autoFlowPending && mapView !== "dsm" && mapView !== "flow") {
+  if (autoFlowPending && mapView !== "dsm" && mapView !== "flow" && mapView !== "framework") {
     mapView = null;
     if (mode === "map") await loadMapView();
     return;
@@ -1371,6 +1773,9 @@ async function doRefreshMap(): Promise<void> {
     // 没变就不重画，免得每次保存后的增量索引把用户的缩放 / 选中冲掉
     if (a && mapView === "arch" && JSON.stringify(a) !== JSON.stringify(archDto)) { archDto = a; showArch(a); }
   } else if (mapView === "flow") await reloadFlow();
+  else if (mapView === "dsm") await loadDsm();
+  else if (mapView === "ns") await loadNamespaceMap();
+  else if (mapView === "framework") { httpCounts = null; await loadFramework(); }
 }
 
 /** 入口流程视图下索引完成：重取入口清单，按 id / 限定名找回原来的入口再重取流程；找不到就重新自动挑一个。 */
@@ -1383,7 +1788,7 @@ async function reloadFlow(): Promise<void> {
   if (mapView !== "flow" || dsmContainer?.key !== container || flowEntry !== old) return;
   const same = old ? findSameEntry(entries, old) : null;
   if (same) {
-    const f = await api.flow(same.symbolId);
+    const f = await api.flow(same.symbolId, undefined, same);
     if (mapView !== "flow" || flowEntry !== old) return;
     const unchanged = same.symbolId === old!.symbolId && JSON.stringify(entries) === JSON.stringify(flowEntries) && JSON.stringify(f) === JSON.stringify(oldFlow);
     if (unchanged) return;
@@ -1395,20 +1800,47 @@ async function reloadFlow(): Promise<void> {
   flowDto = null;
   await loadFlowEntries(old !== null);
 }
+/** 网状图的数据过时了（藏着的时候索引刷新过），切回网状时重建。 */
+let graphStale = false;
+
+/** 网状图按新开关 / 新索引重建当前焦点（不新增面包屑）。 */
 async function refreshFocus(): Promise<void> {
   if (!api || !state.focusNodeId) return;
+  const a = api;
+  const seq = ++graphSeq;
+  // 网状图藏着（时序模式）时不重画：cytoscape 在隐藏的容器里量不出尺寸；切回网状时再重建
+  if (callView.mode !== "graph") { graphStale = true; return; }
+  graphStale = false;
   const old = state.getNode(state.focusNodeId)?.symbol;
   if (!old) return;
   // 增量索引会重建被改文件的符号，id 会变：按 id → 原位置 → 限定名 依次找回
-  const s = await resolveRefreshedSymbol(api, old);
+  const s = await resolveRefreshedSymbol(a, old);
+  // 等待期间换了焦点（切回网状时按时序焦点重画了）：不要用旧焦点把它盖掉
+  if (seq !== graphSeq || a !== api || state.focusNodeId !== GraphState.nodeIdFor(old)) return;
   if (s) await focusSymbol(s, true);
   else toast("焦点符号在新索引里找不到了");
+}
+
+/** 索引刷新后：网状与时序两边的焦点都按新索引找回重画。 */
+async function refreshCallViews(): Promise<void> {
+  await refreshFocus();
+  if (!api) return;
+  const a = api;
+  if (!(await callView.refresh((old) => resolveRefreshedSymbol(a, old))) && callView.mode === "seq") toast("时序图的焦点在新索引里找不到了");
 }
 $("ov-index").onclick = () => void startIndex(false);
 $("reindex").onclick = () => void startIndex(false);
 $("chain-down").onclick = () => { if (state.focusNodeId) void expandChain(state.focusNodeId, "out"); };
-$("chain-up").onclick = () => { if (state.focusNodeId) void expandChain(state.focusNodeId, "in"); };
+$("chain-up").onclick = () => {
+  // 时序模式：切到网状再往上追（时序图只画往下的调用）；这次切换不算用户的选择
+  if (callView.mode === "seq") { const s = callView.history.current; if (s) void callView.focus(s, { chain: "in" }); else toast("先选一个焦点"); return; }
+  if (state.focusNodeId) void expandChain(state.focusNodeId, "in");
+};
 $("show-refs").onchange = () => { void refreshFocus(); };
+$("show-types").onchange = () => { void refreshFocus(); };
+$("call-view").querySelectorAll<HTMLButtonElement>("button[data-view]").forEach((b) => {
+  b.onclick = () => void callView.setMode(b.dataset["view"] === "graph" ? "graph" : "seq");
+});
 $("show-tests").onchange = () => {
   void refreshFocus();
   // 模块关系：tests=true/false；不在这个模式时 relParams 对不上，切回来会自动重取
@@ -1426,21 +1858,29 @@ function onCursorSymbol(symbolId: number): void {
   const box = document.getElementById("follow-cursor") as HTMLInputElement | null;
   // 只在调用图模式下跟；别的模式（模块关系、项目地图）不打断
   if (!box?.checked || mode !== "graph" || !api) return;
-  if (state.focusNodeId === GraphState.nodeIdFor({ id: symbolId } as SymbolDto)) return;
-  void api.symbol(symbolId).then((s) => { if (s && box.checked && mode === "graph") void focusSymbol(s); });
+  const a = api;
+  const seq = ++symbolRequestSeq;
+  // 时序 / 网状各看各的焦点：已经是它就不重画
+  if (callView.focusId() === symbolId) return;
+  void a.symbol(symbolId).then((s) => { if (s && seq === symbolRequestSeq && a === api && box.checked && mode === "graph" && callView.focusId() !== s.id) void focusCall(s); });
 }
 
 // ---------- 启动 ----------
 
 let currentRepo: string | null = null;
 function init(apiBase: string, token: string | null, repoRoot: string | null): void {
+  graphSeq++;
+  symbolRequestSeq++;
+  dsmSeq++;
+  searchSeq++;
+  lastHits = [];
+  dropdown.classList.remove("open");
   api = new Api(apiBase.replace(/\/$/, ""), token);
   if (repoRoot !== currentRepo) {
     // 切到另一个仓库：旧图里的符号 id 对新服务无意义
     currentRepo = repoRoot;
     state.reset();
     mapState.reset();
-    pipeState.reset();
     mapView = null;
     autoFlowPending = true;
     autoPickSeq++;
@@ -1448,11 +1888,15 @@ function init(apiBase: string, token: string | null, repoRoot: string | null): v
     dsmContainer = null; dsmPath = []; dsmDto = null; dsmShown = null;
     flowContainerKey = null; flowEntries = []; flowEntry = null; flowDto = null;
     flowView?.renderEntries([], null); flowView?.clearFlow();
+    fwContainer = null; fwDto = null; fwSeq++; httpCounts = null; fwView?.clear("");
     relHistory.reset(); relDto = null; relParams = ""; relSyncedFromGraph = null; relSeq++; relSelectedEdge = null;
     relRenderer?.clear(); renderRelationsChrome();
     card?.clear();
+    callView.reset();
+    nav.reset();
+    graphStale = false;
     render();
-    showNodeDetails(null);
+    if (mode === "graph") showCallDetails();
   }
   // 叙述卡：数据与跳转都经回调回到这里；api 为空时一律当 404（服务版本太旧）
   card ??= new NarrationCard($("narration"), {
@@ -1463,7 +1907,7 @@ function init(apiBase: string, token: string | null, repoRoot: string | null): v
     onEvidence: (ref, raw) => void onEvidence(ref, raw),
     onApplyLayout: (kind, layout) => applyPreset(kind, layout),
     currentPreset: (kind) => presets[kind],
-    onToggle: () => { archRenderer?.resize(); pipelineRenderer?.resize(); mapRenderer?.resize(); },
+    onToggle: () => { archRenderer?.resize(); mapRenderer?.resize(); },
     runCommand: (command) => {
       if (host.isVsCode) host.post({ type: "command", command });
       else toast(`（浏览器模式）请在 VS Code 命令面板运行 ${command}`);
@@ -1471,12 +1915,15 @@ function init(apiBase: string, token: string | null, repoRoot: string | null): v
   });
   renderer ??= new Renderer($("cy"), {
     onNodeDoubleClick: (n) => {
-      if (n.type === "ambiguous") void expandCapsule(n);
-      else if (n.type === "symbol" && n.symbol && (n.expanded || !n.expandable)) { if (n.symbol.kind !== "external") openInEditor(n.symbol); }
-      else void expandNode(n);
+      if (n.callers) expandCallersCapsule(n);
+      else if (n.type === "ambiguous") void expandCapsule(n);
+      // 默认只展开「它调谁」：这一侧展开过（或没有可展开的）再双击就跳代码
+      else if (n.type === "symbol" && n.symbol && (n.expandedOut || !n.expandable)) { if (n.symbol.kind !== "external") openInEditor(n.symbol); }
+      else void expandNode(n, "out");
     },
     onNodeContext: showContextMenu,
-    onNodeSelect: showNodeDetails,
+    // 「被 N 处调用」胶囊点一下就加入调用者
+    onNodeSelect: (n) => { if (n?.callers) expandCallersCapsule(n); else showNodeDetails(n); },
     onEdgeSelect: showEdgeDetails,
   });
   void checkHealth();
@@ -1487,21 +1934,23 @@ host.onMessage((msg) => {
   if (msg.type === "init") init(msg.apiBase, msg.token ?? null, msg.repoRoot ?? null);
   else if (msg.type === "focus") {
     if (mode !== "graph") setMode("graph");
+    // chain = "in"（影响范围视图的「在面板中打开」，要看谁调了它）：时序图只画往下的调用，CallView 会切到网状并「↑ 到源头」
     const chain = msg.chain;
-    void api?.symbol(msg.symbolId).then(async (s) => {
-      if (!s) return;
-      await focusSymbol(s);
-      if (chain) await expandChain(String(s.id), chain);
-    });
+    const a = api;
+    const seq = ++symbolRequestSeq;
+    void a?.symbol(msg.symbolId).then((s) => { if (s && seq === symbolRequestSeq && a === api) void focusCall(s, chain); });
   }
   else if (msg.type === "cursorSymbol") onCursorSymbol(msg.symbolId);
-  else if (msg.type === "indexChanged") { sawRunning = false; overlay.classList.remove("open"); refreshMapAfterIndex(); void refreshFocus(); void refreshRelations(); }
+  else if (msg.type === "indexChanged") { sawRunning = false; overlay.classList.remove("open"); refreshMapAfterIndex(); void refreshCallViews(); void refreshRelations(); }
   else if (msg.type === "showRelations") {
     if (api) showRelationsFor(msg.symbolId, msg.depth);
     else pendingRelations = { symbolId: msg.symbolId, depth: msg.depth };
   }
 });
-window.addEventListener("resize", () => { renderer?.resize(); relRenderer?.resize(); mapRenderer?.resize(); pipelineRenderer?.resize(); archRenderer?.resize(); });
+window.addEventListener("resize", () => { if (callView.mode === "graph") renderer?.resize(); relRenderer?.resize(); mapRenderer?.resize(); archRenderer?.resize(); });
+
+applyCallViewChrome();
+showSeq({ status: "empty" });
 
 const params = new URLSearchParams(location.search);
 const apiParam = params.get("api");

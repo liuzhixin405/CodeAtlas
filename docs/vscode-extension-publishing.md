@@ -1,5 +1,7 @@
 # CodeTrail Graph：发布到 VS Code Marketplace
 
+当前发布版本为 **0.1.1**，沿用扩展 ID `164910441.codetrail-graph`。索引格式为 **12**，升级后旧索引会自动重建；更新包必须同时包含本轮后端与 Webview，不能只替换前端产物。
+
 ## 1. 名称、身份和图标
 
 - 市场显示名：`CodeTrail Graph`。
@@ -42,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-all.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\publish.ps1 -Rid win-x64 -Out dist
 Set-Location .\extension
 npm run package -- --target win32-x64 --dist dist
-code --install-extension .\codetrail-graph-win32-x64-0.1.0.vsix --force
+code --install-extension .\codetrail-graph-win32-x64-0.1.1.vsix --force
 ```
 
 完全退出并重启 VS Code，验证活动栏图标、命令、首次索引、调用图、服务启动 / 停止；其他平台也应在对应系统上实际验证，交叉打包成功不代表运行验证通过。
@@ -64,7 +66,7 @@ Roslyn worker 显式引用 `System.Security.Cryptography.Pkcs` 和 `System.Secur
 在 `extension` 目录，完成 `vsce login` 后执行：
 
 ```powershell
-npx vsce publish --packagePath .\codetrail-graph-win32-x64-0.1.0.vsix .\codetrail-graph-linux-x64-0.1.0.vsix .\codetrail-graph-linux-arm64-0.1.0.vsix .\codetrail-graph-darwin-x64-0.1.0.vsix .\codetrail-graph-darwin-arm64-0.1.0.vsix
+npx vsce publish --packagePath .\codetrail-graph-win32-x64-0.1.1.vsix .\codetrail-graph-linux-x64-0.1.1.vsix .\codetrail-graph-linux-arm64-0.1.1.vsix .\codetrail-graph-darwin-x64-0.1.1.vsix .\codetrail-graph-darwin-arm64-0.1.1.vsix
 ```
 
 仅发布 Windows 时，只保留 Windows 的路径。上传预构建的 VSIX，不要直接运行不带 `--packagePath` 的 `vsce publish`：本项目的打包脚本负责把对应平台的后端放入扩展，循环构建后工作区的 `server` 只保留最后一个平台。

@@ -33,7 +33,8 @@ public class CliEndToEndTests : IDisposable
         Assert.Contains("src/svc.ts:Svc.find", query.Out);
         // helper 是 import { helper } from './util/format' 绑定的名字：按导出解析 0.95（"0.0" 格式四舍五入打印成 1.0）；以前按 import 范围同名 0.7
         Assert.Contains("→ calls  src/util/format.ts:helper  (0.95)", query.Out);
-        Assert.Contains("← calls  src/app.ts:main  (0.70)", query.Out);
+        // main 里是 new Svc().find(1)：接收者是 new 出来的 Svc，类型已知 → 0.9（索引版本 11 起 TS 按接收者类型解析；以前按名字 0.7）
+        Assert.Contains("← calls  src/app.ts:main  (0.90)", query.Out);
     }
 
     [Fact]
@@ -83,6 +84,8 @@ public class CliEndToEndTests : IDisposable
                 "  调用方",
                 "    ← save  call 0.9  @ L5",
                 "      ← createOrder  call 0.9  @ L4  ⇐ HTTP POST /api/orders",
+                // 第 3 行 app.post('/api/orders', createOrder) 把 createOrder 当回调传给框架：模块 → createOrder 的回调边（索引版本 11 起）
+                "        ← app.js  call 0.85  @ L3[callback]",
                 "      ← retry  call 0.9  @ L6[cond]",
                 "        ← save  call 0.9  @ L5  ↺",
             ],
@@ -178,6 +181,61 @@ public class CliEndToEndTests : IDisposable
         File.WriteAllText(Path.Combine(_repo, ".gitignore"), "node_modules/\n");
         var r = Run("index", _repo);
         Assert.Contains(".codeatlas/", r.Err);
+    }
+
+    [Fact]
+    public void Query_Flow_PrintsSequenceTreeFromAnyMethod_JsonCarriesCallSites()
+    {
+        Assert.Equal(0, Run("index", _repo).Code);
+        // main(): new Svc().find(1); fetch('x');——不是入口、仓库里没有容器：空容器键，按源码位置 new Svc → Svc.find → 框架调用
+        var r = Run("query", _repo, "src/app.ts:main", "--flow");
+        Assert.Equal(0, r.Code);
+        var lines = r.Out.Replace("\r", "").Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        Assert.StartsWith("起点 main  容器 （不在容器里）  节点 4", lines[0]);
+        Assert.Equal(new[] { "main", "  Svc", "  Svc.find", "    helper", "      String", "  fetch" },
+            lines.Skip(2).Select(l => l[..l.IndexOf("  [", StringComparison.Ordinal)]));
+
+        var json = Run("query", _repo, "src/app.ts:main", "--flow", "--json");
+        Assert.Equal(0, json.Code);
+        using var doc = System.Text.Json.JsonDocument.Parse(json.Out);
+        var root = doc.RootElement;
+        Assert.Equal(("main", ""), (root.GetProperty("entryLabel").GetString(), root.GetProperty("containerKey").GetString()));
+        var find = root.GetProperty("root").GetProperty("children")[1];
+        Assert.Equal(("Svc.find", "src/app.ts", 2), (find.GetProperty("label").GetString(), find.GetProperty("path").GetString(), find.GetProperty("line").GetInt32()));
+        Assert.True(find.GetProperty("pos").GetInt32() > root.GetProperty("root").GetProperty("children")[0].GetProperty("pos").GetInt32()); // new Svc 在 find 前面
+
+        var missing = Run("query", _repo, "#987654321", "--flow");
+        Assert.Equal(1, missing.Code);
+        Assert.Contains("未找到符号", missing.Err);
+    }
+
+    [Fact]
+    public void Arch_FlowCoverage_ReportsBusinessCallsSeenInTheFirstTwoLevels()
+    {
+        // Express：POST /api/orders → createOrder → save → audit / retry；createOrder 的业务调用是 save，save 的是 retry（audit 什么都不调，不算）
+        var api = Path.Combine(_repo, "api");
+        Directory.CreateDirectory(api);
+        File.WriteAllText(Path.Combine(api, "package.json"), "{ \"name\": \"api\", \"dependencies\": { \"express\": \"4.19.0\" } }");
+        File.WriteAllText(Path.Combine(api, "Dockerfile"), "FROM node:20\nEXPOSE 3000\n");
+        File.WriteAllText(Path.Combine(api, "app.js"), string.Join("\n",
+            "const express = require('express');",
+            "const app = express();",
+            "app.post('/api/orders', createOrder);",
+            "function createOrder(req, res) { save(req.body); }",
+            "function save(o) { audit(o); retry(o); }",
+            "function retry(o) { if (o) save(o); }",
+            "function audit(o) { return o; }",
+            "app.listen(3000);") + "\n");
+        Assert.Equal(0, Run("index", _repo).Code);
+
+        var r = Run("arch", _repo, "--flow-coverage", "api", "--json");
+        Assert.Equal(0, r.Code);
+        using var doc = System.Text.Json.JsonDocument.Parse(r.Out);
+        var c = doc.RootElement;
+        Assert.Equal((1, 1, 0, 1, 1.0, 1, 1), (c.GetProperty("entries").GetInt32(), c.GetProperty("sampled").GetInt32(), c.GetProperty("skipped").GetInt32(),
+            c.GetProperty("hits").GetInt32(), c.GetProperty("ratio").GetDouble(), c.GetProperty("nextSampled").GetInt32(), c.GetProperty("nextHits").GetInt32()));
+        var text = Run("arch", _repo, "--flow-coverage", "api");
+        Assert.Contains("前 2 层命中 1", text.Out);
     }
 
     public void Dispose()

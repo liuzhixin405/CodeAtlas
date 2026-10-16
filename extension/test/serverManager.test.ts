@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { aiArgs, ApiKeyEnvVar, buildServeLaunch, currentTarget, ensureExecutable, packageTargetMismatch, parsePortLine, projectArgs, redactSecrets, resolveProjects, ServerManager, waitForPortLine, type AiOptions, type ProcessLike } from "../src/serverManager";
+import { aiArgs, ApiKeyEnvVar, buildServeLaunch, currentTarget, ensureExecutable, packageTargetMismatch, parsePortLine, projectArgs, redactSecrets, resolveProjects, ServerManager, ServerProcess, waitForPortLine, type AiOptions, type ProcessLike } from "../src/serverManager";
 
 describe("aiArgs", () => {
   it("turns codeatlas.ai.* into serve flags", () => {
@@ -156,6 +156,44 @@ describe("buildServeLaunch with projects", () => {
 });
 
 describe("ServerManager.stop", () => {
+  for (const action of ["restart", "recover"] as const) {
+    it(`${action} invalidates an in-flight startup without letting its completion delete the new startup`, async () => {
+      const processes: { release: () => void; stopped: boolean }[] = [];
+      const manager = new ServerManager(() => "codeatlas.exe", { info: () => {}, error: () => {} }, () => {
+        const record = { release: () => {}, stopped: false };
+        const port = processes.push(record);
+        let address: string | null = null;
+        return {
+          get alive() { return !record.stopped && address !== null; },
+          get apiBase() { return address; },
+          start: () => new Promise<string>(resolve => { record.release = () => { address = `http://localhost:${port}`; resolve(address); }; }),
+          stop: () => { record.stopped = true; address = null; },
+        };
+      });
+      const obsolete = manager.ensure("repo").catch(error => error);
+      const latest = manager[action]("repo");
+      expect(processes).toHaveLength(2);
+      processes[0]!.release();
+      expect(await obsolete).toBeInstanceOf(Error);
+      expect(manager.ensure("repo")).toBe(latest);
+      processes[1]!.release();
+      expect(await latest).toBe("http://localhost:2");
+      expect(manager.has("repo")).toBe(true);
+      manager.stopAll();
+    });
+  }
+
+  it("does not spawn after stop while awaiting credentials", async () => {
+    let release!: (key: string | undefined) => void;
+    const process = new ServerProcess("missing-codeatlas.exe", "repo", "test", { info: () => {}, error: () => {} },
+      { enabled: true, endpoint: "", model: "" }, () => new Promise(resolve => { release = resolve; }));
+    const starting = process.start();
+    process.stop();
+    release(undefined);
+    await expect(starting).rejects.toThrow("取消");
+    expect(process.alive).toBe(false);
+  });
+
   it("stops only that repo's process; the next ensure() spawns a fresh one", async () => {
     const spawned: { root: string; stopped: boolean }[] = [];
     const m = new ServerManager(() => "codeatlas.exe", { info: () => {}, error: () => {} }, (_exe, root) => {

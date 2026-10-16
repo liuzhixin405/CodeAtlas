@@ -3,7 +3,7 @@ using CodeAtlas.Core.Model;
 
 namespace CodeAtlas.Server.Tests;
 
-/// <summary>C# 控制台 / 宿主程序的启动入口（csharp.main，kind hosted，route = 容器名）：static Main 与顶级语句；一个容器只取一个（顶级语句优先，与编译器一致）；
+/// <summary>C# 控制台 / 宿主程序的启动入口（csharp.main，kind hosted / 不起常驻宿主的控制台程序为 command，route = 容器名）：static Main 与顶级语句；一个容器只取一个（顶级语句优先，与编译器一致）；
 /// 只看容器自己的项目目录（引用的类库里的 Main 不算），测试项目排除，只给 dotnet-exe / dotnet-worker / dotnet-web 容器。</summary>
 public partial class EntryDiscoveryTests
 {
@@ -105,7 +105,10 @@ public partial class EntryDiscoveryTests
             ("Web", "Web", 2010L, "Web/Program.cs", 1),          // Web 项目的 Program.cs 顶级语句：启动流程
             ("Worker", "Worker", 2031L, "Worker/Program.cs", 4), // static async Task Main
         }, entries.Select(e => (e.ContainerKey, e.Route!, e.SymbolId, e.File, e.Line)));
-        Assert.All(entries, e => Assert.Equal(("hosted", (string?)null), (e.Kind, e.HttpMethod)));
+        // kind：dotnet-exe 里启动代码不起常驻宿主的（Tool 的 return Run(args)、Both 的 Console.WriteLine）是跑一次就退出的命令行；
+        // Web（dotnet-web）与 Worker（dotnet-worker，Host.RunAsync）是常驻服务
+        Assert.Equal(new[] { ("Both", "command"), ("Tool", "command"), ("Web", "hosted"), ("Worker", "hosted") }, entries.Select(e => (e.ContainerKey, e.Kind)));
+        Assert.All(entries, e => Assert.Null(e.HttpMethod));
         Assert.DoesNotContain(entries, e => e.ContainerKey == "Tool.Tests" || e.SymbolId is 2004 or 2006 or 2022 or 2041);
     }
 }

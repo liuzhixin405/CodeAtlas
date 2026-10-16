@@ -53,7 +53,8 @@ public class ScriptBindingTests : IDisposable
 
         Assert.Equal(new ScriptBinding(ScriptReceiver.Import, "./fmt", "*"), refs[("label", null)]);           // Fmt.label()，Fmt 是命名空间导入
         Assert.Equal(new ScriptBinding(ScriptReceiver.Import, "./ui", "*"), refs[("Panel", "render")]);        // <Ui.Panel>
-        Assert.Equal(new ScriptBinding(ScriptReceiver.Other), refs[("filter", null)]);                         // data.filter()，data 是局部变量
+        // data.filter()：data = useGroups(1)，接收者是 import 进来的 useGroups 的返回值（解析器再看 useGroups 返回什么）
+        Assert.Equal(new ScriptBinding(ScriptReceiver.Typed, "@/hooks/useGroups", "useGroups()"), refs[("filter", null)]);
         Assert.Equal(new ScriptBinding(ScriptReceiver.None), refs[("has", null)]);                             // 解构出来的局部名字，没有 import
         Assert.Equal(new ScriptBinding(ScriptReceiver.None), refs[("Row", "render")]);                         // 本文件的组件
         Assert.Equal(new ScriptBinding(ScriptReceiver.None, "@/hooks/useGroups", "useGroups"), refs[("useGroups", null)]);

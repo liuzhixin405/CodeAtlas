@@ -1,23 +1,25 @@
 # CodeAtlas
 
-本地代码阅读器。核心动作只有一个：**点开一个符号，看它调了谁、被谁调、实现了什么**，逐层展开。目标是帮人重新读懂（尤其是 AI 写的）代码。
+本地代码阅读器，帮人重新读懂（尤其是 AI 写的）代码。两个方向：**从项目往下**（容器图 → 框架流程 → 入口流程），**从方法出发**（调用时序、调用大纲、影响范围、模块关系、编辑器里的 CodeLens 跳转）。
 
-当前状态：**里程碑 2**。有 VS Code 扩展（右键 → 邻域图面板）、本地服务和命令行。能把 TypeScript / TSX / JavaScript / C# / Go / Python / Java 仓库索引进 SQLite（C# 另有 Roslyn 精确语义）。Roslyn 精确语义（里程碑 3）、解耦调用链（3b）、AI 解释和 MCP（里程碑 4、5）见 [设计文档](docs/superpowers/specs/2026-10-13-codeatlas-design.md) 与 [扩展设计](docs/superpowers/specs/2026-10-13-vscode-extension-design.md)。
+当前状态：有 VS Code 扩展（面板 + 侧边栏 + CodeLens）、本地服务和命令行。能把 TypeScript / TSX / JavaScript / C# / Go / Python / Java 仓库索引进 SQLite（C# 另有 Roslyn 精确语义），识别部分分派链路和框架管道，并支持本地或联网 AI 叙述。早期里程碑规划见 [设计文档](docs/superpowers/specs/2026-10-13-codeatlas-design.md) 与 [扩展设计](docs/superpowers/specs/2026-10-13-vscode-extension-design.md)，当前能力和限制以使用指南为准。
 
 ## 在 VS Code 里用（推荐）
 
-扩展市场品牌为 **CodeTrail Graph**，后端项目仍叫 CodeAtlas；内部 `codeatlas.*` 设置和 `.codeatlas` 索引目录不变。
+市场品牌为 **CodeTrail Graph**，后端项目仍叫 CodeAtlas；内部 `codeatlas.*` 命令、设置及 `.codeatlas` 索引目录不变。
 
-1. 安装扩展：先在仓库根目录运行 `powershell -File .\scripts\publish.ps1`（构建需要 .NET 10 SDK），再进入 `extension` 依次运行 `npm ci`、`npm run package`、`code --install-extension .\codetrail-graph-win32-x64-0.1.0.vsix`。打包脚本会把服务与 Roslyn worker 一起装进 VSIX；最终用户无需安装 .NET 运行时。
-2. 打开仓库，把光标放在任意方法或类名上，**右键 → 在 CodeTrail Graph 中查看**（或 `Ctrl+Alt+G`）。第一次会提示建立索引，四五千个文件的仓库大约 40 秒。
-3. 面板里：聚焦后**自动沿调用链向下展开到底**（橙色虚线是通过 Handler 的分发）；"↑ 到源头"从当前方法反向追到 Controller / 后台任务等入口；双击节点展开一层，已展开的节点双击跳回代码；"还有 N 个"/"N 个可能目标"胶囊双击后勾选要加入的；右键节点有设为焦点 / 折叠 / 隐藏 / 在编辑器中打开；顶部有搜索框、面包屑，以及"类型引用""测试代码"两个默认关闭的开关。
-4. 保存文件后自动增量索引（可在设置 `codeatlas.indexOnSave` 关闭）。服务进程由扩展自动管理，命令面板里有"CodeTrail Graph: 重启服务"。
+1. 在扩展市场搜索 **CodeTrail Graph**，或运行 `code --install-extension 164910441.codetrail-graph`。离线包及源码构建方式见 [使用指南](docs/vscode-extension-guide.md)；构建需要 .NET 10 SDK，最终用户无需另装 .NET 运行时。
+2. 打开仓库，把光标放在任意方法或类名上，**右键 → CodeTrail Graph → 在调用图中查看**（或 `Ctrl+Alt+G`）。第一次会提示建立索引，耗时取决于项目规模与是否启用 Roslyn。
+3. 调用图默认是**时序图**，按调用顺序从上到下、按项目分列；工具栏「时序 | 网状」可切换画法。网状图自动向下展开主分支，「↑ 到源头」追调用者。项目地图包括容器、框架流程、命名空间，面板支持跨视图后退 / 前进。
+4. 保存文件后自动增量索引（可在设置 `codeatlas.indexOnSave` 关闭）；C# 有待更新文件时会自动补算 Roslyn。服务进程由扩展管理，命令面板里有「CodeTrail Graph: 重启服务」。
+
+0.1.1 使用索引格式 **12**：旧索引会自动全量重建。原始引用持久化后，增量索引可重新绑定未修改的调用方；索引请求串行排队、全量请求优先，过期的异步视图响应不会覆盖新选择。性能变化需在实际项目上测量，不保证固定耗时。
 
 命令行方式仍然可用，见下面。
 
 完整的安装与使用指南（前提、更新、看懂这张图、工具栏、项目地图、常见问题）见 [docs/vscode-extension-guide.md](docs/vscode-extension-guide.md)。
 
-发布到 VS Code Marketplace 的账号注册、授权、多平台打包与上传流程见 [发布指南](docs/vscode-extension-publishing.md)。
+多平台打包、Marketplace 上传和后续升级见 [发布指南](docs/vscode-extension-publishing.md)。
 
 ## 快速上手
 
@@ -43,9 +45,9 @@ codeatlas index D:\code\shop-api
 
 - 索引库默认写在仓库的 `.codeatlas\index.db`。**记得把 `.codeatlas/` 加进那个仓库的 `.gitignore`**，工具会提示但不会替你改。
 - 不想污染仓库，用 `--db` 指到别处：`codeatlas index <repo> --db C:\tmp\shop.db`。之后 `query` / `search` 也要带同一个 `--db`。
-- 第二次运行只重新解析改过的文件（按内容哈希判断），一个 1500 个文件的前端仓库全量 6 秒、增量 1 秒以内。
+- 第二次运行复用未变化文件的解析结果（大小、修改时间及内容哈希），重新绑定需要更新的引用；架构输入或 Git ref 不变时跳过相应后处理。CLI 输出各阶段 `timings`，实际耗时以项目实测为准。
 - `--full` 强制全部重解析。改了工具版本或者感觉索引不对劲时用。
-- 自动跳过 `node_modules`、`bin`、`obj`、`.git`、`dist`、`build`、`.vs`、`.idea`、`.codeatlas`，以及任何含有自己 `.git` 的子目录（git worktree、子模块、嵌套仓库）。
+- 自动跳过 `node_modules`、`bin`、`obj`、`.git`、`dist`、`build`、`.vs`、`.idea`、`.codeatlas` 等生成目录。嵌套仓库和子模块默认纳入，`--no-nested` 关闭；Git worktree 副本始终跳过。
 - 大于 2MB 的文件标记为 skipped 不解析。
 
 参考数据（一个 C# + TS 的中型后端）：4373 个文件、5.9 万个符号、73 万条边，全量 21 秒。
@@ -113,25 +115,26 @@ TS 仓库的限定名格式是 `相对路径:类.方法`，比如 `web/src/compo
 | 0.5 | 全仓库有且只有一个同名定义；或者没找到定义、归为外部库（`external:xxx`） | 中 |
 | 0.3 | 有多个候选，分不清是哪个，每个候选各一条边（最多 20 条） | 低，当"可能是这些之一"看 |
 
-0.3 的边是最常见的噪声来源。`GetAsync`、`Ok`、`List`、`For` 这种名字在大仓库里有几十到上千个定义，tree-sitter 不知道接收者类型，只能全列出来。**里程碑 3 的 Roslyn 增强器会用真实类型信息把这些边替换成精确边**，这正是它存在的理由。
+0.3 的边是常见的噪声来源。同名方法无法按导入与接收者信息唯一定位时，会列出候选。C# 的 Roslyn 增强器已可用，会用真实类型信息覆盖可解析的边；其他语言和缺 SDK 时仍以启发式结果为主。
 
-`external:xxx` 是仓库外的目标（框架、第三方包、标准库），也包括暂时没解析出来的东西（比如 TS 里解构出来的局部变量、`@/` 路径别名的 import）。它们不能展开。
+`external:xxx` 是仓库外的目标（框架、第三方包、标准库），也包括暂时没解析出来的动态目标。支持常见 tsconfig `paths` 别名，但复杂再导出与解构仍有限制；外部节点不能展开。
 
 ## 现在能做什么、不能做什么
 
 能：
 
-- TS / TSX / JS / C# 的类、接口、方法、函数、字段、属性、枚举、命名空间定义。
+- TS / TSX / JS / C# / Go / Python / Java 的符号与调用关系（各语言适用的符号种类不同）。
 - 直接调用、`new`、继承、接口实现、类型引用、import / using。
 - C# 文件级命名空间，`I` 开头的基类型自动判为 implements。
 - 增量索引、文件删除后的悬空边保留、重建后自动重挂。
+- VS Code 调用时序 / 网状图、调用大纲、影响范围、模块关系、CodeLens，以及项目地图与框架流程。
+- C# Roslyn 精确语义、可静态识别的分派链路、部分架构规则与 AI 叙述（可关闭）。
 
 还不能（都有计划）：
 
-- 图形界面。现在只能用命令行看文字版。
-- 精确的 C# 语义：重载解析、泛型、扩展方法、接口方法到实现方法的边。
-- MediatR、事件总线、AOP、中间件管道这类**解耦调用链**（设计文档 4.7 节，里程碑 3b）。
-- tsconfig 的 `paths` 别名。
+- 任意反射、动态分派、运行时生成路由的完整还原；图中框架阶段与顺序仅代表静态证据，未知顺序会标注。
+- 无 Roslyn 时，tree-sitter 分派兜底只覆盖直接消息构造实参；先赋变量或工厂生成的消息不保证识别。
+- Blazor `.razor` 解析、复杂重命名转导出和完整的跨语言类型推断。
 - Kotlin / Rust 等其他语言（底座支持，还没写查询文件）。Java 已支持（Maven / Gradle、Spring MVC / WebFlux / JAX-RS / gRPC / 定时任务 / 消息监听 / picocli），但 Gradle 版本目录、Kotlin、Lombok 生成的方法、按实参类型挑重载不支持。
 - 类型推断有边界：调用返回的泛型 `T`、lambda 参数、元组解构、Go 的多返回值第二个起、Python 未注解的参数推不出来，这些调用按名字近似解析（置信度 0.7 / 0.3）。
 - 列号按 UTF-8 字节算，含中文的行会偏。
@@ -142,7 +145,9 @@ TS 仓库的限定名格式是 `相对路径:类.方法`，比如 `web/src/compo
 
 ```bash
 dotnet build
-dotnet test          # 67 个测试，约 5 秒
+dotnet test CodeAtlas.slnx --verbosity minimal
+npm --prefix extension run typecheck
+npm --prefix extension test
 ```
 
 项目结构：
@@ -150,7 +155,10 @@ dotnet test          # 67 个测试，约 5 秒
 ```
 src/CodeAtlas.Core                 模型、SQLite 读写、启发式解析器、IEdgeResolver 扩展点
 src/CodeAtlas.Indexing.TreeSitter  适配器底座 + 每语言一对 .scm 查询 + 薄适配器；扫描器；索引器
-src/CodeAtlas.Cli                  index / query / search
+src/CodeAtlas.Cli                  index / query / search / arch / serve
+src/CodeAtlas.Server               本地 API、项目地图、框架流程与 AI 叙述
+src/CodeAtlas.Indexing.Roslyn       C# 精确分析与独立 worker
+extension/                        VS Code 扩展与 Webview
 tests/                             每个项目一个测试项目，fixtures 是真实的小源文件
 docs/superpowers/specs             设计文档
 docs/superpowers/plans             实施计划（里程碑 1 已完成）

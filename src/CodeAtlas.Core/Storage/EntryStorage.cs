@@ -1,4 +1,4 @@
-using CodeAtlas.Core.Architecture;
+﻿using CodeAtlas.Core.Architecture;
 
 namespace CodeAtlas.Core.Storage;
 
@@ -8,6 +8,7 @@ public static class EntryStorage
     public static void Replace(IndexDatabase db, IReadOnlyList<EntryPoint> entries, IReadOnlyList<RouteMatch> matches)
     {
         using var batch = db.BeginBatch();
+        ArchFingerprintStorage.Set(db, ArchFingerprintStorage.Post, null); // 结果换了，指纹作废（后处理写完再记新的）
         db.Execute("DELETE FROM entry_points");
         db.Execute("DELETE FROM route_matches");
         foreach (var e in entries)

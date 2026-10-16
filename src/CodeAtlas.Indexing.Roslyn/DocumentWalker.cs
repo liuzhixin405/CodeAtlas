@@ -13,13 +13,13 @@ internal sealed class DocumentWalker
     private readonly string _path;
     /// <summary>"仓库内"的根目录（主根 + 外部根）：定义在它们之下的符号是内部目标，否则记为 external。</summary>
     private readonly IReadOnlyList<string> _repoRoot;
-    private readonly Dictionary<string, List<(INamedTypeSymbol Type, ISymbol Entry)>> _handlers;
+    private readonly DispatchHandlers _handlers;
     private readonly Action<RoslynRecord> _emit;
     private readonly HashSet<(string, string, string, int, string?)> _seenEdges = [];
     private readonly HashSet<SyntaxNode> _conduitCreations = [];
 
     public DocumentWalker(SemanticModel model, SyntaxNode root, string path, IReadOnlyList<string> repoRoot,
-        Dictionary<string, List<(INamedTypeSymbol Type, ISymbol Entry)>> handlers, Action<RoslynRecord> emit)
+        DispatchHandlers handlers, Action<RoslynRecord> emit)
     {
         _model = model; _root = root; _path = path; _repoRoot = repoRoot; _handlers = handlers; _emit = emit;
     }
@@ -107,6 +107,9 @@ internal sealed class DocumentWalker
         var handled = RoslynAnalyzer.HandledMessages(type).ToList();
         foreach (var (message, _) in handled)
             Edge(typeKey, message, "dispatches", 1.0, line, via: "handles");
+        // 开放泛型 Handler（EnqueueHandler<TCommand>）经 DI 按消息闭合注册处理的消息：边挂在类型声明上，和普通 handles 一样
+        foreach (var message in _handlers.ClosedRegistrationsOf(type))
+            Edge(typeKey, message, "dispatches", 1.0, line, via: "handles");
         // 入口落在类型上 = 子类自己没有 Handle，处理逻辑在基类里
         if (handled.Any(h => h.Entry is INamedTypeSymbol)) EmitInheritedHandle(type, typeKey, line);
     }
@@ -144,8 +147,7 @@ internal sealed class DocumentWalker
                         var argType = model.GetTypeInfo(arg.Expression).Type;
                         if (argType is null || !SymbolKeys.ContainsTypeParameter(argType)) continue; // 不含类型参数的分派已由基类方法自己输出
                         if (Substitute(argType, map) is not { } concrete) continue;
-                        if (!_handlers.TryGetValue(SymbolKeys.MessageKey(concrete), out var list)
-                            && !_handlers.TryGetValue(SymbolKeys.Key(concrete), out list)) continue;
+                        if (!_handlers.TryGet(concrete, out var list)) continue;
                         var dispatchVia = "dispatch:" + SymbolKeys.MessageShortName(concrete);
                         foreach (var (_, entry) in list)
                             Edge(typeKey, entry, "dispatches", 1.0, line, via: dispatchVia, evidenceLine: line);
@@ -207,15 +209,19 @@ internal sealed class DocumentWalker
                 var argType = _model.GetTypeInfo(arg.Expression).Type;
                 if (argType is null) continue;
                 // 先按构造键（含类型实参）找具体 Handler 子类，找不到再退回泛型定义键（开放泛型 Handler 的旧行为）
-                if (!_handlers.TryGetValue(SymbolKeys.MessageKey(argType), out var list)
-                    && !_handlers.TryGetValue(SymbolKeys.Key(argType), out list)) continue;
-                var dispatchVia = "dispatch:" + SymbolKeys.MessageShortName(argType);
-                foreach (var (_, entry) in list)
-                    Edge(from, entry, "dispatches", 1.0, line, via: dispatchVia, evidenceLine: line, site: site);
+                if (_handlers.TryGet(argType, out var list))
+                {
+                    var dispatchVia = "dispatch:" + SymbolKeys.MessageShortName(argType);
+                    foreach (var (_, entry) in list)
+                        Edge(from, entry, "dispatches", 1.0, line, via: dispatchVia, evidenceLine: line, site: site);
+                }
+                // 按基类型分派（foreach (var e in domainEvents) mediator.Publish(e)，e 是 INotification）：连到处理它各个子类消息的 Handler，置信度降到 0.5
+                else if (!EmitPolymorphicDispatch(from, argType, line, site)) continue;
                 via = "conduit";
                 if (arg.Expression is BaseObjectCreationExpressionSyntax creation) _conduitCreations.Add(creation);
             }
         }
+        else EmitForwardedDispatch(inv, method, from, line, site);
 
         if (RoslynAnalyzer.DiMethods.Contains(method.Name)) EmitDi(inv, method);
         Edge(from, method, "calls", 1.0, line, via, site: site);
@@ -231,15 +237,44 @@ internal sealed class DocumentWalker
             site: (CallSyntax.NamePos(oc), CallSyntax.ContextOf(oc)));
     }
 
+    /// <summary>
+    /// 分派实参的静态类型是不带类型参数的接口 / 抽象类（INotification、DomainEvent 基类）、自己没有 Handler：连到处理它子类消息的全部 Handler（0.5）。
+    /// 子类消息超过 <see cref="DispatchHandlers.MaxPolymorphicTargets"/> 个就不连（等于"什么都可能"）。带类型参数的（ICommand&lt;TResponse&gt;）交给 <see cref="EmitForwardedDispatch"/>。
+    /// </summary>
+    private bool EmitPolymorphicDispatch(string from, ITypeSymbol argType, int line, (int Pos, string? Ctx) site)
+    {
+        if (argType is not INamedTypeSymbol { IsGenericType: false } named || !(named.TypeKind == TypeKind.Interface || (named.TypeKind == TypeKind.Class && named.IsAbstract))
+            || !RoslynAnalyzer.IsMessageType(named)) return false;
+        var subtypes = _handlers.Subtypes(named);
+        if (subtypes.Count == 0 || subtypes.Count > DispatchHandlers.MaxPolymorphicTargets) return false;
+        foreach (var (message, list) in subtypes)
+            foreach (var (_, entry) in list)
+                Edge(from, entry, "dispatches", 0.5, line, via: "dispatch:" + SymbolKeys.MessageShortName(message), evidenceLine: line, site: site);
+        return true;
+    }
+
+    /// <summary>
+    /// 泛型转发：被调的仓库内方法把某个参数原样交给分派方法（<c>SendApprovedAsync&lt;T&gt;(ICommand&lt;T&gt; command) =&gt; _dispatcher.SendAsync(command)</c>），
+    /// 方法里看不出消息是谁，调用处的实参类型才是。实参类型有 Handler 就从调用处建分派边（中等置信度 0.7），推不出不连。
+    /// </summary>
+    private void EmitForwardedDispatch(InvocationExpressionSyntax inv, IMethodSymbol method, string from, int line, (int Pos, string? Ctx) site)
+    {
+        var forwarded = _handlers.ForwardedParameters(method, _model.Compilation, _repoRoot);
+        if (forwarded.Count == 0 || _model.GetOperation(inv) is not Microsoft.CodeAnalysis.Operations.IInvocationOperation op) return;
+        foreach (var arg in op.Arguments)
+        {
+            if (arg.Parameter is not { } p || !forwarded.Contains(p.Ordinal)) continue;
+            var value = arg.Value is Microsoft.CodeAnalysis.Operations.IConversionOperation { IsImplicit: true } conv ? conv.Operand : arg.Value;
+            if (value.Type is not { } actual || !_handlers.TryGet(actual, out var list)) continue;
+            var dispatchVia = "dispatch:" + SymbolKeys.MessageShortName(actual);
+            foreach (var (_, entry) in list)
+                Edge(from, entry, "dispatches", 0.7, line, via: dispatchVia, evidenceLine: line, site: site);
+        }
+    }
+
     private void EmitDi(InvocationExpressionSyntax inv, IMethodSymbol method)
     {
-        ITypeSymbol? iface = null, impl = null;
-        if (method.TypeArguments.Length == 2) { iface = method.TypeArguments[0]; impl = method.TypeArguments[1]; }
-        else
-        {
-            var typeOfs = inv.ArgumentList.Arguments.Select(a => a.Expression).OfType<TypeOfExpressionSyntax>().ToList();
-            if (typeOfs.Count == 2) { iface = _model.GetTypeInfo(typeOfs[0].Type).Type; impl = _model.GetTypeInfo(typeOfs[1].Type).Type; }
-        }
+        var (iface, impl) = RoslynAnalyzer.DiTypes(inv, method, _model);
         if (iface is null || impl is null) return;
         var lifetime = method.Name.Contains("Singleton") ? "singleton" : method.Name.Contains("Transient") ? "transient" : "scoped";
         var conditional = inv.Ancestors().Any(a => a is IfStatementSyntax or ConditionalExpressionSyntax or SwitchStatementSyntax or SwitchExpressionSyntax);

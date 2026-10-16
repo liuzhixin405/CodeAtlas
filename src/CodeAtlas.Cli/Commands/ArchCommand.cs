@@ -12,7 +12,7 @@ internal static class ArchCommand
 
     public static int Run(ParsedArgs args, TextWriter stdout, TextWriter stderr)
     {
-        if (args.Positional.Count < 1) { stderr.WriteLine("用法：codeatlas arch <repo> [--db <path>] [--json] [--no-store] [--project <外部根> …] [--no-nested] |--dsm <容器键> [--root <组件键>] | --entries <容器键> [--kind k] [--q 文本] | --flow <入口符号 id> [--depth N] | --narrate <container|component|flow> <键> [--force] [--facts] | --narrate-all [--flows N] [--force] [--ai-provider openai|anthropic] [--ai-endpoint <url>] [--ai-model <名>] [--ai-timeout <秒>] [--ai-concurrency N] [--ai-no-source] [--no-ai]"); return 2; }
+        if (args.Positional.Count < 1) { stderr.WriteLine("用法：codeatlas arch <repo> [--db <path>] [--json] [--no-store] [--project <外部根> …] [--no-nested] |--dsm <容器键> [--root <组件键>] | --entries <容器键> [--kind k] [--q 文本] | --flow <入口符号 id> [--depth N] | --flow-coverage <容器键> [--sample N] [--levels N] [--json] | --framework <容器键> [--json] | --narrate <container|component|flow> <键> [--force] [--facts] | --narrate-all [--flows N] [--force] [--ai-provider openai|anthropic] [--ai-endpoint <url>] [--ai-model <名>] [--ai-timeout <秒>] [--ai-concurrency N] [--ai-no-source] [--no-ai]"); return 2; }
         var repo = Path.GetFullPath(args.Positional[0]);
         if (!Directory.Exists(repo)) { stderr.WriteLine($"目录不存在：{repo}"); return 2; }
 
@@ -21,6 +21,8 @@ internal static class ArchCommand
         if (args.Value("--dsm") is { } containerKey) return PrintDsm(repo, containerKey, args.Value("--root") ?? "", args, stdout, stderr);
         if (args.Value("--entries") is { } entriesContainer) return PrintEntries(repo, entriesContainer, args, stdout, stderr);
         if (args.Value("--flow") is { } flowArg) return PrintFlow(repo, flowArg, args, stdout, stderr);
+        if (args.Value("--flow-coverage") is { } coverageContainer) return PrintFlowCoverage(repo, coverageContainer, args, stdout, stderr);
+        if (args.Value("--framework") is { } frameworkContainer) return PrintFramework(repo, frameworkContainer, args, stdout, stderr);
 
         ArchModel model;
         ArchReport report;
@@ -194,23 +196,83 @@ internal static class ArchCommand
         }
         using var db = IndexDatabase.Open(CommonOptions.DbPath(repo, args));
         var (entries, matches) = EntryStorage.Read(db);
-        var entry = entries.FirstOrDefault(e => e.SymbolId == symbolId);
+        // 同一个方法上几条路由：--route / --method 选一条（与服务 /api/arch/flow 同一套）
+        var entry = CodeAtlas.Server.EntryDiscovery.PickEntry(entries, symbolId, args.Value("--route"), args.Value("--method"));
         if (entry is null) { stderr.WriteLine($"没有这个入口：{symbolId}（用 --entries <容器键> 看入口清单）"); return 2; }
         var arch = ArchStorage.Read(db);
         var containers = arch.Nodes.Where(n => n.Kind == ArchNodeKind.Container).ToList();
         var (symbols, edges) = CodeAtlas.Server.MapData.Load(new IndexReader(db));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var flow = CodeAtlas.Server.FlowBuilder.Build(symbols, edges, entry, containers, matches, entries, Math.Clamp(depth ?? CodeAtlas.Server.FlowBuilder.DefaultMaxDepth, 1, 20),
+        var flow = CodeAtlas.Server.FlowBuilder.Build(symbols, CodeAtlas.Server.EntryDiscovery.FlowEdges(entry, entries, symbols, edges), entry, containers, matches, entries, Math.Clamp(depth ?? CodeAtlas.Server.FlowBuilder.DefaultMaxDepth, 1, 20),
             outbound: arch.Outbound, externalNodes: arch.Nodes.Where(n => n.Kind == ArchNodeKind.External).ToList());
+        // 与服务同一条：dispatch:M 前面插入这条消息经过的管道步骤（行为 + 按消息注入的验证器等）
+        flow = CodeAtlas.Server.MessagePipeline.InjectFromDb(db, Path.GetFullPath(repo), flow, containers, symbols, edges);
         if (args.Has("--json")) { stdout.WriteLine(JsonSerializer.Serialize(flow, Json)); return 0; }
 
         var containerName = containers.FirstOrDefault(c => c.Key == flow.ContainerKey)?.Name ?? flow.ContainerKey;
-        stdout.WriteLine($"入口 {flow.EntryLabel}{(entry.HttpMethod is null ? "" : "  " + entry.HttpMethod)}{(flow.Route is null ? "" : "  路由 " + flow.Route)}  容器 {containerName}  节点 {flow.Nodes}{(flow.Truncated ? "（已截断）" : "")}  {sw.Elapsed.TotalMilliseconds:F0}ms{(flow.Note is null ? "" : "  " + flow.Note)}");
+        PrintFlowTree(flow, "入口", entry.HttpMethod, containerName, sw.Elapsed.TotalMilliseconds, stdout);
+        return 0;
+    }
+
+    internal static readonly JsonSerializerOptions FlowJson = Json;
+
+    /// <summary>框架流程（与 GET /api/arch/framework 同一份数据）：阶段、说明、骨架树、Handler 清单概要。</summary>
+    private static int PrintFramework(string repo, string containerKey, ParsedArgs args, TextWriter stdout, TextWriter stderr)
+    {
+        var dbPath = CommonOptions.DbPath(repo, args);
+        if (!File.Exists(dbPath)) { stderr.WriteLine($"索引库不存在：{dbPath}。先运行 codeatlas index {repo}"); return 2; }
+        using var db = IndexDatabase.Open(dbPath);
+        var (symbols, edges) = CodeAtlas.Server.MapData.Load(new IndexReader(db));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var f = CodeAtlas.Server.FrameworkFlowQuery.Build(db, repo, containerKey, symbols, edges);
+        if (f is null) { stderr.WriteLine($"没有这个容器：{containerKey}（先跑 codeatlas index 或 codeatlas arch）"); return 2; }
+        if (args.Has("--json")) { stdout.WriteLine(JsonSerializer.Serialize(f, Json)); return 0; }
+        var handlerCount = f.Handlers.Sum(g => g.Items.Count);
+        stdout.WriteLine($"框架流程  容器 {f.ContainerName}  阶段 {f.Stages.Count}  行为 {f.Flow.Behaviors.Count}  Handler {handlerCount}  节点 {f.Flow.Nodes}  {sw.Elapsed.TotalMilliseconds:F0}ms");
+        stdout.WriteLine("阶段: " + string.Join(" → ", f.Stages.Select(s => $"{s.Label}({s.Symbols.Count}{(s.OrderKnown ? "" : "，顺序未知")})")));
+        if (f.Flow.Behaviors.Count > 0) stdout.WriteLine("行为链: " + string.Join(" → ", f.Flow.Behaviors));
+        foreach (var n in f.Notes) stdout.WriteLine("说明: " + n);
+        stdout.WriteLine();
+        var actorLabels = f.Flow.Actors.ToDictionary(a => a.Key, a => a.Label, StringComparer.Ordinal);
+        PrintNode(f.Flow.Root, 0, actorLabels, stdout);
+        if (f.Handlers.Count > 0)
+        {
+            stdout.WriteLine();
+            stdout.WriteLine($"Handler 清单（{handlerCount}，{f.Handlers.Count} 个模块）:");
+            foreach (var g in f.Handlers)
+                stdout.WriteLine($"  {g.Module} ({g.Items.Count}): " + string.Join(", ", g.Items.Take(6).Select(i => $"{i.MessageType ?? i.Handler.Name}[{i.MessageKind ?? "?"}]←{i.Entries.Count}")) + (g.Items.Count > 6 ? " …" : ""));
+        }
+        return 0;
+    }
+
+    /// <summary>流程树的人读输出（arch --flow 与 query --flow 共用）：一行概要、参与者、管道行为，再是缩进树。</summary>
+    internal static void PrintFlowTree(CodeAtlas.Server.FlowDto flow, string head, string? httpMethod, string containerName, double ms, TextWriter stdout)
+    {
+        stdout.WriteLine($"{head} {flow.EntryLabel}{(httpMethod is null ? "" : "  " + httpMethod)}{(flow.Route is null ? "" : "  路由 " + flow.Route)}  容器 {(containerName.Length == 0 ? "（不在容器里）" : containerName)}  节点 {flow.Nodes}{(flow.Truncated ? "（已截断）" : "")}  {ms:F0}ms{(flow.Note is null ? "" : "  " + flow.Note)}");
         stdout.WriteLine($"参与者 ({flow.Actors.Count}): {string.Join(", ", flow.Actors.Select(a => $"{a.Label} [{a.Kind}]"))}");
         if (flow.Behaviors.Count > 0) stdout.WriteLine($"管道行为: {string.Join(", ", flow.Behaviors)}");
         stdout.WriteLine();
         var actorLabels = flow.Actors.ToDictionary(a => a.Key, a => a.Label, StringComparer.Ordinal);
         PrintNode(flow.Root, 0, actorLabels, stdout);
+    }
+
+    /// <summary>任意方法时序图的业务调用覆盖率（见 FlowCoverage；回归脚本场景 1 用）。</summary>
+    private static int PrintFlowCoverage(string repo, string containerKey, ParsedArgs args, TextWriter stdout, TextWriter stderr)
+    {
+        var sample = CodeAtlas.Server.FlowCoverage.DefaultSample;
+        if (args.Value("--sample") is { } sv && (!int.TryParse(sv, out sample) || sample < 1)) { stderr.WriteLine($"--sample 需要正整数，不是 {sv}"); return 2; }
+        var levels = CodeAtlas.Server.FlowCoverage.DefaultLevels;
+        if (args.Value("--levels") is { } lv && (!int.TryParse(lv, out levels) || levels < 1)) { stderr.WriteLine($"--levels 需要正整数，不是 {lv}"); return 2; }
+        var dbPath = CommonOptions.DbPath(repo, args);
+        if (!File.Exists(dbPath)) { stderr.WriteLine($"索引库不存在：{dbPath}。先运行 codeatlas index {repo}"); return 2; }
+        using var index = new CodeAtlas.Server.IndexService(new CodeAtlas.Server.ServerOptions(repo, dbPath) { Roslyn = false, Projects = args.Values("--project").Select(Path.GetFullPath).ToList(), IncludeNested = !args.Has("--no-nested") });
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var r = CodeAtlas.Server.FlowCoverage.Measure(index, containerKey, sample, levels);
+        if (args.Has("--json")) { stdout.WriteLine(JsonSerializer.Serialize(r, Json)); return 0; }
+        stdout.WriteLine($"容器 {containerKey}  HTTP 入口 {r.Entries}  抽样 {r.Sampled}（跳过没有业务调用的 {r.Skipped}）  前 {r.Levels} 层命中 {r.Hits}  覆盖率 {r.Ratio:P1}  平均召回 {r.Recall:P1}  {sw.Elapsed.TotalSeconds:F1}s");
+        stdout.WriteLine($"下一层方法为根  {r.NextSampled} 个  命中 {r.NextHits}  覆盖率 {r.NextRatio:P1}");
+        foreach (var i in r.Items.Where(i => !i.Hit)) stdout.WriteLine($"  未命中  入口 {i.EntryId} {i.Route}  根 {i.RootId}  业务调用 {i.Targets} 个");
+        foreach (var i in r.Items.Where(i => i.NextHit == false)) stdout.WriteLine($"  下一层未命中  入口 {i.EntryId} {i.Route}  根 {i.NextRootId}");
         return 0;
     }
 
@@ -248,7 +310,7 @@ internal static class ArchCommand
         {
             var c = d.Components[r];
             var row = string.Join("", Enumerable.Range(0, n).Select(col => col == r ? "    ·" : cells.TryGetValue((r, col), out var v) ? $"{v,5}" : "     "));
-            stdout.WriteLine($"{r,3}  {row}   {c.Label} ({c.Symbols} 符号, {c.Files} 文件{(c.HasChildren ? ", 可钻" : "")}{(c.Hot is null ? "" : $", 修订 {c.Hot.Revisions}, {c.Hot.AgeMonths} 月前")}){(d.Cycles.Any(cy => cy.Contains(c.Key)) ? "  ⟲ 环" : "")}");
+            stdout.WriteLine($"{r,3}  {row}   {c.Label} ({c.Symbols} 符号, {c.Files} 文件{(c.HasChildren ? ", 可钻" : "")}{(c.Hot is null ? "" : $", {(c.Hot.Commits is { } commits ? $"{commits} 次提交" : $"文件修订合计 {c.Hot.Revisions}")}, {c.Hot.AgeMonths} 月前")}){(d.Cycles.Any(cy => cy.Contains(c.Key)) ? "  ⟲ 环" : "")}");
         }
         foreach (var cy in d.Cycles) stdout.WriteLine("环: " + string.Join(" ↔ ", cy));
         foreach (var cp in d.Coupling) stdout.WriteLine($"隐性耦合: {d.Components[cp.A].Label} ~ {d.Components[cp.B].Label}  共同修订 {cp.Shared}  耦合度 {cp.Degree:F2}");

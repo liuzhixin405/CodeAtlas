@@ -58,7 +58,7 @@ button:disabled { opacity: .5; cursor: default; }
 /* 容器层下面的两个子视图：组件矩阵 / 入口流程 */
 .subtabs { display: inline-flex; border: 1px solid var(--ca-border); border-radius: 3px; overflow: hidden; flex: none; margin: 0 4px; }
 .subtabs .tab { padding: 1px 7px; font-size: 11px; }
-#map-cy, #pipe-cy, #arch-cy, #dsm-view, #flow-view { grid-row: 2; min-height: 0; }
+#map-cy, #fw-view, #arch-cy, #dsm-view, #flow-view { grid-row: 2; min-height: 0; }
 #dsm-view { overflow: auto; padding: 10px 12px; }
 .dsm { border-collapse: collapse; font-size: 11px; }
 .dsm th, .dsm td { border: 1px solid var(--ca-border); min-width: 26px; height: 24px; text-align: center; padding: 0 3px; }
@@ -216,7 +216,7 @@ footer a { color: var(--ca-accent); cursor: pointer; text-decoration: none; }
 /* ---- 叙述卡（M5d）：地图模式右侧 320px，可收起成竖条；调用图模式随 #map 一起隐藏 ---- */
 #map { grid-template-columns: minmax(0, 1fr) auto; }
 #map-crumbs { grid-column: 1 / -1; }
-#map-cy, #pipe-cy, #arch-cy, #dsm-view, #flow-view { grid-column: 1; }
+#map-cy, #fw-view, #arch-cy, #dsm-view, #flow-view { grid-column: 1; }
 #map-layout-wrap { flex: none; }
 #narration { grid-row: 2; grid-column: 2; width: 320px; min-height: 0; border-left: 1px solid var(--ca-border); background: var(--ca-bg); display: flex; position: relative; font-size: 12px; }
 #narration.collapsed { width: 22px; }
@@ -276,6 +276,17 @@ footer a { color: var(--ca-accent); cursor: pointer; text-decoration: none; }
 .nc-stale { display: flex; gap: 8px; align-items: center; padding: 4px 6px 4px 8px; border-radius: 3px; border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(209, 134, 22, .5)); border-left-width: 3px; background: var(--vscode-inputValidation-warningBackground, rgba(209, 134, 22, .12)); color: var(--vscode-editorWarning-foreground, #d18616); font-size: 11px; }
 .nc-stale .nc-stale-text { flex: 1; min-width: 0; line-height: 1.45; }
 .nc-stale .nc-stale-btn { flex: none; padding: 0 8px; font-size: 11px; }
+/* ---- 调用图 · 时序（与入口流程同一个时序图渲染器）---- */
+#seq { position: relative; min-height: 0; }
+#seq .flow-diagram { position: absolute; inset: 0; }
+#call-view { flex: none; }
+.flow-arrow.selectable { cursor: pointer; user-select: none; }
+.flow-arrow.selected { background: rgba(59, 130, 246, .14); box-shadow: inset 2px 0 0 var(--ca-accent); }
+.flow-label .caret { cursor: pointer; padding: 0 2px; }
+.flow-label .caret:hover { color: var(--ca-fg); }
+.flow-title a.flow-where { color: var(--ca-accent); cursor: pointer; font-family: var(--ca-mono); font-size: 11px; }
+.flow-hint { font-size: 11px; }
+.flow-switch { margin: 0 12px; }
 /* 时序图：JSX 渲染边（页面 → 组件）用绿色细线 + "渲染"标签，和函数调用区分开 */
 .flow-arrow.via-render { --c: #22a06b; }
 .flow-arrow.via-render .flow-line { border-top-width: 1px; }
@@ -296,3 +307,28 @@ footer a { color: var(--ca-accent); cursor: pointer; text-decoration: none; }
 #app[data-mode="relations"] footer > .rel-samples { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px 14px; white-space: normal; overflow: visible; }
 .rel-sample { display: inline-flex; gap: 6px; align-items: baseline; min-width: 0; }
 .rel-sample a { font-family: var(--ca-mono); }
+/* ---- 框架流程：骨架时序图（列 = 阶段）+ 右侧 Handler / 控制器清单 ---- */
+#fw-view { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+#fw-view .fw-diagram { grid-column: 1; }
+.fw-panel { grid-column: 2; width: min(340px, 45vw); min-height: 0; border-left: 1px solid var(--ca-border); display: flex; flex-direction: column; }
+.fw-panel[hidden] { display: none; }
+.fw-panel-head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 0 12px; font-weight: 600; }
+.fw-panel-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fw-close { padding: 0 7px; line-height: 18px; }
+.fw-handler-item .route { overflow: hidden; text-overflow: ellipsis; }
+.fw-handler-item.open { background: var(--ca-hover); }
+.fw-mk { flex: none; font-size: 10px; padding: 0 4px; border-radius: 3px; border: 1px solid currentColor; color: var(--ca-muted); }
+.fw-mk.command { color: #d18616; }
+.fw-mk.query { color: #3b82f6; }
+.fw-mk.event { color: #8957e5; }
+.fw-handler-entries { margin: 0 0 4px 18px; padding-left: 6px; border-left: 2px solid var(--ca-border); }
+.fw-choose { font-size: 11px; padding: 2px 6px; }
+.flow-title select.fw-container { background: var(--ca-input-bg); color: var(--ca-input-fg); border: 1px solid var(--ca-border); border-radius: 3px; padding: 1px 4px; font: inherit; font-weight: 600; }
+.fw-notes { margin: 2px 0 0; padding-left: 18px; color: var(--ca-muted); font-size: 11px; }
+.flow-actor.stage > span { font-weight: 600; border-color: var(--ca-border); background: var(--ca-widget); }
+/* 占位行（N 个 Handler ▸ / N 个控制器 ▸）：点开右侧清单 */
+.flow-arrow.kind-handlers, .flow-arrow.kind-controllers { --c: var(--ca-accent); cursor: pointer; }
+.flow-arrow.kind-handlers .flow-label .text, .flow-arrow.kind-controllers .flow-label .text { border: 1px dashed currentColor; border-radius: 3px; padding: 0 6px; font-family: var(--ca-font, inherit); font-weight: 600; }
+/* 入口流程 / 调用图时序标题里的「经框架流程 ▸」 */
+a.flow-fw-jump { color: var(--ca-accent); cursor: pointer; align-self: flex-start; }
+a.flow-fw-jump:hover { text-decoration: underline; }

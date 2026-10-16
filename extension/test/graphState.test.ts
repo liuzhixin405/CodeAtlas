@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { GraphState } from "../webview/graphState";
 import type { NeighborDto, SymbolDto } from "../webview/types";
 
@@ -13,6 +15,64 @@ function edge(edgeId: number, direction: "in" | "out", other: SymbolDto | null, 
 const focus = sym(1, "focus");
 const callee = sym(2, "callee");
 const caller = sym(3, "caller");
+
+function asyncGraphHarness() {
+  const source = ts.createSourceFile("main.ts", readFileSync(new URL("../webview/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+  const names = new Set(["focusSymbol", "expandNode", "expandChain"]);
+  const code = source.statements.filter(ts.isFunctionDeclaration).filter(node => node.name && names.has(node.name.text))
+    .map(node => node.getText(source)).join("\n");
+  const state = new GraphState();
+  const pending = new Map<number, ((neighbors: NeighborDto[]) => void)[]>();
+  const api = { neighbors: (id: number) => new Promise<NeighborDto[]>(resolve => {
+    const requests = pending.get(id) ?? [];
+    requests.push(resolve);
+    pending.set(id, requests);
+  }) };
+  const deps = {
+    api, state, GraphState, graphSeq: 0, focusModule: "", graphStale: false, arrivedBy: new Map(),
+    filterNeighbors: (neighbors: NeighborDto[]) => neighbors, currentKinds: () => [], moduleOf: () => "", remember: () => {},
+    expandOptions: () => ({}), recordCall: () => {}, render: () => {}, showNodeDetails: () => {}, autoChainEnabled: () => false,
+    highlightTrunk: () => {}, toast: () => {}, ChainMaxDepth: 4, ChainMaxFanout: 6,
+  };
+  const compiled = ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const actions = new Function(...Object.keys(deps), compiled + "\nreturn { focusSymbol, expandNode, expandChain };")(...Object.values(deps)) as {
+    focusSymbol(symbol: SymbolDto): Promise<void>;
+    expandNode(node: NonNullable<ReturnType<GraphState["getNode"]>>): Promise<void>;
+    expandChain(id: string, side: "out"): Promise<void>;
+  };
+  return { ...actions, state, reply: (id: number, neighbors: NeighborDto[]) => pending.get(id)!.shift()!(neighbors) };
+}
+
+describe("async graph ownership", () => {
+  it("ignores a previous focus response that arrives last", async () => {
+    const h = asyncGraphHarness();
+    const old = h.focusSymbol(focus);
+    const latest = h.focusSymbol(caller);
+    h.reply(caller.id, []);
+    await latest;
+    h.reply(focus.id, [edge(1, "out", callee)]);
+    await old;
+    expect(h.state.focusNodeId).toBe("sym:3");
+    expect(h.state.toElements().nodes.map(node => node.id)).toEqual(["sym:3"]);
+  });
+
+  for (const action of ["node", "chain"] as const) {
+    it(`ignores an old ${action} expansion even when its node exists in the new focus`, async () => {
+      const h = asyncGraphHarness();
+      const initial = h.focusSymbol(focus);
+      h.reply(focus.id, [edge(1, "out", callee)]);
+      await initial;
+      const expanding = action === "node" ? h.expandNode(h.state.getNode("sym:2")!) : h.expandChain("sym:1", "out");
+      const latest = h.focusSymbol(caller);
+      h.reply(caller.id, [edge(2, "out", callee)]);
+      await latest;
+      h.reply(callee.id, [edge(3, "out", sym(4, "obsolete"))]);
+      await expanding;
+      expect(h.state.getNode("sym:4")).toBeUndefined();
+      expect(h.state.getNode("sym:2")?.expandedOut).toBe(false);
+    });
+  }
+});
 
 describe("GraphState", () => {
   it("setFocus builds focus node plus one layer, out edges go focus→other and in edges other→focus", () => {
@@ -275,13 +335,92 @@ describe("GraphState", () => {
     expect(s.toElements().nodes).toHaveLength(51);
   });
 
-  it("generic entry-method names are labeled with their class so several HandleAsync nodes stay distinguishable", () => {
+  it("node labels are always Type.Method (same as the entry-flow sequence diagram), not only for generic names", () => {
     const s = new GraphState();
     const handle = { ...sym(50, "HandleAsync", "method", "H.cs"), qualifiedName: "Acme.Handlers.ListFeedsHandler.HandleAsync" };
-    const plain = { ...sym(51, "ListFeedsAsync", "method", "R.cs"), qualifiedName: "Acme.Repo.FeedRepository.ListFeedsAsync" };
-    s.setFocus(focus, [edge(80, "out", handle), edge(81, "out", plain)]);
+    const plain = { ...sym(51, "ListFeedsAsync", "method", "R.cs"), qualifiedName: "Acme.Repo.FeedRepository.ListFeedsAsync(int)" };
+    const script = { ...sym(52, "add", "method", "src/cart.ts"), qualifiedName: "src/cart.ts:Cart.add" };
+    s.setFocus(focus, [edge(80, "out", handle), edge(81, "out", plain), edge(82, "out", script)]);
     expect(s.getNode("sym:50")!.label).toBe("ListFeedsHandler.HandleAsync");
-    expect(s.getNode("sym:51")!.label).toBe("ListFeedsAsync");
+    expect(s.getNode("sym:51")!.label).toBe("FeedRepository.ListFeedsAsync");
+    expect(s.getNode("sym:52")!.label).toBe("Cart.add");
+  });
+
+  it("calls and dispatches share one branch budget per side: limit 2 means the 2 best of both, not 2 of each", () => {
+    const s = new GraphState();
+    s.setFocus(focus, []);
+    const neighbors = [
+      edge(1, "out", sym(101, "a")), edge(2, "out", sym(102, "b")),
+      edge(3, "out", sym(103, "Msg"), { kind: "dispatches", via: "dispatch:Msg" }),
+    ];
+    s.expand("sym:1", neighbors, "out", { limit: 2, rank: (x) => (x.kind === "dispatches" ? 100 : x.other!.name === "b" ? 50 : 10) });
+    const visible = s.toElements().nodes.filter((x) => x.type === "symbol" && x.id !== "sym:1").map((x) => x.label).sort();
+    expect(visible).toEqual(["Msg", "b"]);
+  });
+
+  it("equal rank: callees are expanded in source order (earlier call first)", () => {
+    const s = new GraphState();
+    s.setFocus(focus, []);
+    s.expand("sym:1", [edge(1, "out", sym(101, "zeta"), { line: 5 }), edge(2, "out", sym(102, "alpha"), { line: 30 }), edge(3, "out", sym(103, "mid"), { line: 12 })], "out", { limit: 2, rank: () => 1 });
+    const visible = s.toElements().nodes.filter((x) => x.type === "symbol" && x.id !== "sym:1").map((x) => x.label).sort();
+    expect(visible).toEqual(["mid", "zeta"]);
+  });
+
+  describe("callers capsule (focus in-edges)", () => {
+    const callers = [caller, sym(4, "caller2"), sym(5, "caller3")];
+    const data = () => [edge(10, "out", callee), ...callers.map((c, i) => edge(20 + i, "in", c))];
+
+    it("with callersCapsule the focus only draws its callees; callers fold into one 「被 N 处调用」 capsule", () => {
+      const s = new GraphState();
+      s.setFocus(focus, data(), { callersCapsule: true });
+      const el = s.toElements();
+      expect(el.nodes.filter((n) => n.type === "symbol").map((n) => n.id).sort()).toEqual(["sym:1", "sym:2"]);
+      const cap = s.callersCapsule("sym:1");
+      expect(cap?.label).toBe("被 3 处调用");
+      expect(el.edges).toContainEqual(expect.objectContaining({ source: cap!.id, target: "sym:1", dashed: true }));
+      expect(s.getNode("sym:1")).toMatchObject({ expandedOut: true, expandedIn: false });
+    });
+
+    it("expandCallers adds the callers with the normal budget and removes the capsule", () => {
+      const s = new GraphState();
+      s.setFocus(focus, data(), { callersCapsule: true });
+      const added = s.expandCallers(s.callersCapsule("sym:1")!.id, { limit: 2, rank: (n) => -n.edgeId });
+      expect(added).toBe(3); // 2 个调用者 + 1 个「还有 1 个调用者」溢出胶囊
+      expect(s.callersCapsule("sym:1")).toBeUndefined();
+      expect(s.chainTargets("sym:1", "in").map((n) => n.id).sort()).toEqual(["sym:3", "sym:4"]);
+      expect(s.getNode("sym:1")!.expandedIn).toBe(true);
+    });
+
+    it("no callers: no capsule, and the focus counts as expanded on both sides (shows 「入口?」)", () => {
+      const s = new GraphState();
+      s.setFocus(focus, [edge(10, "out", callee)], { callersCapsule: true });
+      expect(s.toElements().nodes.some((n) => n.callers)).toBe(false);
+      expect(s.getNode("sym:1")!.expanded).toBe(true);
+    });
+
+    it("type-relation in-edges are not callers: they stay as normal edges", () => {
+      const s = new GraphState();
+      const sub = sym(9, "Sub", "class");
+      s.setFocus(focus, [...data(), edge(30, "in", sub, { kind: "inherits" })], { callersCapsule: true });
+      expect(s.callersCapsule("sym:1")!.label).toBe("被 3 处调用");
+      expect(s.getNode("sym:9")).toBeDefined();
+    });
+
+    it("expanding the in side directly drops the capsule", () => {
+      const s = new GraphState();
+      s.setFocus(focus, data(), { callersCapsule: true });
+      s.expand("sym:1", [edge(20, "in", caller)], "in");
+      expect(s.callersCapsule("sym:1")).toBeUndefined();
+      expect(s.getNode("sym:3")).toBeDefined();
+    });
+
+    it("the capsule survives breadcrumb navigation", () => {
+      const s = new GraphState();
+      s.setFocus(focus, data(), { callersCapsule: true });
+      s.setFocus(callee, [], { callersCapsule: true });
+      s.goTo(0);
+      expect(s.callersCapsule("sym:1")?.label).toBe("被 3 处调用");
+    });
   });
 
   it("external symbols are flagged not expandable", () => {

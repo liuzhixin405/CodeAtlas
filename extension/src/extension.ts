@@ -555,7 +555,7 @@ function onSaved(doc: vscode.TextDocument): void {
 function schedulerFor(repoRoot: string): IndexScheduler {
   let s = schedulers.get(repoRoot);
   if (!s) {
-    s = new IndexScheduler(() => doIndex(repoRoot, false), 1500, (e) => log(`索引失败：${e}`));
+    s = new IndexScheduler((full) => doIndex(repoRoot, full), 1500, (e) => log(`索引失败：${e}`));
     schedulers.set(repoRoot, s);
   }
   return s;
@@ -563,17 +563,20 @@ function schedulerFor(repoRoot: string): IndexScheduler {
 
 async function runIndex(repoRoot: string, full: boolean): Promise<void> {
   try {
-    if (full) await doIndex(repoRoot, true);
-    else await schedulerFor(repoRoot).runNow();
+    await schedulerFor(repoRoot).runNow(full);
   } catch (e) {
     reportServerError(e);
   }
 }
 
 async function doIndex(repoRoot: string, full: boolean): Promise<void> {
-  const started = await withServer(repoRoot, (c) => c.startIndex(full));
+  let started = await withServer(repoRoot, (c) => c.startIndex(full));
+  while (started === "busy") {
+    log("索引已在进行中，等待结束后执行本次请求");
+    if (await withServer(repoRoot, (c) => c.waitForIndex(() => {})) === undefined) return;
+    started = await withServer(repoRoot, (c) => c.startIndex(full));
+  }
   if (started === undefined) return;
-  if (started === "busy") log("索引已在进行中，等待其结束");
   status.text = "$(sync~spin) CodeTrail Graph · 索引中";
   const final = await withServer(repoRoot, (c) => c.waitForIndex((s) => {
     if (!s.running) return;
@@ -597,6 +600,7 @@ async function doIndex(repoRoot: string, full: boolean): Promise<void> {
     }
     else log(`Roslyn 完成：${r.roslyn.files} 文件，合并 ${r.roslyn.symbolsMerged} 符号，${r.roslyn.edges} 条精确边，${r.roslyn.elapsedSeconds.toFixed(1)}s`);
   }
+  if (r?.timings?.length) log(`阶段耗时：${r.timings.map((t) => `${t.phase} ${t.seconds.toFixed(1)}s`).join("  ")}`);
   const apiBase = await ensureServer(repoRoot);
   if (apiBase) await refreshStatus(new ServerClient(apiBase, token));
   panel.indexChanged();

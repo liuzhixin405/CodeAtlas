@@ -1,4 +1,6 @@
-import { layoutFlow, toggle, type FlowPreset, type FlowRow } from "./flowLayout";
+import type { FlowPreset } from "./flowLayout";
+import { frameworkJumpText, frameworkJumpTitle } from "./frameworkModel";
+import { esc, SequenceDiagram } from "./seqDiagram";
 import type { EntryDto, FlowDto, FlowNodeDto } from "./types";
 
 /** 入口种类的分组标题，也决定分组顺序。 */
@@ -17,6 +19,8 @@ export const EntryKindLabels: Record<string, string> = {
 export interface FlowViewCallbacks {
   onEntrySelect(entry: EntryDto): void;
   onNodeFocus(node: FlowNodeDto): void;
+  /** 点标题里的「经框架流程 ▸」：切到这个流程所在容器的框架流程。 */
+  onFrameworkJump?(dto: FlowDto): void;
 }
 
 /** 入口显示名：HTTP 用「方法 路由」，其他用路由或名字。 */
@@ -83,17 +87,66 @@ function saveListWidth(px: number): void {
   try { localStorage.setItem(ListWidthKey, String(Math.round(px))); } catch { /* 不记也能用 */ }
 }
 
+/** 入口流程时序图的标题：入口名、路由、容器、节点数、「经框架流程 ▸」、服务端提示。 */
+export function entryFlowHeader(dto: FlowDto, onFramework?: (dto: FlowDto) => void): HTMLElement {
+  const head = document.createElement("div");
+  head.className = "flow-head";
+  const title = dto.route && dto.route !== dto.entryLabel ? `${esc(dto.entryLabel)} <span class="muted">${esc(dto.route)}</span>` : esc(dto.entryLabel);
+  const stats = [`${dto.nodes} 个节点`];
+  if (dto.truncated) stats.push("已截断");
+  head.innerHTML = `<div class="flow-title"><span class="kind">入口</span><span class="label">${title}</span><span class="muted">容器 ${esc(dto.containerKey)} · ${esc(stats.join("，"))}</span></div>`;
+  appendFlowHeadExtras(head, dto, onFramework);
+  return head;
+}
+
+/**
+ * 标题下的两行（入口流程、调用图时序模式共用）：
+ * - 有行为链时一行「经框架流程 ▸ 行为 ×N」（悬停列出行为），给了回调就可点、点了切到框架流程；
+ * - 服务端提示。
+ */
+export function appendFlowHeadExtras(head: HTMLElement, dto: FlowDto, onFramework?: (dto: FlowDto) => void): void {
+  const jump = frameworkJumpText(dto.behaviors);
+  if (jump) {
+    const el = document.createElement(onFramework ? "a" : "div");
+    el.className = "flow-behaviors" + (onFramework ? " flow-fw-jump" : " muted");
+    el.textContent = jump;
+    el.title = frameworkJumpTitle(dto.behaviors);
+    if (onFramework) el.onclick = (e) => { e.stopPropagation(); onFramework(dto); };
+    head.appendChild(el);
+  }
+  if (dto.note) {
+    const note = document.createElement("div");
+    note.className = "flow-note";
+    note.textContent = dto.note;
+    head.appendChild(note);
+  }
+}
+
+/** 入口清单一项的 HTML（入口流程左栏、框架流程的 Handler / 控制器清单共用）；attrs 是额外的 data-* 属性。 */
+export function entryItemHtml(e: EntryDto, active: boolean, attrs: Record<string, string> = {}): string {
+  const main = e.route ?? e.name;
+  const extra = Object.entries(attrs).map(([k, v]) => ` ${k}="${esc(v)}"`).join("");
+  return `<div class="flow-entry${active ? " active" : ""}" title="${esc(`${e.qualifiedName}\n${e.file}:${e.line}`)}"${extra}>` +
+    (e.httpMethod ? `<span class="method ${esc(e.httpMethod.toLowerCase())}">${esc(e.httpMethod)}</span>` : "") +
+    `<span class="route">${esc(main)}</span>` +
+    (e.route !== null && e.route !== e.name ? `<span class="name">${esc(e.name)}</span>` : "") + `</div>`;
+}
+
+function entryItem(e: EntryDto, active: boolean, onClick: (e: EntryDto) => void): HTMLElement {
+  const tmp = document.createElement("div");
+  tmp.innerHTML = entryItemHtml(e, active);
+  const item = tmp.firstElementChild as HTMLElement;
+  item.onclick = () => onClick(e);
+  return item;
+}
+
 export class FlowView {
   private readonly search: HTMLInputElement;
   private readonly list: HTMLElement;
-  private readonly diagram: HTMLElement;
+  private readonly seq: SequenceDiagram;
   private entries: EntryDto[] = [];
   /** 选中的那一条入口（不是符号：顶级语句里的几条 Minimal API 路由与 Main 入口落在同一个符号上）。 */
   private selected: string | null = null;
-  private dto: FlowDto | null = null;
-  private expanded = new Set<string>();
-  /** 时序图版式预设，见 flowLayout.FlowPreset。 */
-  private preset: FlowPreset | string = "first-seen";
 
   constructor(container: HTMLElement, private readonly cb: FlowViewCallbacks) {
     container.innerHTML = "";
@@ -110,9 +163,12 @@ export class FlowView {
     resizer.className = "flow-resizer";
     resizer.title = "拖动调整入口列表宽度";
     left.append(this.search, this.list, resizer);
-    this.diagram = document.createElement("div");
-    this.diagram.className = "flow-diagram";
-    container.append(left, this.diagram);
+    const diagram = document.createElement("div");
+    diagram.className = "flow-diagram";
+    container.append(left, diagram);
+    // 入口流程的老交互：单击行展开 / 折叠，点名字切到调用图
+    const jump = this.cb.onFrameworkJump ? (dto: FlowDto) => this.cb.onFrameworkJump?.(dto) : undefined;
+    this.seq = new SequenceDiagram(diagram, { header: (dto) => entryFlowHeader(dto, jump), toggleOnRowClick: true, onNodeLink: (n) => this.cb.onNodeFocus(n) });
     applyListWidth(container, savedListWidth());
     resizer.onpointerdown = (down) => {
       down.preventDefault();
@@ -138,22 +194,16 @@ export class FlowView {
 
   /** 右侧回到提示文字（换容器、还没选入口时）。 */
   clearFlow(hint = "在左侧选一个入口，看它一路调到哪里。"): void {
-    this.dto = null;
-    this.expanded = new Set();
-    this.diagram.innerHTML = `<p class="flow-empty">${esc(hint)}</p>`;
+    this.seq.clear(hint);
   }
 
   renderFlow(dto: FlowDto): void {
-    if (this.dto?.entrySymbolId !== dto.entrySymbolId) this.expanded = new Set();
-    this.dto = dto;
-    this.renderDiagram();
+    this.seq.render(dto);
   }
 
   /** 切换版式预设；已有流程时立刻重画，展开状态保留。 */
   setPreset(preset: FlowPreset | string): void {
-    if (this.preset === preset) return;
-    this.preset = preset;
-    if (this.dto) this.renderDiagram();
+    this.seq.setPreset(preset);
   }
 
   // ---------- 左栏 ----------
@@ -173,108 +223,9 @@ export class FlowView {
       head.className = "flow-group";
       head.textContent = `${EntryKindLabels[kind] ?? kind} · ${group.length}`;
       this.list.appendChild(head);
-      for (const e of group) {
-        const item = document.createElement("div");
-        item.className = "flow-entry" + (entryKey(e) === this.selected ? " active" : "");
-        item.title = `${e.qualifiedName}\n${e.file}:${e.line}`;
-        const main = e.route ?? e.name;
-        item.innerHTML = (e.httpMethod ? `<span class="method ${esc(e.httpMethod.toLowerCase())}">${esc(e.httpMethod)}</span>` : "") +
-          `<span class="route">${esc(main)}</span>` +
-          (e.route !== null && e.route !== e.name ? `<span class="name">${esc(e.name)}</span>` : "");
-        item.onclick = () => this.cb.onEntrySelect(e);
-        this.list.appendChild(item);
-      }
+      for (const e of group) this.list.appendChild(entryItem(e, entryKey(e) === this.selected, (x) => this.cb.onEntrySelect(x)));
     }
   }
 
-  // ---------- 右栏 ----------
-
-  private renderDiagram(): void {
-    const dto = this.dto;
-    if (!dto) return;
-    const layout = layoutFlow(dto, this.expanded, this.preset);
-    const n = Math.max(1, layout.columns.length);
-    this.diagram.innerHTML = "";
-    this.diagram.appendChild(this.buildHeader(dto));
-
-    const grid = document.createElement("div");
-    grid.className = "flow-grid";
-    grid.style.setProperty("--cols", String(n));
-
-    const actors = document.createElement("div");
-    actors.className = "flow-actors";
-    for (const a of layout.columns) {
-      const cell = document.createElement("div");
-      cell.className = `flow-actor ${a.kind}`;
-      cell.title = `${a.label}（${a.kind === "container" ? "容器" : a.kind === "external" ? "外部" : "项目"}）`;
-      cell.innerHTML = `<span>${esc(a.label)}</span>`;
-      actors.appendChild(cell);
-    }
-    grid.appendChild(actors);
-
-    const body = document.createElement("div");
-    body.className = "flow-body";
-    layout.rows.forEach((row, i) => body.appendChild(this.buildRow(row, i)));
-    grid.appendChild(body);
-    this.diagram.appendChild(grid);
-  }
-
-  private buildHeader(dto: FlowDto): HTMLElement {
-    const head = document.createElement("div");
-    head.className = "flow-head";
-    const title = dto.route && dto.route !== dto.entryLabel ? `${dto.entryLabel} <span class="muted">${esc(dto.route)}</span>` : esc(dto.entryLabel);
-    const stats = [`${dto.nodes} 个节点`];
-    if (dto.truncated) stats.push("已截断");
-    head.innerHTML = `<div class="flow-title"><span class="kind">入口</span><span class="label">${title}</span><span class="muted">容器 ${esc(dto.containerKey)} · ${esc(stats.join("，"))}</span></div>` +
-      (dto.behaviors.length > 0 ? `<div class="flow-behaviors muted">行为链（顺序未知）: ${esc(dto.behaviors.join(" → "))}</div>` : "") +
-      (dto.note ? `<div class="flow-note">${esc(dto.note)}</div>` : "");
-    return head;
-  }
-
-  private buildRow(row: FlowRow, index: number): HTMLElement {
-    const node = row.node;
-    const el = document.createElement("div");
-    const lo = Math.min(row.fromCol, row.toCol);
-    const hi = Math.max(row.fromCol, row.toCol);
-    const span = hi - lo + 1;
-    el.className = `flow-arrow ${row.direction} kind-${node.kind}` + (row.hasChildren ? " has-children" : "") + (row.collapsed ? " collapsed" : "") + (node.confidence < 0.7 ? " weak" : "") + (row.via ? ` ${row.via.cls}` : "");
-    el.style.gridRow = String(index + 1);
-    el.style.gridColumn = `${lo + 1} / ${hi + 2}`;
-    // 箭头要从起点列的中线画到终点列的中线：列等宽，所以两边各空半列
-    if (row.direction === "self") el.style.paddingLeft = node.kind === "entry" ? "0" : "50%";
-    else el.style.padding = `0 calc(50% / ${span})`;
-    const isHttp = node.kind === "http";
-    el.title = [node.qualifiedName, isHttp && node.note ? node.note : "", node.via ? `via ${node.via}` : "", node.confidence < 1 ? `confidence ${node.confidence.toFixed(1)}` : "", row.collapsed ? `${node.children.length} 个孩子已折起` : "", node.hidden > 0 ? `还有 ${node.hidden} 个没下发` : ""].filter(Boolean).join("\n");
-
-    const label = document.createElement("span");
-    label.className = "flow-label";
-    const text = node.kind === "more" ? `还有 ${node.count} 个` : row.label;
-    label.innerHTML = (row.hasChildren ? `<span class="caret">${row.collapsed ? "▸" : "▾"}</span>` : "") +
-      // 没对上后端的接口调用：标签前一个「接口」小标记，行尾灰字说明原因
-      (isHttp ? `<span class="api-tag">接口</span>` : "") +
-      `<span class="text">${esc(text)}</span>` +
-      (node.via && node.kind === "hop" ? `<span class="via">${esc(node.via)}</span>` : "") +
-      (row.via ? `<span class="via">${esc(row.via.tag)}</span>` : "") +
-      (row.collapsed ? `<span class="muted">(${node.children.length})</span>` : "") +
-      ((node.kind === "hop" || isHttp) && node.note ? `<span class="note">${esc(node.note)}</span>` : "");
-    // 接口调用没有符号，点了也不跳调用图
-    if (node.symbolId !== null && !isHttp) {
-      label.classList.add("link");
-      label.onclick = (e) => { e.stopPropagation(); this.cb.onNodeFocus(node); };
-    }
-
-    const line = document.createElement("span");
-    line.className = node.kind === "entry" ? "flow-dot" : row.direction === "self" ? "flow-loop" : "flow-line";
-    if (row.direction === "self" || node.kind === "entry") el.append(line, label);
-    else el.append(label, line);
-
-    if (row.hasChildren) {
-      el.onclick = () => { this.expanded = toggle(this.expanded, row.id); this.renderDiagram(); };
-    }
-    return el;
-  }
 }
 
-function esc(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
-}

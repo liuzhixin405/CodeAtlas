@@ -102,6 +102,12 @@ public sealed class PolyglotFixture : IDisposable
             func RegisterCatalogServiceServer(s grpc.ServiceRegistrar, srv CatalogServiceServer) {}
             """);
 
+        // ── 测试夹具里的"服务"：目录在测试树下（tests/…），不是可部署单元，不出容器 ──
+        Write("tests/fixtures/go/shop/go.mod", "module example.com/shop\n\ngo 1.22\n\nrequire github.com/lib/pq v1.10.9\n");
+        Write("tests/fixtures/go/shop/main.go", "package main\n\nfunc main() {}\n");
+        Write("tests/Fixtures/Sample.App/Sample.App.csproj", """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""");
+        Write("tests/Fixtures/Sample.App/Program.cs", "System.Console.WriteLine(1);\n");
+
         // ── Go：模块根就是 main ──
         Write("go/single/go.mod", "module github.com/acme/pricing\n\ngo 1.22\n\nrequire gorm.io/gorm v1.25.7\n");
         Write("go/single/main.go", """
@@ -294,6 +300,11 @@ public sealed class PolyglotFixture : IDisposable
             public class LedgerApi : Ledger.LedgerBase { }
             public class HealthApi : Grpc.Health.V1.Health.HealthBase { }
             """);
+
+        // ── Node：没有 Dockerfile 的 HTTP 服务（有 start 脚本算服务）；只是依赖了 express、没有 start 的不算 ──
+        Write("node/api/package.json", """{ "name": "shop-api", "scripts": { "start": "node dist/main.js", "build": "tsc" }, "dependencies": { "@nestjs/core": "^10.0.0", "express": "^4.18.0" } }""");
+        Write("node/api/src/main.ts", "async function bootstrap() {}\nbootstrap();\n");
+        Write("node/mock/package.json", """{ "name": "mock-server", "scripts": { "test": "jest" }, "dependencies": { "express": "^4.18.0" } }""");
 
         // ── Node：gRPC 服务 ──
         Write("node/payment/package.json", """{ "name": "payment-svc", "scripts": { "start": "node server.js" }, "dependencies": { "@grpc/grpc-js": "1.9.0" } }""");

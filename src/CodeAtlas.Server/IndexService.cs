@@ -1,4 +1,5 @@
 using CodeAtlas.Core.Architecture;
+using CodeAtlas.Core.Diagnostics;
 using CodeAtlas.Core.Model;
 using CodeAtlas.Core.Resolution;
 using CodeAtlas.Core.Roslyn;
@@ -13,7 +14,7 @@ namespace CodeAtlas.Server;
 /// 服务的核心：一个写连接给索引器、一个读连接给查询（WAL 模式下互不阻塞）。
 /// 索引在后台串行运行；所有查询在读锁下串行执行（毫秒级，够用）。
 /// </summary>
-public sealed class IndexService : IDisposable
+public sealed class IndexService : IDisposable, IAsyncDisposable
 {
     private readonly ServerOptions _options;
     private readonly IndexDatabase _writeDb;
@@ -21,6 +22,9 @@ public sealed class IndexService : IDisposable
     private readonly SemaphoreSlim _readLock = new(1, 1);
     private readonly List<ILanguageAdapter> _adapters = LanguageAdapters.Create();
     private readonly object _stateLock = new();
+    private readonly CancellationTokenSource _lifetime = new();
+    private volatile bool _stopping;
+    private Task? _disposeTask;
     private Task? _indexTask;
     private IndexProgress? _progress;
     private IndexReportDto? _lastReport;
@@ -48,7 +52,7 @@ public sealed class IndexService : IDisposable
         var symbols = _readDb.Scalar<long>("SELECT COUNT(*) FROM symbols WHERE kind <> 'external'");
         var indexedAt = _readDb.Query<string>("SELECT MAX(indexed_at) FROM files WHERE path <> $ext", ("$ext", IndexWriter.ExternalFilePath)).FirstOrDefault();
         var roslynAt = _readDb.Query<string>("SELECT COALESCE(MAX(roslyn_at), '') FROM files").FirstOrDefault();
-        var stale = _readDb.Scalar<long>("SELECT COUNT(*) FROM files WHERE language = 'csharp' AND roslyn_at IS NULL");
+        var stale = r.CountRoslynPendingFiles();
         return new HealthDto(_options.RepoRoot, _options.DbPath, files, symbols, string.IsNullOrEmpty(indexedAt) ? null : indexedAt, _writeDb.NeedsRebuild,
             string.IsNullOrEmpty(roslynAt) ? null : roslynAt, stale);
     });
@@ -58,35 +62,45 @@ public sealed class IndexService : IDisposable
     {
         lock (_stateLock)
         {
-            if (_indexTask is { IsCompleted: false }) return false;
+            if (_stopping || _indexTask is { IsCompleted: false }) return false;
             _progress = new IndexProgress("scan", 0, 0, null);
             _lastError = null;
             var roots = _roots = _options.LoadRoots();
             var indexer = new TreeSitterIndexer(_writeDb, _adapters, new HeuristicEdgeResolver(), new IndexOptions { Full = full });
             var progress = new Progress<IndexProgress>(p => _progress = p);
+            var ct = _lifetime.Token;
             _indexTask = Task.Run(async () =>
             {
                 try
                 {
-                    var r = await indexer.IndexAsync(roots, progress);
+                    var r = await indexer.IndexAsync(roots, progress, ct);
+                    var timings = new PhaseTimings();
+                    timings.AddRange(r.Timings ?? []);
                     var report = new IndexReportDto(r.FilesScanned, r.FilesParsed, r.FilesFailed, r.FilesSkipped, r.FilesRemoved, r.FilesUnchanged,
                         r.TotalSymbols, r.TotalEdges, r.Elapsed.TotalSeconds);
                     lock (_stateLock) _lastReport = report;
                     if (ShouldRunRoslyn(full, roslyn))
                     {
-                        var roslynReport = await RunRoslynAsync(roots);
-                        lock (_stateLock) _lastReport = report with { Roslyn = roslynReport };
+                        var roslynReport = await RunRoslynAsync(roots, full, timings, ct);
+                        lock (_stateLock) _lastReport = report = report with { Roslyn = roslynReport };
                     }
-                    // 容器图事实：几秒钟的文件与文本扫描；失败只记错误不影响索引
-                    try { lock (_stateLock) _progress = new IndexProgress("arch", 0, 0, null); ArchitectureScanner.ScanAndStore(roots, _writeDb); }
+                    ct.ThrowIfCancellationRequested();
+                    // 后处理三步共用一份清单与源码缓存；输入没变时 arch + entries 整段跳过，git ref 没变时 git 跳过（见 PostIndexSteps）
+                    var post = new PostIndexSteps(roots, _writeDb, timings);
+                    // 容器图事实：文件与文本扫描；失败只记错误不影响索引
+                    try { lock (_stateLock) _progress = new IndexProgress("arch", 0, 0, null); timings.Measure("arch", post.Arch); }
                     catch (Exception ex) { lock (_stateLock) _lastError = "容器图扫描失败：" + ex.Message; }
+                    ct.ThrowIfCancellationRequested();
                     // git 行为统计：没有 git 时 Error 里写原因，DSM 的叠加层为空
-                    try { lock (_stateLock) _progress = new IndexProgress("git", 0, 0, null); GitStorage.Replace(_writeDb, GitHistory.Run(roots)); }
+                    try { lock (_stateLock) _progress = new IndexProgress("git", 0, 0, null); timings.Measure("git", post.Git); }
                     catch (Exception ex) { lock (_stateLock) _lastError = "git 统计失败：" + ex.Message; }
+                    ct.ThrowIfCancellationRequested();
                     // 入口与路由匹配：靠索引里的符号和边，所以放在最后；失败同样只记错误
-                    try { lock (_stateLock) _progress = new IndexProgress("entries", 0, 0, null); ArchitecturePostProcess.Run(roots, _writeDb); }
+                    try { lock (_stateLock) _progress = new IndexProgress("entries", 0, 0, null); timings.Measure("entries", post.Entries); }
                     catch (Exception ex) { lock (_stateLock) _lastError = "入口识别失败：" + ex.Message; }
+                    lock (_stateLock) _lastReport = report with { Timings = timings.Items };
                 }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
                 catch (Exception ex)
                 {
                     lock (_stateLock) _lastError = ex.Message;
@@ -94,7 +108,7 @@ public sealed class IndexService : IDisposable
                 finally
                 {
                     lock (_stateLock) _progress = null;
-                    lock (_mapCache) { _mapCache.Clear(); _pipelineCache.Clear(); _archCache = null; _dsmCache.Clear(); _entriesCache.Clear(); _flowCache.Clear(); _mapData = null; _fileHashes = null; }
+                    lock (_mapCache) { _mapCache.Clear(); _frameworkCache.Clear(); _pipelineCache.Clear(); _archCache = null; _dsmCache.Clear(); _entriesCache.Clear(); _flowCache.Clear(); _repoContainer = null; _mapData = null; _fileHashes = null; }
                 }
             });
             return true;
@@ -105,29 +119,36 @@ public sealed class IndexService : IDisposable
     {
         if (!_options.Roslyn || requested == false) return false;
         if (requested == true || full) return true;
-        // 自动：从没跑过 Roslyn 的库（首次索引）才跑；保存文件触发的增量不跑，等下次全量
-        return _writeDb.Scalar<long>("SELECT COUNT(*) FROM files WHERE roslyn_at IS NOT NULL") == 0
-            && _writeDb.Scalar<long>("SELECT COUNT(*) FROM files WHERE language = 'csharp'") > 0;
+        return new IndexReader(_writeDb).CountRoslynPendingFiles() > 0;
     }
 
-    /// <summary>主根、外部根、被纳入的嵌套仓库各找一个解决方案，依次跑 worker 写回同一个库；部分失败不影响其余（失败原因进 error）。</summary>
-    private async Task<RoslynReportDto> RunRoslynAsync(ProjectRoots roots)
+    /// <summary>
+    /// 主根、外部根、被纳入的嵌套仓库各找一个解决方案，依次跑 worker 写回同一个库；部分失败不影响其余（失败原因进 error）。
+    /// 非全量时只把待 Roslyn 的文件（IndexReader.GetRoslynPendingFiles）交给它们各自的解决方案，没分到文件的解决方案不启动。
+    /// </summary>
+    private async Task<RoslynReportDto> RunRoslynAsync(ProjectRoots roots, bool full, PhaseTimings timings, CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var worker = RoslynRunner.FindWorker();
         if (worker is null) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, $"没有找到 {RoslynRunner.WorkerName}（应与 codeatlas 同目录），跳过 Roslyn 精确语义。");
         var solutions = RoslynRunner.DiscoverSolutions(roots);
         if (solutions.Count == 0) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, "仓库里没有找到 .sln/.slnx，跳过 Roslyn 精确语义。");
-        if (await RoslynRunner.ProbeAsync(worker) is { } unavailable) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, unavailable, Unavailable: true);
+        if (await RoslynRunner.ProbeAsync(worker, ct) is { } unavailable) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, unavailable, Unavailable: true);
+        var pending = full ? null : new IndexReader(_writeDb).GetRoslynPendingFiles();
+        if (pending is { Count: 0 }) return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, 0, null, Incremental: true);
+        timings.Add("roslyn.prepare", sw.Elapsed.TotalSeconds);
         lock (_stateLock) _progress = new IndexProgress("roslyn", 0, 0, null);
         try
         {
             var r = await RoslynRunner.RunAndApplyAsync(_writeDb, worker, solutions, roots,
                 p => { lock (_stateLock) _progress = new IndexProgress("roslyn", p.Done, p.Total, p.Current); },
-                null, CancellationToken.None);
+                null, ct, pendingFiles: pending);
+            timings.AddRange(r.Timings ?? []);
             var partial = r.FailedSolutions is { Count: > 0 } failed ? $"{failed.Count}/{r.Solutions} 个解决方案失败：" + string.Join("；", failed) : null;
-            return new RoslynReportDto(r.Files, r.FilesSkipped, r.SymbolsMerged, r.SymbolsAdded, r.Edges, r.DiRegistrations, r.Errors, sw.Elapsed.TotalSeconds, partial);
+            return new RoslynReportDto(r.Files, r.FilesSkipped, r.SymbolsMerged, r.SymbolsAdded, r.Edges, r.DiRegistrations, r.Errors, sw.Elapsed.TotalSeconds, partial,
+                Incremental: r.Incremental);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             return new RoslynReportDto(0, 0, 0, 0, 0, 0, 0, sw.Elapsed.TotalSeconds, ex.Message);
@@ -208,7 +229,6 @@ public sealed class IndexService : IDisposable
     public ImpactDto? Impact(long id, ImpactOptions options) => Read(_ => ImpactQuery.Build(_readDb, id, options));
 
     private readonly Dictionary<string, MapDto> _mapCache = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, PipelineDto> _pipelineCache = new(StringComparer.Ordinal);
 
     /// <summary>项目地图。整库符号与边加载一次后按 root 缓存；索引结束时清空。</summary>
     public MapDto Map(string root) => Read(r =>
@@ -223,19 +243,48 @@ public sealed class IndexService : IDisposable
         }
     });
 
-    /// <summary>项目地图的管道视图；root 为空表示自动推导。缓存与清空策略同 Map。</summary>
-    public PipelineDto Pipeline(string root) => Read(r =>
+    private readonly Dictionary<string, FrameworkFlowDto?> _frameworkCache = new(StringComparer.Ordinal);
+
+    /// <summary>框架流程（见 <see cref="FrameworkFlowBuilder"/>）：容器不存在返回 null。缓存与清空策略同 Map。</summary>
+    public FrameworkFlowDto? Framework(string containerKey) => Read(r =>
     {
-        lock (_mapCache)
-        {
-            if (_pipelineCache.TryGetValue(root, out var cached)) return cached;
-            var (symbols, edges) = Data(r);
-            var di = r.GetDiRegistrations().Select((d, i) => new MapDi(d.InterfaceId, d.ImplId, i)).ToList();
-            var pipeline = PipelineBuilder.Build(symbols, edges, di, root);
-            _pipelineCache[root] = pipeline;
-            return pipeline;
-        }
+        lock (_mapCache) return FrameworkLocked(r, containerKey);
     });
+
+    /// <summary>Framework 的本体：调用方已拿到读锁与 _mapCache 锁（入口流程注入管道时要用，读锁不可重入）。</summary>
+    private FrameworkFlowDto? FrameworkLocked(IndexReader r, string containerKey)
+    {
+        if (_frameworkCache.TryGetValue(containerKey, out var cached)) return cached;
+        var (symbols, edges) = Data(r);
+        return _frameworkCache[containerKey] = FrameworkFlowQuery.Build(_readDb, Roots.Main, containerKey, symbols, edges);
+    }
+
+    private readonly Dictionary<string, MessagePipeline?> _pipelineCache = new(StringComparer.Ordinal);
+
+    /// <summary>容器的消息管道（见 <see cref="MessagePipeline"/>）：取自框架流程的行为链；不是 .NET / 没有行为链为 null。调用方持有读锁与 _mapCache 锁。</summary>
+    private MessagePipeline? PipelineLocked(IndexReader r, string containerKey)
+    {
+        if (_pipelineCache.TryGetValue(containerKey, out var cached)) return cached;
+        var fw = FrameworkLocked(r, containerKey);
+        var (symbols, edges) = Data(r);
+        return _pipelineCache[containerKey] = fw is null ? null : MessagePipeline.From(fw, symbols, edges, ReadRepoFile);
+    }
+
+    private string? ReadRepoFile(string rel)
+    {
+        try
+        {
+            var full = Path.GetFullPath(Path.Combine(Roots.Main, rel));
+            return File.Exists(full) ? File.ReadAllText(full) : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return null; }
+    }
+
+    /// <summary>
+    /// 流程里的 dispatch:M 插入管道步骤（行为 + 按消息注入的验证器等）：用 dispatch 目标所在的 .NET 容器的管道（流程自己的容器优先）。
+    /// </summary>
+    private FlowDto InjectPipeline(IndexReader r, FlowDto flow, IReadOnlyList<ArchNode> containers) =>
+        MessagePipeline.InjectByContainer(flow, containers, key => PipelineLocked(r, key));
 
     private ArchDto? _archCache;
 
@@ -296,7 +345,8 @@ public sealed class IndexService : IDisposable
     });
 
     private readonly Dictionary<string, List<EntryDto>> _entriesCache = new(StringComparer.Ordinal);
-    private readonly Dictionary<(long, int), FlowDto?> _flowCache = new();
+    /// <summary>键里的 AnySymbol 区分两个接口：/api/arch/flow 只认入口（非入口缓存 null → 404），/api/symbols/{id}/flow 任意符号都给流程。</summary>
+    private readonly Dictionary<(long Id, int Depth, bool AnySymbol), FlowDto?> _flowCache = new();
 
     /// <summary>L3：某容器的入口清单。容器不存在或没有入口都返回空表；kind / q 在缓存的全表上过滤。</summary>
     public IReadOnlyList<EntryDto> Entries(string containerKey, string? kind, string? q) => Read(r =>
@@ -330,25 +380,59 @@ public sealed class IndexService : IDisposable
         return result.ToList();
     });
 
-    /// <summary>L3：从一个入口出发的时序树。没有这个入口返回 null。depth 夹到 1..20，默认 12。</summary>
-    public FlowDto? Flow(long symbolId, int? depth) => Read(r =>
+    /// <summary>
+    /// L3：从一个入口出发的时序树。没有这个入口返回 null。depth 夹到 1..20，默认 12。
+    /// 同一符号上挂着多条路由（lambda 处理器留在外层方法上、健康检查端点）时，route / httpMethod 指定哪一条；不给取第一条。
+    /// 入口落在外层方法上时根节点只取那段路由自己行范围里的调用（见 <see cref="EntryDiscovery.FlowEdges"/>），不把同一方法里别的路由混进来。
+    /// </summary>
+    public FlowDto? Flow(long symbolId, int? depth, string? route = null, string? httpMethod = null) => Read(r =>
     {
         var maxDepth = Math.Clamp(depth ?? FlowBuilder.DefaultMaxDepth, 1, 20);
+        var cacheable = route is null && httpMethod is null; // 指定路由的不进缓存（缓存键只有符号）
         lock (_mapCache)
         {
-            if (_flowCache.TryGetValue((symbolId, maxDepth), out var cached)) return cached;
+            if (cacheable && _flowCache.TryGetValue((symbolId, maxDepth, false), out var cached)) return cached;
             var (entries, matches) = EntryStorage.Read(_readDb);
-            var entry = entries.FirstOrDefault(e => e.SymbolId == symbolId);
-            if (entry is null) return _flowCache[(symbolId, maxDepth)] = null;
+            var entry = EntryDiscovery.PickEntry(entries, symbolId, route, httpMethod);
+            if (entry is null) return cacheable ? _flowCache[(symbolId, maxDepth, false)] = null : null;
             var arch = ArchStorage.Read(_readDb);
             var containers = arch.Nodes.Where(n => n.Kind == ArchNodeKind.Container).ToList();
             var externals = arch.Nodes.Where(n => n.Kind == ArchNodeKind.External).ToList();
             var (symbols, edges) = Data(r);
             // 出口：没对上路由的 HTTP 调用画成 http 叶子（单独打开前端时后端不在索引里）
-            return _flowCache[(symbolId, maxDepth)] = FlowBuilder.Build(symbols, edges, entry, containers, matches, entries, maxDepth,
-                outbound: arch.Outbound, externalNodes: externals);
+            var flow = FlowBuilder.Build(symbols, EntryDiscovery.FlowEdges(entry, entries, symbols, edges), entry, containers, matches, entries, maxDepth, outbound: arch.Outbound, externalNodes: externals);
+            var result = InjectPipeline(r, flow, containers);
+            return cacheable ? _flowCache[(symbolId, maxDepth, false)] = result : result;
         }
     });
+
+    /// <summary>
+    /// 从任意符号出发的时序树（见 <see cref="Server.SymbolFlow"/>）：入口与 <see cref="Flow"/> 结果相同，方法临时构造入口，类型取构造函数，
+    /// 不可执行的符号给只有根的流程并在 Note 里说明。符号不存在返回 null。depth 同 Flow。
+    /// </summary>
+    public FlowDto? SymbolFlow(long symbolId, int? depth) => Read(r =>
+    {
+        var maxDepth = Math.Clamp(depth ?? FlowBuilder.DefaultMaxDepth, 1, 20);
+        if (r.GetSymbol(symbolId) is null) return null; // 不缓存：索引后可能出现
+        lock (_mapCache)
+        {
+            if (_flowCache.TryGetValue((symbolId, maxDepth, true), out var cached)) return cached;
+            var (symbols, edges) = Data(r);
+            var symbol = symbols.FirstOrDefault(s => s.Id == symbolId);
+            if (symbol is null) return null;
+            var (entries, matches) = EntryStorage.Read(_readDb);
+            var arch = ArchStorage.Read(_readDb);
+            var containers = arch.Nodes.Where(n => n.Kind == ArchNodeKind.Container).ToList();
+            var externals = arch.Nodes.Where(n => n.Kind == ArchNodeKind.External).ToList();
+            var flow = Server.SymbolFlow.Build(symbols, edges, symbol, containers, matches, entries, maxDepth, arch.Outbound, externals, RepoContainer);
+            return _flowCache[(symbolId, maxDepth, true)] = InjectPipeline(r, flow, containers);
+        }
+    });
+
+    private ArchNode? _repoContainer;
+
+    /// <summary>整库伪容器（成员 = 仓库里的各个项目目录），不在任何容器里的根拿它分参与者列；要扫一遍项目文件，按索引缓存。调用方持有 _mapCache 锁。</summary>
+    private ArchNode RepoContainer() => _repoContainer ??= DsmBuilder.RepoContainer(Roots);
 
     private IReadOnlyDictionary<string, string>? _fileHashes;
 
@@ -407,16 +491,39 @@ public sealed class IndexService : IDisposable
     private T Read<T>(Func<IndexReader, T> query)
     {
         _readLock.Wait();
-        try { return query(new IndexReader(_readDb)); }
+        try
+        {
+            if (_stopping) throw new ObjectDisposedException(nameof(IndexService));
+            return query(new IndexReader(_readDb));
+        }
         finally { _readLock.Release(); }
     }
 
-    public void Dispose()
+    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    public ValueTask DisposeAsync()
     {
-        try { WaitForIndexAsync().Wait(TimeSpan.FromSeconds(30)); } catch { /* 索引失败已记录在 _lastError */ }
-        _readDb.Dispose();
-        _writeDb.Dispose();
-        foreach (var a in _adapters.OfType<IDisposable>()) a.Dispose();
+        lock (_stateLock)
+        {
+            _stopping = true;
+            return new ValueTask(_disposeTask ??= DisposeCoreAsync(_indexTask ?? Task.CompletedTask));
+        }
+    }
+
+    private async Task DisposeCoreAsync(Task indexing)
+    {
+        await _lifetime.CancelAsync().ConfigureAwait(false);
+        try { await indexing.ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        await _readLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            _readDb.Dispose();
+            _writeDb.Dispose();
+            foreach (var adapter in _adapters.OfType<IDisposable>()) adapter.Dispose();
+            _lifetime.Dispose();
+        }
+        finally { _readLock.Release(); }
     }
 }
 
@@ -429,7 +536,7 @@ public static class MapData
         var symbols = r.GetAllSymbols()
             .Select(s => new MapSymbol(s.Id, s.Kind, s.QualifiedName, files.GetValueOrDefault(s.FileId, IndexWriter.ExternalFilePath), s.ParentId, s.StartLine, s.EndLine, s.Visibility))
             .ToList();
-        var edges = r.GetEdgeTriples().Select(t => new MapEdge(t.FromId, t.ToId, t.Kind, t.Confidence, t.Via)).ToList();
+        var edges = r.GetEdgeTriples().Select(t => new MapEdge(t.FromId, t.ToId, t.Kind, t.Confidence, t.Via, t.Line, t.Pos)).ToList();
         return (symbols, edges);
     }
 }

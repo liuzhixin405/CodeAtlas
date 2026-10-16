@@ -81,6 +81,8 @@ export class Renderer {
         { selector: 'node[type = "dangling"]', style: { "background-color": bg, "border-style": "dashed", color: muted } },
         { selector: 'node[type = "ambiguous"]', style: { "background-color": bg, "border-style": "dashed", "border-color": muted, color: muted, shape: "round-rectangle" } },
         { selector: 'node[?externalGroup]', style: { "background-color": bg, "border-style": "dotted", "border-color": muted, color: muted } },
+        // 「被 N 处调用」：可点的胶囊，用强调色和普通的多候选 / 溢出胶囊区分开
+        { selector: 'node[?callers]', style: { "background-color": bg, "border-style": "dashed", "border-color": accent, "border-width": 1.5, color: accent, shape: "round-rectangle" } },
         { selector: "node.dim", style: { opacity: 0.55 } },
         { selector: "node.focus", style: { "border-color": accent, "border-width": 2.5, "font-weight": "bold" } },
         { selector: "node.expanded", style: { "background-opacity": 0.6 } },
@@ -143,7 +145,7 @@ export class Renderer {
     this.cy.add([
       ...elements.nodes.map((n) => ({
         group: "nodes" as const,
-        data: { id: n.id, label: n.label, width: labelWidth(n.label, n.id === focusId), kind: n.kind, type: n.type, externalGroup: Boolean(n.externalGroup), payload: n },
+        data: { id: n.id, label: n.label, width: labelWidth(n.label, n.id === focusId), kind: n.kind, type: n.type, externalGroup: Boolean(n.externalGroup), callers: Boolean(n.callers), payload: n },
         classes: [n.id === focusId ? "focus" : "", n.expanded ? "expanded" : "", hasTrunk && !n.trunk && n.id !== focusId ? "dim" : ""].join(" ").trim(),
       })),
       ...elements.edges.map((e) => ({

@@ -1,8 +1,21 @@
-import type { ArchDto, DsmDto, EntryDto, FlowDto, HealthDto, IndexStatusDto, MapDto, NarrationStatusDto, NarrativeDto, NarrativeKind, NeighborDto, PipelineDto, RelationsDto, SymbolDto } from "./types";
+import type { ArchDto, DsmDto, EntryDto, FlowDto, FrameworkFlowDto, HealthDto, IndexStatusDto, MapDto, NarrationStatusDto, NarrativeDto, NarrativeKind, NeighborDto, RelationsDto, SymbolDto } from "./types";
 
-/** 默认不含 references：类型引用（参数类型、字段类型）不是调用链的一部分，按需打开。 */
-export const DefaultKinds = "calls,implements,inherits,dispatches";
+/**
+ * 网状调用图默认只取调用链上的边：调用与分发。
+ * 继承 / 实现（类型关系）不是"它调谁"，默认不取，工具栏「类型关系」开关打开（看类型之间的关系主要用模块关系视图）；
+ * 类型引用（参数类型、字段类型）同理，「类型引用」开关打开。
+ */
+export const DefaultKinds = "calls,dispatches";
+export const TypeRelationKinds = "implements,inherits";
 export const KindsWithReferences = DefaultKinds + ",references";
+
+/** 按工具栏开关拼 neighbors 的 kinds 参数。 */
+export function neighborKinds(opts: { references?: boolean; typeRelations?: boolean } = {}): string {
+  let k = DefaultKinds;
+  if (opts.typeRelations) k += "," + TypeRelationKinds;
+  if (opts.references) k += ",references";
+  return k;
+}
 
 /** CodeAtlas.Server 的薄封装。404 返回 null，其他非 2xx 抛错。 */
 export class Api {
@@ -57,14 +70,26 @@ export class Api {
     return (await this.get<EntryDto[]>(path)) ?? [];
   }
 
-  /** 一个入口的调用流程（时序图）；入口不存在或旧服务返回 null。 */
-  flow(symbolId: number, depth?: number): Promise<FlowDto | null> {
-    return this.get<FlowDto>(`/api/arch/flow?entry=${symbolId}${depth !== undefined ? `&depth=${depth}` : ""}`);
+  /**
+   * 一个入口的调用流程（时序图）；入口不存在或旧服务返回 null。
+   * pick：同一个方法上挂着几条路由时选哪一条（入口清单里的那一项）；旧服务忽略这两个参数。
+   */
+  flow(symbolId: number, depth?: number, pick?: { route: string | null; httpMethod: string | null }): Promise<FlowDto | null> {
+    const extra = (pick?.route ? `&route=${encodeURIComponent(pick.route)}` : "") + (pick?.httpMethod ? `&method=${encodeURIComponent(pick.httpMethod)}` : "");
+    return this.get<FlowDto>(`/api/arch/flow?entry=${symbolId}${depth !== undefined ? `&depth=${depth}` : ""}${extra}`);
   }
 
-  /** root 为空 = 服务端自动推导。旧版本服务没有这个接口（404）时返回 null，页面退回命名空间视图。 */
-  pipeline(root: string): Promise<PipelineDto | null> {
-    return this.get<PipelineDto>(`/api/pipeline?root=${encodeURIComponent(root)}`);
+  /**
+   * 从任意一个方法出发的调用流程（调用图的时序模式），数据形状与入口流程一样（FlowDto）。
+   * 旧服务没有这个接口、或符号不在索引里时返回 null；调用方可以再试 flow()（入口符号能出图）。
+   */
+  symbolFlow(symbolId: number, depth?: number): Promise<FlowDto | null> {
+    return this.get<FlowDto>(`/api/symbols/${symbolId}/flow${depth !== undefined ? `?depth=${depth}` : ""}`);
+  }
+
+  /** 一个容器的框架流程（中间件 → 控制器 → 分派器 → 行为链 → Handler → 收尾）；容器不存在或旧服务（404）返回 null。 */
+  framework(container: string): Promise<FrameworkFlowDto | null> {
+    return this.get<FrameworkFlowDto>(`/api/arch/framework?container=${encodeURIComponent(container)}`);
   }
 
   symbol(id: number): Promise<SymbolDto | null> {

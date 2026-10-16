@@ -66,27 +66,29 @@ public partial class FlowBuilderTests
         Assert.Equal(("/api/v5/Orders", "Acme.Api"), (f.EntryLabel, f.ContainerKey));
         var root = f.Root;
         Assert.Equal(("OrdersController.Create", "entry", "Acme.Api|Acme.Api"), (root.Label, root.Kind, root.Actor));
-        // 根的孩子：分派到 Handler（排第一），然后一个"2 个框架调用"；conduit 那条不出现
-        Assert.Equal(new[] { "dispatch", "external-group" }, root.Children.Select(c => c.Kind));
+        // 根的孩子：分派到 Handler（排第一），然后外部调用按列分组各一行（System 的 ToList、Microsoft 的 LogInformation——
+        // 原来并成一行"2 个框架调用"挂在第一个外部符号的 [System] 列，日志也算进 System）；conduit 那条不出现
+        Assert.Equal(new[] { "dispatch", "external-group", "external-group" }, root.Children.Select(c => c.Kind));
         var handler = root.Children[0];
         Assert.Equal(("CreateOrderHandler.HandleAsync", "Acme.Api|Acme.App", "dispatch:CreateOrderCommand"), (handler.Label, handler.Actor, handler.Via));
-        Assert.Equal("2 个框架调用", root.Children[1].Label);
-        Assert.Equal("ext|System", root.Children[1].Actor);
+        Assert.Equal(("ToList", "ext|System"), (root.Children[1].Label, root.Children[1].Actor));
+        Assert.Equal(("LogInformation", "ext|Microsoft"), (root.Children[2].Label, root.Children[2].Actor));
 
-        // Handler 的孩子：impl 派生边到实现（rank 40）在接口方法（30）之前；Log 去重后一个；测试代码没有；最后是跨容器续接
-        Assert.Equal(new[] { "OrderRepo.Save", "IOrderRepo.Save", "Log", "HTTP /api/billing/invoices" }, handler.Children.Select(c => c.Label));
+        // Handler 的孩子：接口调用与它唯一的实现（impl 0.9，同一处）合成一步，只留实现；Log 去重后一个；测试代码没有；最后是跨容器续接
+        // （夹具的边没有行号：位置全相同时保持 rank 顺序；续接在第 15 行，排在后面）
+        Assert.Equal(new[] { "OrderRepo.Save", "Log", "HTTP /api/billing/invoices" }, handler.Children.Select(c => c.Label));
         Assert.Equal(("Acme.Api|Acme.Infra", "impl", 0.9), (handler.Children[0].Actor, handler.Children[0].Via, handler.Children[0].Confidence));
-        Assert.Equal("Acme.Api|Acme.App", handler.Children[1].Actor); // 接口方法
+        Assert.DoesNotContain(handler.Children, c => c.QualifiedName.StartsWith("Acme.App.IOrderRepo", StringComparison.Ordinal)); // 接口方法那步合进实现了
         Assert.DoesNotContain(handler.Children, c => c.QualifiedName.StartsWith("Acme.Tests", StringComparison.Ordinal));
 
-        // 实现里：Audit → Save 是环，被祖先集合剪掉；Npgsql 外部单独一个节点
+        // 实现里：Audit → Save 是环，被祖先集合剪掉；Npgsql 是数据库驱动：关键外部调用单独一行，标签带类型（NpgsqlConnection.Open），Note 写类别
         var impl = handler.Children[0];
-        Assert.Equal(new[] { "OrderRepo.Audit", "Open" }, impl.Children.Select(c => c.Label));
+        Assert.Equal(new[] { "OrderRepo.Audit", "NpgsqlConnection.Open" }, impl.Children.Select(c => c.Label));
         Assert.Empty(impl.Children[0].Children);
-        Assert.Equal("ext|Npgsql", impl.Children[1].Actor);
+        Assert.Equal(("ext|Npgsql", "数据库"), (impl.Children[1].Actor, impl.Children[1].Note));
 
         // 续接：hop 节点下接 Billing 的入口，actor 是另一个容器
-        var hop = handler.Children[3];
+        var hop = handler.Children[2];
         Assert.Equal(("hop", 0.9), (hop.Kind, hop.Confidence));
         Assert.Contains("Billing", hop.Note);
         var billingEntry = Assert.Single(hop.Children);
@@ -94,8 +96,8 @@ public partial class FlowBuilderTests
         Assert.Equal("Append", Assert.Single(billingEntry.Children).Label);
 
         // actor 顺序：入口项目第一，然后按遍历中首次出现的顺序（深度优先：Npgsql 在实现里先被走到，根的框架调用组在分派子树之后才建），外部最后
-        Assert.Equal(new[] { "Acme.Api|Acme.Api", "Acme.Api|Acme.App", "Acme.Api|Acme.Infra", "billing/Billing.Api|billing/Billing.Api", "ext|Npgsql", "ext|System" }, f.Actors.Select(a => a.Key));
-        Assert.Equal(new[] { "project", "project", "project", "container", "external", "external" }, f.Actors.Select(a => a.Kind));
+        Assert.Equal(new[] { "Acme.Api|Acme.Api", "Acme.Api|Acme.App", "Acme.Api|Acme.Infra", "billing/Billing.Api|billing/Billing.Api", "ext|Npgsql", "ext|System", "ext|Microsoft" }, f.Actors.Select(a => a.Key));
+        Assert.Equal(new[] { "project", "project", "project", "container", "external", "external", "external" }, f.Actors.Select(a => a.Kind));
         Assert.Equal(new[] { "AuditBehavior" }, f.Behaviors);
         Assert.False(f.Truncated);
     }
@@ -240,10 +242,10 @@ public partial class FlowBuilderTests
         var f = FlowBuilder.Build(WebSymbols, WebEdges, entry, WebContainers, WebMatches, [entry], outbound: WebOutbound, externalNodes: [ApiNode]);
 
         var hook = Assert.Single(f.Root.Children[0].Children, c => c.Label == "useMT5GroupByServerId");
-        // 顺序：hop（对上路由的那条）→ http（没对上的）→ 框架调用组；第 60 行没有重复成 http，第 80 行与别的容器的不挂
-        Assert.Equal(new[] { ("HTTP /api/v5/mt5/servers", "hop"), ("GET /api/v5/mt5/groups", "http"), ("get", "external-group") },
+        // 顺序按出口所在行：http（第 53 行，没对上的）→ hop（第 60 行，对上路由的那条）→ 框架调用组最后；第 60 行没有重复成 http，第 80 行与别的容器的不挂
+        Assert.Equal(new[] { ("GET /api/v5/mt5/groups", "http"), ("HTTP /api/v5/mt5/servers", "hop"), ("get", "external-group") },
             hook.Children.Select(c => (c.Label, c.Kind)));
-        var http = hook.Children[1];
+        var http = hook.Children[0];
         Assert.Equal(((long?)null, "/api/proxy-gateway/api/v5/mt5/groups", ApiNodeKey, 0.5, 2, 3, "未对上后端（后端不在索引里，或路由没匹配上）"),
             (http.SymbolId, http.QualifiedName, http.Actor, http.Confidence, http.Count, http.Depth, http.Note));
         Assert.Empty(http.Children);
@@ -270,8 +272,9 @@ public partial class FlowBuilderTests
         var f = FlowBuilder.Build(Symbols, Edges, Entry, Containers, Matches, AllEntries, outbound: outbound);
 
         var handler = f.Root.Children[0];
-        Assert.Equal(new[] { "OrderRepo.Save", "IOrderRepo.Save", "Log", "HTTP /api/billing/invoices", "HTTP Billing:Url" }, handler.Children.Select(c => c.Label));
-        var http = handler.Children[4];
+        // 出口在第 10 行、续接在第 15 行：按位置，出口在前
+        Assert.Equal(new[] { "OrderRepo.Save", "Log", "HTTP Billing:Url", "HTTP /api/billing/invoices" }, handler.Children.Select(c => c.Label));
+        var http = handler.Children[2];
         Assert.Equal(("http", "Billing:Url", "ext|", 0.5, "未对上后端（路由没匹配上）"), (http.Kind, http.QualifiedName, http.Actor, http.Confidence, http.Note));
         Assert.Equal("外部 / 框架", f.Actors.Single(a => a.Key == "ext|").Label);
     }

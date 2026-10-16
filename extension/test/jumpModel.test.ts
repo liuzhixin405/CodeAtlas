@@ -86,6 +86,25 @@ describe("被调方 QuickPick 项（调用大纲第一层）", () => {
     expect(items[1]!.detail).toBe("2 个候选");
     expect(items[1]!.definition).toBeNull();
   });
+
+  it("分发调用下的 Handler、接口调用下的实现：各补一项「↳ …」，选中直接跳到定义（不是停在 Send 那一行）", () => {
+    const handler = step({ kind: "dispatch", label: "RestartFeedsHandler.HandleAsync", target: sym(30, "HandleAsync", "src/Feeds/RestartFeedsHandler.cs", 22), line: 14, pos: 420 });
+    const impl = step({ kind: "impl", label: "OrderRepository.Save", target: sym(31, "Save", "src/Orders/OrderRepository.cs", 40) });
+    const external = step({ kind: "external", label: "Task.FromResult", target: sym(9, "FromResult", "?", 0, "external") });
+    const items = calleePickItems(outline([
+      step({ kind: "external", label: "IDispatcher.SendAsync", target: sym(8, "SendAsync", "?", 0, "external"), children: [handler, external] }),
+      step({ kind: "call", label: "IOrderRepository.Save", children: [impl] }),
+      step({ kind: "dispatch", label: "PlaceOrderHandler.Handle", target: sym(32, "Handle", "src/Orders/PlaceOrderHandler.cs", 12), children: [] }),
+    ]));
+    expect(items.map((i) => i.label)).toEqual(["IDispatcher.SendAsync", "↳ RestartFeedsHandler.HandleAsync", "IOrderRepository.Save", "↳ OrderRepository.Save", "PlaceOrderHandler.Handle"]);
+    expect(items[1]).toMatchObject({ target: { path: "src/Feeds/RestartFeedsHandler.cs", line: 22, col: 5, pos: null } });
+    expect(items[1]!.description.startsWith("经分派 · ")).toBe(true);
+    expect(items[3]!.description.startsWith("经接口 · ")).toBe(true);
+    expect(items[3]!.target).toEqual(items[3]!.definition);
+    // 第一层本身就是 dispatch：同样跳到 Handler 定义；Send 那一项照旧跳到调用处
+    expect(items[4]!.target).toMatchObject({ path: "src/Orders/PlaceOrderHandler.cs", line: 12 });
+    expect(items[0]!.target).toMatchObject({ path: "src/Orders/OrderService.cs", line: 14 });
+  });
 });
 
 describe("受影响的入口 QuickPick 项", () => {

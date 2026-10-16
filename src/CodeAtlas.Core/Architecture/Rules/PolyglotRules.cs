@@ -412,7 +412,7 @@ public sealed class PolyglotInfraRule : IDiscoveryRule
     private static readonly Dictionary<string, string> SqlDrivers = new(StringComparer.OrdinalIgnoreCase)
     {
         ["postgres"] = "PostgreSQL", ["postgresql"] = "PostgreSQL", ["pgx"] = "PostgreSQL", ["postgresql_psycopg2"] = "PostgreSQL", ["postgis"] = "PostgreSQL",
-        ["mysql"] = "MySQL", ["sqlite"] = "SQLite", ["sqlite3"] = "SQLite", ["spatialite"] = "SQLite",
+        ["mysql"] = "MySQL", ["sqlite"] = PackageReferenceRule.SQLite, ["sqlite3"] = PackageReferenceRule.SQLite, ["spatialite"] = PackageReferenceRule.SQLite,
         ["sqlserver"] = "SQL Server", ["mssql"] = "SQL Server", ["oracle"] = "Oracle", ["clickhouse"] = "ClickHouse",
     };
 

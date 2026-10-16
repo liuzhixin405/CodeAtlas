@@ -1,3 +1,5 @@
+import { nodeLabel } from "./neighborRank";
+import type { MergedNeighbor } from "./neighborRules";
 import type { NeighborDto, SymbolDto } from "./types";
 
 /** 图里的节点：真实符号、多候选胶囊、悬空占位。 */
@@ -24,6 +26,8 @@ export interface GraphNode {
   externalGroup?: boolean;
   /** 在主干路径上。 */
   trunk?: boolean;
+  /** 「被 N 处调用」胶囊：焦点的调用者先不画，点开再加入（谁调它的完整列表在影响范围视图）。 */
+  callers?: boolean;
 }
 
 export interface GraphEdge {
@@ -37,12 +41,25 @@ export interface GraphEdge {
   label?: string;
   /** 在主干路径上。 */
   trunk?: boolean;
+  /** 接口调用与唯一实现合并后（collapseImplementations）：被替掉的接口方法限定名。 */
+  viaInterface?: string;
 }
 
-/** 展开时的取舍：每侧每种边最多直接显示几个、按什么排名（高分优先）。 */
+/**
+ * 展开时的取舍：每侧最多直接显示几个、按什么排名（高分优先）。
+ * 调用与分发（calls / dispatches）共用一份名额——"2 分支"就是它调的最像主流程的 2 个，不是每种边各 2 个；
+ * 其他边（类型关系、类型引用）各自一份名额。
+ */
 export interface ExpandOptions {
   limit?: number;
   rank?: (n: NeighborDto) => number;
+  /** setFocus / replaceFocus：焦点的调用者（calls / dispatches 入边）收进一个「被 N 处调用」胶囊，不直接画。 */
+  callersCapsule?: boolean;
+}
+
+/** 调用链上的边：共用名额，也是「被 N 处调用」统计的边。 */
+function isFlowKind(kind: string): boolean {
+  return kind === "calls" || kind === "dispatches";
 }
 
 export interface Breadcrumb {
@@ -57,21 +74,18 @@ interface Snapshot {
   hidden: Set<string>;
 }
 
-/** 像 HandleAsync / Execute / Consume 这种到处都是的入口方法名，带上类名才分得清。 */
-const GenericMethodNames = /^(Handle|HandleAsync|Execute|ExecuteAsync|Consume|ConsumeAsync|Invoke|InvokeAsync|Run|RunAsync|Process|ProcessAsync|Validate|ValidateAsync|Dispose|ToString|Equals|GetHashCode|Build|Create|Get|Set|Add|Update|Delete|Remove|Save|Load|Send|SendAsync|Start|Stop|Initialize|Configure)$/;
-function displayLabel(symbol: SymbolDto): string {
-  if (symbol.kind !== "method" || !GenericMethodNames.test(symbol.name)) return symbol.name;
-  const parts = symbol.qualifiedName.split(/[.:]/);
-  return parts.length >= 2 ? `${parts[parts.length - 2]}.${symbol.name}` : symbol.name;
-}
-
 /** 边上显示的字：分发边显示 "new 消息类型"，其余显示 via 或 kind。 */
 function edgeLabel(n: NeighborDto): string {
   if (n.via?.startsWith("dispatch:")) return `new ${n.via.slice("dispatch:".length)}`;
   return n.via ?? n.kind;
 }
 
-function capsuleLabel(count: number, direction: "in" | "out", overflow = false, external = false): string {
+export function callersCapsuleLabel(count: number): string {
+  return `被 ${count} 处调用`;
+}
+
+function capsuleLabel(count: number, direction: "in" | "out", overflow = false, external = false, callers = false): string {
+  if (callers) return callersCapsuleLabel(count);
   if (external) return `${count} 个框架调用`;
   if (overflow) return direction === "out" ? `还有 ${count} 个目标` : `还有 ${count} 个调用者`;
   return direction === "out" ? `${count} 个可能目标` : `${count} 个可能调用者`;
@@ -141,7 +155,7 @@ export class GraphState {
     const id = this.focusNodeId!;
 
     this.history = this.history.slice(0, this.historyIndex + 1);
-    this.history.push({ label: symbol.name, focusNodeId: id, snapshot: this.snapshot() });
+    this.history.push({ label: nodeLabel(symbol), focusNodeId: id, snapshot: this.snapshot() });
     this.historyIndex = this.history.length - 1;
   }
 
@@ -149,7 +163,7 @@ export class GraphState {
   replaceFocus(symbol: SymbolDto, neighbors: NeighborDto[], opts?: ExpandOptions): void {
     const index = this.historyIndex;
     this.rebuild(symbol, neighbors, opts);
-    const crumb = { label: symbol.name, focusNodeId: this.focusNodeId!, snapshot: this.snapshot() };
+    const crumb = { label: nodeLabel(symbol), focusNodeId: this.focusNodeId!, snapshot: this.snapshot() };
     if (index >= 0) this.history[index] = crumb;
     else { this.history = [crumb]; this.historyIndex = 0; }
   }
@@ -162,19 +176,63 @@ export class GraphState {
     const id = GraphState.nodeIdFor(symbol);
     this.focusNodeId = id;
     this.ensureSymbolNode(symbol);
-    this.applyNeighbors(id, neighbors, opts);
-    this.markExpanded(this.nodes.get(id)!, "both");
+    const node = this.nodes.get(id)!;
+    if (opts?.callersCapsule) {
+      const callers = neighbors.filter((n) => n.direction === "in" && isFlowKind(n.kind));
+      this.applyNeighbors(id, neighbors.filter((n) => !callers.includes(n)), opts);
+      if (callers.length > 0) {
+        this.addCapsule(GraphState.callersCapsuleId(id), id, callers, false, false, true);
+        this.markExpanded(node, "out");
+        return;
+      }
+    } else {
+      this.applyNeighbors(id, neighbors, opts);
+    }
+    this.markExpanded(node, "both");
+  }
+
+  static callersCapsuleId(nodeId: string): string {
+    return `callers:${nodeId}`;
+  }
+
+  /** 节点挂着的「被 N 处调用」胶囊（没有为 undefined）。 */
+  callersCapsule(nodeId: string): GraphNode | undefined {
+    const n = this.nodes.get(GraphState.callersCapsuleId(nodeId));
+    return n?.callers ? n : undefined;
+  }
+
+  /** 点开「被 N 处调用」：胶囊里的调用者按普通规则加入图（名额、排名、溢出胶囊照旧）。返回新增节点数。 */
+  expandCallers(capsuleId: string, opts?: ExpandOptions): number {
+    const capsule = this.nodes.get(capsuleId);
+    if (!capsule?.callers || !capsule.anchor || !capsule.members) return 0;
+    const anchor = this.nodes.get(capsule.anchor.nodeId);
+    const members = capsule.members;
+    this.removeCapsule(capsuleId);
+    if (!anchor) return 0;
+    const before = this.nodes.size;
+    this.applyNeighbors(anchor.id, members, opts);
+    this.markExpanded(anchor, "in");
+    this.saveCurrentSnapshot();
+    return this.nodes.size - before;
   }
 
   /** 展开一个节点的一层邻居（可只展开一侧）。返回新增节点数。 */
   expand(nodeId: string, neighbors: NeighborDto[], side: Side = "both", opts?: ExpandOptions): number {
     const node = this.nodes.get(nodeId);
     if (!node || node.type !== "symbol" || !node.expandable) return 0;
+    // 直接展开调用者一侧：「被 N 处调用」胶囊就多余了
+    if (side !== "out") this.removeCapsule(GraphState.callersCapsuleId(nodeId));
     const before = this.nodes.size;
     this.applyNeighbors(nodeId, neighbors.filter((n) => side === "both" || n.direction === side), opts);
     this.markExpanded(node, side);
     this.saveCurrentSnapshot();
     return this.nodes.size - before;
+  }
+
+  private removeCapsule(capsuleId: string): void {
+    if (!this.nodes.delete(capsuleId)) return;
+    this.hidden.delete(capsuleId);
+    for (const [eid, e] of this.edges) if (e.source === capsuleId || e.target === capsuleId) this.edges.delete(eid);
   }
 
   /**
@@ -211,11 +269,10 @@ export class GraphState {
       else remaining.push(m);
     }
     if (remaining.length === 0) {
-      this.nodes.delete(capsuleId);
-      for (const [eid, e] of this.edges) if (e.source === capsuleId || e.target === capsuleId) this.edges.delete(eid);
+      this.removeCapsule(capsuleId);
     } else {
       capsule.members = remaining;
-      capsule.label = capsuleLabel(remaining.length, capsule.anchor.direction, capsule.overflow, capsule.externalGroup);
+      capsule.label = capsuleLabel(remaining.length, capsule.anchor.direction, capsule.overflow, capsule.externalGroup, capsule.callers);
     }
     this.saveCurrentSnapshot();
   }
@@ -306,17 +363,19 @@ export class GraphState {
         const key = `${anchorId}|${n.direction}|${groupKey}`;
         (groups.get(key) ?? groups.set(key, []).get(key)!).push(n);
       } else {
-        const key = `${anchorId}|${n.direction}|${n.kind}`;
+        // 调用与分发共用一份名额（见 ExpandOptions）
+        const key = `${anchorId}|${n.direction}|${isFlowKind(n.kind) ? "flow" : n.kind}`;
         (plain.get(key) ?? plain.set(key, []).get(key)!).push(n);
       }
     }
-    // 普通边：每侧每种最多 limit 个直接显示（按 rank，缺省按 confidence），其余进溢出胶囊
+    // 普通边：每侧（调用链一份、其他每种一份）最多 limit 个直接显示（按 rank，缺省按 confidence），其余进溢出胶囊
     const limit = opts?.limit ?? GraphState.MaxVisiblePerSide;
     const rank = opts?.rank ?? ((n: NeighborDto) => n.confidence);
     for (const [key, list] of plain) {
       const already = new Set([...this.edges.keys()]);
       const fresh = list.filter((n) => !already.has(`edge:${n.edgeId}`));
-      fresh.sort((a, b) => rank(b) - rank(a) || (a.other?.name ?? a.toName).localeCompare(b.other?.name ?? b.toName));
+      // 同分时出边按调用在代码里的先后（先调的先展开），入边（行号在各调用者文件里，没有可比性）按名字
+      fresh.sort((a, b) => rank(b) - rank(a) || (a.direction === "out" ? a.line - b.line : 0) || (a.other?.name ?? a.toName).localeCompare(b.other?.name ?? b.toName));
       const visible = fresh.slice(0, limit);
       const rest = fresh.slice(limit);
       for (const n of visible) this.addRealEdge(anchorId, n);
@@ -334,20 +393,20 @@ export class GraphState {
     }
   }
 
-  private addCapsule(capsuleId: string, anchorId: string, fresh: NeighborDto[], overflow: boolean, externalGroup = false): void {
+  private addCapsule(capsuleId: string, anchorId: string, fresh: NeighborDto[], overflow: boolean, externalGroup = false, callers = false): void {
     {
       const existing = this.nodes.get(capsuleId);
       const first = fresh[0]!;
       if (existing) {
         const known = new Set(existing.members!.map((m) => m.edgeId));
         existing.members!.push(...fresh.filter((m) => !known.has(m.edgeId)));
-        existing.label = capsuleLabel(existing.members!.length, existing.anchor!.direction, existing.overflow, existing.externalGroup);
+        existing.label = capsuleLabel(existing.members!.length, existing.anchor!.direction, existing.overflow, existing.externalGroup, existing.callers);
         return;
       }
       this.nodes.set(capsuleId, {
         id: capsuleId,
         type: "ambiguous",
-        label: capsuleLabel(fresh.length, first.direction, overflow, externalGroup),
+        label: capsuleLabel(fresh.length, first.direction, overflow, externalGroup, callers),
         kind: first.kind,
         expanded: false,
         expandedOut: false,
@@ -357,6 +416,7 @@ export class GraphState {
         anchor: { nodeId: anchorId, direction: first.direction },
         overflow,
         externalGroup,
+        callers,
       });
       const [source, target] = first.direction === "out" ? [anchorId, capsuleId] : [capsuleId, anchorId];
       this.edges.set(`cap:${capsuleId}`, {
@@ -394,7 +454,8 @@ export class GraphState {
     const [source, target] = n.direction === "out" ? [anchorId, otherId] : [otherId, anchorId];
     const id = `edge:${n.edgeId}`;
     if (!this.edges.has(id)) {
-      this.edges.set(id, { id, source, target, kind: n.kind, confidence: n.confidence, line: n.line, dashed: n.confidence <= 0.3, label: edgeLabel(n) });
+      const viaInterface = (n as MergedNeighbor).viaInterface;
+      this.edges.set(id, { id, source, target, kind: n.kind, confidence: n.confidence, line: n.line, dashed: n.confidence <= 0.3, label: edgeLabel(n), ...(viaInterface ? { viaInterface } : {}) });
     }
   }
 
@@ -404,7 +465,7 @@ export class GraphState {
       this.nodes.set(id, {
         id,
         type: "symbol",
-        label: displayLabel(symbol),
+        label: nodeLabel(symbol),
         kind: symbol.kind,
         symbol,
         expanded: false,

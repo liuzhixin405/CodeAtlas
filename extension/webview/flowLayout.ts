@@ -31,6 +31,8 @@ export interface ViaStyle {
 export function viaStyle(node: FlowNodeDto): ViaStyle | null {
   if (node.kind !== "call") return null;
   if (node.via === "render") return { cls: "via-render", tag: "渲染" };
+  // 作为实参 / 属性值传出去的函数（stream.on("data", onData)、mutationFn: login）：框架回头调它
+  if (node.via === "callback") return { cls: "via-render", tag: "回调" };
   return null;
 }
 

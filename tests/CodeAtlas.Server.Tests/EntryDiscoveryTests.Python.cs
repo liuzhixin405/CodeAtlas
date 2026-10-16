@@ -105,7 +105,7 @@ public partial class EntryDiscoveryTests
             "from django.conf.urls import include, url",                                      // 1
             "from . import views",                                                            // 2
             "urlpatterns = [",                                                                // 3
-            "    url(r'^admin/', admin.site.urls),",                                          // 4：不是视图 → 不算
+            "    url(r'^admin/', admin.site.urls),",                                          // 4：Django 管理后台 → 落在 urls.py 模块上
             "    url(r'^api/', include('conduit.apps.articles.urls', namespace='articles')),", // 5
             "    path(\"health/\", views.health),",                                           // 6
             "]",                                                                              // 7
@@ -174,7 +174,7 @@ public partial class EntryDiscoveryTests
             "    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))",    // 13
             "    service = RecommendationService()",                                   // 14
             "    demo_pb2_grpc.add_RecommendationServiceServicer_to_server(service, server)", // 15
-            "    health_pb2_grpc.add_HealthServicer_to_server(service, server)",       // 16：类没继承 HealthServicer → 不算
+            "    health_pb2_grpc.add_HealthServicer_to_server(service, server)",       // 16：同一个实例也是健康检查服务 → 它的 Check 不算本服务的方法
             "def initStackdriverProfiling():",                                         // 17
             "    pass",                                                                // 18
         ],
@@ -283,6 +283,7 @@ public partial class EntryDiscoveryTests
         var entries = PyEntries();
         Assert.Equal(new (string, string, string?, long, string, int)[]
         {
+            ("conduit", "/admin/", null, 2040, "conduit/urls.py", 4),                                                 // admin.site.urls：管理后台整站，行号是那条 url()
             ("conduit", "/api/articles/feed", "GET", 2051, "conduit/apps/articles/views.py", 17),                    // ^api/ + ^articles/feed/?$；list → GET
             ("conduit", "/api/articles/{article_slug}/comments", "GET", 2053, "conduit/apps/articles/views.py", 21), // re_path 正则 → 模板；类视图的 get / post
             ("conduit", "/api/articles/{article_slug}/comments", "POST", 2054, "conduit/apps/articles/views.py", 23),
@@ -295,7 +296,6 @@ public partial class EntryDiscoveryTests
             ("conduit", "/api/articles/{slug}", "GET", 2048, "conduit/apps/articles/views.py", 10), // retrieve；lookup_field = 'slug'；trailing_slash=False
         }, Rows(entries.Where(e => e.RuleId == "python.drf")));
         Assert.DoesNotContain(entries, e => e.SymbolId == 2049);                       // _helper
-        Assert.DoesNotContain(entries, e => e.Route is not null && e.Route.StartsWith("/admin", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -346,10 +346,10 @@ public partial class EntryDiscoveryTests
         var entries = PyEntries();
         Assert.Equal(new (string, string, string?, long, string, int)[]
         {
-            ("recommendationservice", "RecommendationService/Check", null, 2063, "recommendationservice/recommendation_server.py", 5),
             ("recommendationservice", "RecommendationService/ListRecommendations", null, 2062, "recommendationservice/recommendation_server.py", 2),
         }, Rows(entries.Where(e => e.RuleId == "python.grpc")));
         Assert.All(entries.Where(e => e.RuleId == "python.grpc"), e => Assert.Equal("grpc", e.Kind));
+        Assert.DoesNotContain(entries, e => e.SymbolId == 2063); // Check 属于 grpc.health（实例同时注册给 add_HealthServicer_to_server）
         Assert.Equal(new (string, string, string?, long, string, int)[]
         {
             ("flaskapp", "rebuild", null, 2026, "flaskapp/views.py", 9),    // @shared_task(bind=True)
@@ -362,5 +362,140 @@ public partial class EntryDiscoveryTests
             ("recommendationservice", "recommendation_server", null, 2060, "recommendationservice/recommendation_server.py", 10), // 没有 → 落在模块上，行号是 if 那行
         }, Rows(entries.Where(e => e.RuleId == "python.main")));
         Assert.All(entries.Where(e => e.RuleId == "python.main"), e => Assert.Equal("hosted", e.Kind));
+    }
+
+    [Fact]
+    public void Python_Drf_InheritedGenericActions_PartialUpdateGoesToOverriddenUpdate_MixinViewSet()
+    {
+        Dictionary<string, string[]> files = new()
+        {
+            ["shop/urls.py"] =
+            [
+                "from rest_framework.routers import DefaultRouter",                       // 1
+                "from .views import CommentsView, ProfileView, ItemViewSet, LegacyView",  // 2
+                "router = DefaultRouter()",                                               // 3
+                "router.register(r'items', ItemViewSet)",                                 // 4
+                "urlpatterns = [",                                                        // 5
+                "    path('', include(router.urls)),",                                    // 6
+                "    path('comments/', CommentsView.as_view()),",                         // 7
+                "    path('profile', ProfileView.as_view()),",                            // 8
+                "    path('legacy/', LegacyView.as_view()),",                             // 9
+                "]",                                                                      // 10
+            ],
+            ["shop/views.py"] =
+            [
+                "class CommentsView(generics.ListCreateAPIView):",                    // 1：list 继承来、没重写
+                "    def create(self, request):",                                     // 2
+                "        pass",                                                       // 3
+                "class ProfileView(RetrieveUpdateAPIView):",                          // 4
+                "    def retrieve(self, request):",                                   // 5
+                "        pass",                                                       // 6
+                "    def update(self, request, *args, **kwargs):",                    // 7：PATCH 走 partial_update → self.update(partial=True)
+                "        pass",                                                       // 8
+                "class ItemViewSet(mixins.ListModelMixin,",                           // 9：基类列表跨行
+                "                  mixins.DestroyModelMixin,",                        // 10
+                "                  viewsets.GenericViewSet):",                        // 11
+                "    def list(self, request):",                                       // 12
+                "        pass",                                                       // 13
+                "class LegacyView(mixins.ListModelMixin, generics.GenericAPIView):",  // 14：as_view 的类只认 XxxAPIView，mixin 不带 get
+                "    def get(self, request):",                                        // 15
+                "        return self.list(request)",                                  // 16
+            ],
+        };
+        List<MapSymbol> symbols =
+        [
+            Sym(1, SymbolKind.Module, "shop.urls", "shop/urls.py", null, 1, 10),
+            Sym(2, SymbolKind.Module, "shop.views", "shop/views.py", null, 1, 16),
+            Sym(3, SymbolKind.Class, "shop.views.CommentsView", "shop/views.py", 2, 1, 3),
+            Sym(4, SymbolKind.Method, "shop.views.CommentsView.create", "shop/views.py", 3, 2, 3),
+            Sym(5, SymbolKind.Class, "shop.views.ProfileView", "shop/views.py", 2, 4, 8),
+            Sym(6, SymbolKind.Method, "shop.views.ProfileView.retrieve", "shop/views.py", 5, 5, 6),
+            Sym(7, SymbolKind.Method, "shop.views.ProfileView.update", "shop/views.py", 5, 7, 8),
+            Sym(8, SymbolKind.Class, "shop.views.ItemViewSet", "shop/views.py", 2, 9, 13),
+            Sym(9, SymbolKind.Method, "shop.views.ItemViewSet.list", "shop/views.py", 8, 12, 13),
+            Sym(10, SymbolKind.Class, "shop.views.LegacyView", "shop/views.py", 2, 14, 16),
+            Sym(11, SymbolKind.Method, "shop.views.LegacyView.get", "shop/views.py", 10, 15, 16),
+        ];
+        var entries = EntryDiscovery.Discover(symbols, [], [Container("shop", "python", "shop")], p => files.TryGetValue(p, out var l) ? l : []);
+        Assert.Equal(new (string, string, string?, long, string, int)[]
+        {
+            ("shop", "/comments/", "GET", 3, "shop/views.py", 1),   // 继承来的 list → 类本身
+            ("shop", "/comments/", "POST", 4, "shop/views.py", 2),  // 重写的 create
+            ("shop", "/legacy/", "GET", 11, "shop/views.py", 15),   // 只有 get，不因 ListModelMixin 多出一条
+            ("shop", "/profile", "GET", 6, "shop/views.py", 5),
+            ("shop", "/profile", "PATCH", 7, "shop/views.py", 7),   // partial_update 没重写 → 子类的 update
+            ("shop", "/profile", "PUT", 7, "shop/views.py", 7),
+        }, Rows(entries.Where(e => e.RuleId == "python.django")));
+        Assert.Equal(new (string, string, string?, long, string, int)[]
+        {
+            ("shop", "/items/", "GET", 9, "shop/views.py", 12),
+            ("shop", "/items/{pk}/", "DELETE", 8, "shop/views.py", 9), // DestroyModelMixin 带来的 destroy，没重写 → 类
+        }, Rows(entries.Where(e => e.RuleId == "python.drf")));
+    }
+
+    [Fact]
+    public void Python_Main_SampleClientDropped_OneOffScriptIsCommand_HealthMethodsSkipped()
+    {
+        Dictionary<string, string[]> files = new()
+        {
+            ["mail/mail_server.py"] =
+            [
+                "class MailService(demo_pb2_grpc.MailServiceServicer):",               // 1
+                "    def SendReceipt(self, request, context):",                        // 2
+                "        pass",                                                        // 3
+                "    def Watch(self, request, context):",                              // 4：方法体是健康检查的响应
+                "        return health_pb2.HealthCheckResponse(status=UNIMPLEMENTED)", // 5
+                "def serve():",                                                        // 6
+                "    server = grpc.server(pool)",                                      // 7
+                "    demo_pb2_grpc.add_MailServiceServicer_to_server(MailService(), server)", // 8
+                "    server.start()",                                                  // 9
+                "if __name__ == '__main__':",                                          // 10
+                "    serve()",                                                         // 11
+            ],
+            ["mail/mail_client.py"] =
+            [
+                "def send_test():",              // 1
+                "    stub.SendReceipt(request)", // 2
+                "if __name__ == '__main__':",    // 3：调本服务的示例客户端
+                "    send_test()",               // 4
+            ],
+            ["api/app/main.py"] =
+            [
+                "from fastapi import FastAPI", // 1
+                "app = FastAPI()",             // 2
+                "@app.get(\"/items\")",        // 3
+                "def items():",                // 4
+                "    pass",                    // 5
+            ],
+            ["api/app/initial_data.py"] =
+            [
+                "def main() -> None:",          // 1
+                "    init_db(session)",         // 2
+                "if __name__ == \"__main__\":", // 3：建初始数据，跑完就退
+                "    main()",                   // 4
+            ],
+        };
+        List<MapSymbol> symbols =
+        [
+            Sym(1, SymbolKind.Module, "mail.mail_server", "mail/mail_server.py", null, 1, 11),
+            Sym(2, SymbolKind.Class, "mail.mail_server.MailService", "mail/mail_server.py", 1, 1, 5),
+            Sym(3, SymbolKind.Method, "mail.mail_server.MailService.SendReceipt", "mail/mail_server.py", 2, 2, 3),
+            Sym(4, SymbolKind.Method, "mail.mail_server.MailService.Watch", "mail/mail_server.py", 2, 4, 5),
+            Sym(5, SymbolKind.Function, "mail.mail_server.serve", "mail/mail_server.py", 1, 6, 9),
+            Sym(6, SymbolKind.Module, "mail.mail_client", "mail/mail_client.py", null, 1, 4),
+            Sym(7, SymbolKind.Function, "mail.mail_client.send_test", "mail/mail_client.py", 6, 1, 2),
+            Sym(8, SymbolKind.Module, "api.app.main", "api/app/main.py", null, 1, 5),
+            Sym(9, SymbolKind.Function, "api.app.main.items", "api/app/main.py", 8, 4, 5),
+            Sym(10, SymbolKind.Module, "api.app.initial_data", "api/app/initial_data.py", null, 1, 4),
+            Sym(11, SymbolKind.Function, "api.app.initial_data.main", "api/app/initial_data.py", 10, 1, 2),
+        ];
+        var entries = EntryDiscovery.Discover(symbols, [], [Container("mail", "python", "mail"), Container("api", "python", "api")], p => files.TryGetValue(p, out var l) ? l : []);
+        var e = Assert.Single(entries, x => x.RuleId == "python.grpc");
+        Assert.Equal(("MailService/SendReceipt", 3L), (e.Route, e.SymbolId)); // Watch 是 grpc.health 的
+        var main = Assert.Single(entries, x => x.ContainerKey == "mail" && x.RuleId == "python.main");
+        Assert.Equal(("hosted", "mail_server", 5L), (main.Kind, main.Route, main.SymbolId)); // mail_client 不算
+        Assert.DoesNotContain(entries, x => x.SymbolId is 6 or 7);
+        var script = Assert.Single(entries, x => x.ContainerKey == "api" && x.Kind != "http");
+        Assert.Equal(("python.script", "command", "initial_data", 11L, "api/app/initial_data.py", 1), (script.RuleId, script.Kind, script.Route, script.SymbolId, script.File, script.Line));
     }
 }

@@ -1,4 +1,6 @@
 using System.Net.Http.Json;
+using System.Reflection;
+using CodeAtlas.Core.Model;
 using CodeAtlas.Core.Resolution;
 using CodeAtlas.Core.Storage;
 using CodeAtlas.Indexing.TreeSitter;
@@ -12,6 +14,94 @@ namespace CodeAtlas.Server.Tests;
 /// </summary>
 public class StartupRebuildTests
 {
+    [Fact]
+    public async Task DisposeAsync_WaitsForActiveParserBeforeReleasingResources()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "codeatlas-active-dispose-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(repo);
+        File.WriteAllText(Path.Combine(repo, "a.ts"), "export function a() {}");
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var service = new IndexService(new ServerOptions(repo, ServerOptions.DefaultDbPath(repo)) { Roslyn = false });
+        try
+        {
+            var adapters = (List<ILanguageAdapter>)typeof(IndexService).GetField("_adapters", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(service)!;
+            var index = adapters.FindIndex(adapter => adapter.LanguageId == "typescript");
+            adapters[index] = new BlockingAdapter(adapters[index], entered, release);
+            Assert.True(service.TryStartIndex(false));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            var disposing = service.DisposeAsync().AsTask();
+            Assert.False(disposing.IsCompleted);
+            Assert.False(service.TryStartIndex(false));
+            release.Set();
+            await disposing.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.False(service.Status().Running);
+            Assert.Null(service.Status().Error);
+        }
+        finally
+        {
+            release.Set();
+            await service.DisposeAsync();
+            Directory.Delete(repo, true);
+        }
+    }
+
+    private sealed class BlockingAdapter(ILanguageAdapter inner, TaskCompletionSource<bool> entered, ManualResetEventSlim release) : ILanguageAdapter, IDisposable
+    {
+        public string LanguageId => inner.LanguageId;
+        public IReadOnlyList<string> Extensions => inner.Extensions;
+        public ParsedFile Parse(string relativePath, string source)
+        {
+            entered.TrySetResult(true);
+            release.Wait();
+            return inner.Parse(relativePath, source);
+        }
+        public void Dispose() => (inner as IDisposable)?.Dispose();
+    }
+
+    [Fact]
+    public void DisposedService_RejectsFurtherIndexRequests()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "codeatlas-dispose-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(repo);
+        try
+        {
+            using var service = new IndexService(new ServerOptions(repo, ServerOptions.DefaultDbPath(repo)) { Roslyn = false });
+            service.Dispose();
+            Assert.False(service.TryStartIndex(false));
+        }
+        finally { Directory.Delete(repo, true); }
+    }
+
+    [Theory]
+    [InlineData(null, true)]
+    [InlineData(false, false)]
+    public async Task IncrementalIndex_RefreshesStaleRoslynFilesUnlessExplicitlyDisabled(bool? requested, bool expected)
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "codeatlas-stale-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(repo);
+        var dbPath = ServerOptions.DefaultDbPath(repo);
+        try
+        {
+            File.WriteAllText(Path.Combine(repo, "a.cs"), "public class A {}");
+            File.WriteAllText(Path.Combine(repo, "b.cs"), "public class B {}");
+            using (var db = IndexDatabase.Open(dbPath))
+            using (var adapter = new CSharpAdapter())
+            {
+                await new TreeSitterIndexer(db, [adapter], new HeuristicEdgeResolver()).IndexAsync(repo);
+                db.Execute("UPDATE files SET roslyn_at = '2026-10-16T00:00:00Z' WHERE path = 'a.cs'");
+            }
+            using var service = new IndexService(new ServerOptions(repo, dbPath) { Roslyn = true });
+            Assert.True(service.TryStartIndex(false, requested));
+            await service.WaitForIndexAsync();
+            Assert.Null(service.Status().Error);
+            Assert.Equal(expected, service.Status().LastReport!.Roslyn is not null);
+        }
+        finally { Directory.Delete(repo, true); }
+    }
+
     [Fact]
     public async Task OldIndexVersion_IsRebuiltFully_WhenTheServerStarts()
     {

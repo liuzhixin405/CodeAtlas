@@ -67,16 +67,18 @@ public sealed partial class HeuristicEdgeResolver : IEdgeResolver
         var importsByFile = reader.GetAllImports().GroupBy(i => i.FileId)
             .ToDictionary(g => g.Key, g => g.Select(i => (i.Target, i.IsPath)).ToList());
 
+        // 各语言索引要看全部待解析引用里的跨文件事实（父类型、内嵌、返回值提示……）：增量时补上不在本次范围的那部分
+        IReadOnlyList<PendingReference> indexed = context.SupportReferences.Count == 0 ? context.References : [.. context.References, .. context.SupportReferences];
         ScriptIndex? script = null;
-        ScriptIndex Script() => script ??= new ScriptIndex(all, byId, files, modulesByPathNoExt, importsByFile, context.ScriptConfigs);
+        ScriptIndex Script() => script ??= new ScriptIndex(all, byId, files, modulesByPathNoExt, importsByFile, context.ScriptConfigs, indexed, reader);
         GoIndex? go = null;
-        GoIndex Go() => go ??= new GoIndex(all, files, importsByFile, context.GoModules, context.References);
+        GoIndex Go() => go ??= new GoIndex(all, files, importsByFile, context.GoModules, indexed);
         PythonIndex? python = null;
-        PythonIndex Python() => python ??= new PythonIndex(all, byId, files, importsByFile, context.References, reader);
+        PythonIndex Python() => python ??= new PythonIndex(all, byId, files, importsByFile, indexed, reader);
         JavaIndex? java = null;
-        JavaIndex Java() => java ??= new JavaIndex(all, byId, files, importsByFile, context.References, reader);
+        JavaIndex Java() => java ??= new JavaIndex(all, byId, files, importsByFile, indexed, reader);
         CSharpIndex? csharp = null;
-        CSharpIndex CSharp() => csharp ??= new CSharpIndex(all, byId, files, importsByFile, context.References, reader);
+        CSharpIndex CSharp() => csharp ??= new CSharpIndex(all, byId, files, importsByFile, indexed, reader);
 
         var edges = new List<NewEdge>();
         // handles（Handler 类 → 它处理的类型）先处理并先入库，后面的 dispatch 推导要查它
@@ -148,14 +150,16 @@ public sealed partial class HeuristicEdgeResolver : IEdgeResolver
                 edges.Add(Edge(r, c, 0.3));
         }
 
-        var handles = edges.Where(e => e.Via == "handles").ToList();
+        var handles = edges.Where(e => e.Via == "handles" && TakesMessage(reader, e)).ToList();
         var others = edges.Where(e => e.Via != "handles").ToList();
         writer.WriteEdges(handles);
         var dispatch = DeriveDispatchEdges(reader, others, out var conduitIndexes);
         // 分发方法（IDispatcher.QueryAsync）调用推导出的"接口 → 实现"边：消息已经由 dispatches 边送到 Handler，
         // 再连到 Dispatcher 实现（含测试里的桩）只是噪声，丢掉。与 ImplementationLinker 不给 conduit 边推实现一致
         others = others
-            .Select((e, i) => !conduitIndexes.Contains(i) ? e : e.Via == ImplementationLinker.Via ? null : e with { Via = "conduit" })
+            .Select((e, i) => !conduitIndexes.Contains(i)
+                ? e.Via?.StartsWith("dispatch-site:", StringComparison.Ordinal) == true ? e with { Via = null } : e
+                : e.Via == ImplementationLinker.Via ? null : e with { Via = "conduit" })
             .OfType<NewEdge>().ToList();
         writer.WriteEdges(others);
         writer.WriteEdges(dispatch);
@@ -165,34 +169,31 @@ public sealed partial class HeuristicEdgeResolver : IEdgeResolver
     /// <summary>分发方法名：调用它只是把消息送进管道，本身不是链路上的一站。</summary>
     private static readonly Regex DispatcherMethod = new("^(Send|Query|Dispatch|Publish|Execute|Handle|Process|Mediate|Request)(Async)?$", RegexOptions.Compiled);
 
-    /// <summary>
-    /// 解耦调用链的弱版本（spec 4.7）：方法里 new 了一个有 Handler 的类型 T，就视为把 T 分发给了它的 Handler。
-    /// 证据行是 new T 那一行；目标优先取 Handler 的 Handle*/Consume*/Execute* 方法，没有就连到类。
-    /// </summary>
+    public static bool IsDispatcherMethod(string name) => DispatcherMethod.IsMatch(name);
+
     private static List<NewEdge> DeriveDispatchEdges(IndexReader reader, List<NewEdge> edges, out HashSet<int> conduitIndexes)
     {
         var result = new List<NewEdge>();
         conduitIndexes = [];
         var seen = new HashSet<(long, long)>();
+        var dispatchSites = edges.Select((edge, index) => (Edge: edge, Index: index))
+            .Where(item => item.Edge.Kind == EdgeKind.Calls && item.Edge.Pos is not null)
+            .ToLookup(item => (item.Edge.FromId, item.Edge.Pos!.Value));
         for (var i = 0; i < edges.Count; i++)
         {
             var e = edges[i];
-            if (e.Kind != EdgeKind.Calls || e.ToId is not { } typeId) continue;
+            if (e.Kind != EdgeKind.Calls || e.ToId is not { } typeId
+                || e.Via?.StartsWith("dispatch-site:", StringComparison.Ordinal) != true
+                || !int.TryParse(e.Via["dispatch-site:".Length..], out var dispatchPos)) continue;
+            var dispatcher = dispatchSites[(e.FromId, dispatchPos)].ToList();
+            if (dispatcher.Count == 0) continue;
             var target = reader.GetSymbol(typeId);
             if (target is null || target.Kind is not (SymbolKind.Class or SymbolKind.Struct)) continue;
             var handlers = reader.GetDispatchHandlers(typeId);
             if (handlers.Count == 0) continue;
 
-            // 这条 new T 的构造调用是管道细节；同一行（±1）上对分发方法的调用也是
             conduitIndexes.Add(i);
-            for (var j = 0; j < edges.Count; j++)
-            {
-                var c = edges[j];
-                if (j == i || c.Kind != EdgeKind.Calls || c.FromId != e.FromId || Math.Abs(c.Line - e.Line) > 1) continue;
-                // 目标可能是 "Ns.Type.Method"、"path.ts:Type.method" 或 "external:QueryAsync"
-                var methodName = c.ToName[(Math.Max(c.ToName.LastIndexOf('.'), c.ToName.LastIndexOf(':')) + 1)..];
-                if (DispatcherMethod.IsMatch(methodName)) conduitIndexes.Add(j);
-            }
+            foreach (var candidate in dispatcher) conduitIndexes.Add(candidate.Index);
 
             foreach (var handler in handlers)
             {
@@ -203,6 +204,77 @@ public sealed partial class HeuristicEdgeResolver : IEdgeResolver
             }
         }
         return result;
+    }
+
+    /// <summary>
+    /// tree-sitter 的 handles 只看得到基类列表里的 IXxxHandler&lt;M, …&gt;，看不到接口定义：用 Handler 类自己的 Handle* / Consume* / Execute* 方法签名把关——
+    /// 这些方法都有签名、却没有一个以 M 为参数类型（Consume* 允许 ConsumeContext&lt;M&gt; 这种包着它的），就不是分派器的 Handler
+    /// （后台作业 <c>HandleAsync(IJobContext&lt;M&gt; ctx)</c> 由作业引擎执行）。没有这类方法（处理逻辑在基类里）或签名缺失时照旧保留。
+    /// </summary>
+    private static bool TakesMessage(IndexReader reader, NewEdge handles)
+    {
+        if (handles.ToId is not { } messageId || reader.GetSymbol(handles.FromId) is not { } handler) return true;
+        var message = reader.GetSymbol(messageId)?.Name;
+        if (message is null) return true;
+        var entries = reader.GetChildren(handler.Id).Where(c => c.Kind == SymbolKind.Method && IsHandlerEntry(c.Name)).ToList();
+        if (entries.Count == 0 || entries.Any(e => string.IsNullOrEmpty(e.Signature))) return true;
+        foreach (var entry in entries)
+        {
+            // 参数表跨行（首行签名里括号没合上）：看不全，不下结论
+            if (ParameterTypes(entry.Signature!, entry.Name) is not { } types) return true;
+            foreach (var type in types)
+            {
+                var bare = ShortTypeName(type);
+                if (bare == message) return true;
+                if (entry.Name.StartsWith("Consume", StringComparison.Ordinal) && Regex.IsMatch(type, @"<\s*(?:[\w.]+\.)?" + Regex.Escape(message) + @"\s*[,>]")) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>签名首行里方法名后面那对括号中每个参数的类型（去掉修饰符与参数名）；括号在首行里没合上返回 null。</summary>
+    public static List<string>? ParameterTypes(string signature, string methodName)
+    {
+        var at = signature.IndexOf(methodName + "(", StringComparison.Ordinal);
+        if (at < 0) return null;
+        var result = new List<string>();
+        var open = at + methodName.Length;
+        var depth = 0;
+        var close = -1;
+        for (var i = open; i < signature.Length; i++)
+        {
+            if (signature[i] is '(' or '<' or '[') depth++;
+            else if (signature[i] is ')' or '>' or ']' && --depth == 0) { close = i; break; }
+        }
+        if (close < 0) return null;
+        var start = open + 1;
+        depth = 0;
+        for (var i = open + 1; i <= close; i++)
+        {
+            var ch = signature[i];
+            if (ch is '<' or '(' or '[') depth++;
+            else if (ch is '>' or ')' or ']') depth--;
+            if ((ch == ',' && depth == 0) || i == close)
+            {
+                var part = signature[start..i].Trim();
+                start = i + 1;
+                var eq = part.IndexOf('=');
+                if (eq >= 0) part = part[..eq].Trim();
+                var words = part.Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(w => w is not ("this" or "in" or "ref" or "out" or "params" or "scoped")).ToList();
+                if (words.Count >= 2) result.Add(string.Join(' ', words.Take(words.Count - 1)));
+            }
+        }
+        return result;
+    }
+
+    /// <summary>Ns.Foo&lt;T&gt;? → Foo。</summary>
+    private static string ShortTypeName(string type)
+    {
+        var t = type.TrimEnd('?');
+        var lt = t.IndexOf('<');
+        if (lt >= 0) t = t[..lt];
+        var dot = t.LastIndexOf('.');
+        return dot >= 0 ? t[(dot + 1)..] : t;
     }
 
     private static bool IsHandlerEntry(string name) =>

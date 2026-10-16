@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.RegularExpressions;
 
 namespace CodeAtlas.Core.Architecture;
@@ -76,14 +76,20 @@ public static class ArchRuleParser
 
     public static ArchRuleParseResult Parse(string file, IReadOnlyList<string> lines, IArchTypeResolver? resolver = null)
     {
+        // 按整个文件剥注释与字符串再扫：多行原始字符串 / 逐字字符串 / 块注释里的 Types.… 样例不是规则（逐行判认不出跨行的字符串）。
+        // code = 注释与字符串都换成空格，判结构（链起点、括号、分号）；text = 只剥注释，读实参里的字符串
+        var code = SourceMask.Code(lines, Rules.SourceLang.CSharp);
+        var text = SourceMask.WithoutComments(lines, Rules.SourceLang.CSharp);
+        bool IsCode(int line, int index) => index < code[line].Length && !char.IsWhiteSpace(code[line][index]);
+
         var constants = new Dictionary<string, string>(StringComparer.Ordinal);
         var usings = new List<string>();
-        for (var i = 0; i < lines.Count; i++)
+        for (var i = 0; i < text.Length; i++)
         {
-            var m = ConstDecl.Match(lines[i]);
-            if (m.Success) constants[m.Groups[1].Value] = m.Groups[2].Value;
-            var u = UsingDecl.Match(lines[i]);
-            if (u.Success) usings.Add(u.Groups[1].Value);
+            var m = ConstDecl.Match(text[i]);
+            if (m.Success && IsCode(i, m.Index)) constants[m.Groups[1].Value] = m.Groups[2].Value;
+            var u = UsingDecl.Match(text[i]);
+            if (u.Success && IsCode(i, u.Groups[1].Index)) usings.Add(u.Groups[1].Value);
         }
         // 常量里的插值（$"{ApplicationNamespace}.Behaviors"）再替换一轮
         foreach (var k in constants.Keys.ToList()) constants[k] = Interpolate(constants[k], constants);
@@ -91,28 +97,27 @@ public static class ArchRuleParser
         var rules = new List<ArchRule>();
         var skipped = 0;
         string? currentTest = null;
-        for (var i = 0; i < lines.Count; i++)
+        for (var i = 0; i < code.Length; i++)
         {
-            var md = MethodDecl.Match(lines[i].TrimEnd());
-            if (md.Success && !lines[i].Contains("=>", StringComparison.Ordinal)) currentTest = md.Groups[1].Value;
-            var start = ChainStart.Match(lines[i]);
-            if (!start.Success || Rules.RuleContext.InCommentOrString(lines[i], start.Index)) continue;
+            var md = MethodDecl.Match(code[i].TrimEnd());
+            if (md.Success && !code[i].Contains("=>", StringComparison.Ordinal)) currentTest = md.Groups[1].Value;
+            var start = ChainStart.Match(code[i]);
+            if (!start.Success) continue;
 
-            // 拼成一条语句：到第一个括号深度为 0 的分号为止
+            // 拼成一条语句：到第一个括号深度为 0 的分号为止（括号与分号按 code 判，字符取 text，字符串实参原样保留）
             var sb = new StringBuilder();
             var depth = 0;
             var end = -1;
-            for (var j = i; j < lines.Count && end < 0; j++)
+            for (var j = i; j < code.Length && end < 0; j++)
             {
-                var text = j == i ? lines[i][start.Index..] : lines[j];
-                var comment = text.IndexOf("//", StringComparison.Ordinal);
-                if (comment >= 0 && !Rules.RuleContext.InCommentOrString(text, comment)) text = text[..comment];
-                foreach (var ch in text)
+                var from = j == i ? start.Index : 0;
+                for (var k = from; k < text[j].Length; k++)
                 {
+                    var ch = code[j][k];
                     if (ch == '(') depth++;
                     else if (ch == ')') depth--;
                     else if (ch == ';' && depth <= 0) { end = j; break; }
-                    sb.Append(ch);
+                    sb.Append(text[j][k]);
                 }
                 sb.Append(' ');
             }
@@ -369,16 +374,20 @@ public static class ArchRuleScanner
 {
     public sealed record Report(IReadOnlyList<ArchRule> Rules, int SkippedPredicates, int FilesScanned);
 
+    /// <summary>同 <see cref="Scan(ProjectInventory, IArchTypeResolver?, Func{string, string[]}, ArchitectureDeclarations?)"/>，先把测试项目的源码并行读进缓存（容器图扫描不读测试文件）。</summary>
+    public static Report Scan(ProjectInventory inventory, IArchTypeResolver? resolver, SourceTextCache sources, ArchitectureDeclarations? declarations)
+    {
+        sources.Prefetch(TestSources(inventory));
+        return Scan(inventory, resolver, sources.Lines, declarations);
+    }
+
     public static Report Scan(ProjectInventory inventory, IArchTypeResolver? resolver, Func<string, string[]> readLines, ArchitectureDeclarations? declarations)
     {
         var rules = new List<ArchRule>();
         var skipped = 0;
         var files = 0;
-        var testDirs = inventory.Projects.Where(p => p.IsTest).Select(p => p.Dir).ToList();
-        foreach (var file in inventory.SourceFiles)
+        foreach (var file in TestSources(inventory))
         {
-            if (!file.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!testDirs.Any(d => Rules.RuleContext.Under(file, d))) continue;
             var lines = readLines(file);
             if (!lines.Any(l => l.Contains("Types.", StringComparison.Ordinal))) continue;
             files++;
@@ -388,5 +397,12 @@ public static class ArchRuleScanner
         }
         if (declarations is not null) rules.AddRange(declarations.DependencyRules());
         return new Report(rules, skipped, files);
+    }
+
+    /// <summary>测试项目目录下的 .cs 文件（NetArchTest 链只写在测试里）。</summary>
+    private static IEnumerable<string> TestSources(ProjectInventory inventory)
+    {
+        var testDirs = inventory.Projects.Where(p => p.IsTest).Select(p => p.Dir).ToList();
+        return inventory.SourceFiles.Where(file => file.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) && testDirs.Any(d => Rules.RuleContext.Under(file, d)));
     }
 }

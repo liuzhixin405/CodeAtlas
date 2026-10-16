@@ -135,4 +135,152 @@ public class FrontendHttpRuleTests : IDisposable
             """);
         Assert.Equal(new[] { ("/api/proxy-gateway", true), ("/keep", false) }, d.Document.Proxies.Select(p => (p.Prefix, p.Strip)));
     }
+
+    private void WriteShopRoutes() => _fx.Write("web/src/config/shopRoutes.ts", """
+        import { V5 } from "./base";
+        export const SHOP_ROUTES = {
+          AUDIT: { LIST: `${V5}/audit-logs/list` },
+          ORDERS: {
+            DETAIL: (id: string) => `${V5}/shop/orders/${id}`,
+            DELETE_ASYNC: `${V5}/shop/orders/job/delete-list-async`,
+            PATCH: `${V5}/shop/orders/patch`,
+            IMPORT_NEW: `${V5}/shop/orders/import/new/validate`,
+            IMPORT_UPDATE: `${V5}/shop/orders/import/update/validate`,
+            EXPORT_XLSX: `${V5}/shop/orders/export`,
+            EXPORT_JSON: `${V5}/shop/orders/export/json`,
+          },
+        } as const;
+        """);
+
+    [Fact]
+    public void GenericArguments_WithObjectTypesSemicolonsAndNewlines_StillRecognized()
+    {
+        WriteShopRoutes();
+        _fx.Write("web/src/hooks/useShopOrders.ts", """
+            import { useApi } from "@/hooks/useApi";
+            import { SHOP_ROUTES } from "@/config/shopRoutes";
+            export const useShopOrders = (id: string) => {
+              const api = useApi();
+              const list = () => api.post<IV5APIResponse<{ totalCount: number; items: IOrder[] }>>(
+                SHOP_ROUTES.AUDIT.LIST, {});
+              const detail = () => api.get<IV5APIResponse<{ order?: IOrder } | IOrder>>(SHOP_ROUTES.ORDERS.DETAIL(id));
+              const patch = () => api.patch<
+                IV5APIResponse<{ id: number } | IApproval>
+              >(SHOP_ROUTES.ORDERS.PATCH, {});
+              const remove = () => api.delete<IV5APIResponse<{ jobId?: string }>>(SHOP_ROUTES.ORDERS.DELETE_ASYNC, { data: {} });
+              const typed = () => api.put<Array<[string, (x: number) => void]>>(SHOP_ROUTES.ORDERS.PATCH);
+              const notGeneric = api.get < limit && limit > 0;
+              return { list, detail, patch, remove, typed, notGeneric };
+            };
+            """);
+        var (ctx, _) = Run();
+        var got = ctx.Outbound.Where(o => o.File == "web/src/hooks/useShopOrders.ts").OrderBy(o => o.Line).Select(o => (o.Line, o.ClientName, o.Url)).ToList();
+        Assert.Equal(new (int, string?, string?)[]
+        {
+            (5, "POST 经代理 /api/proxy-gateway", "/api/proxy-gateway/api/v5/audit-logs/list"),
+            (7, "GET 经代理 /api/proxy-gateway", "/api/proxy-gateway/api/v5/shop/orders/${id}"),
+            (8, "PATCH 经代理 /api/proxy-gateway", "/api/proxy-gateway/api/v5/shop/orders/patch"),
+            (11, "DELETE 经代理 /api/proxy-gateway", "/api/proxy-gateway/api/v5/shop/orders/job/delete-list-async"),
+            (12, "PUT 经代理 /api/proxy-gateway", "/api/proxy-gateway/api/v5/shop/orders/patch"),
+        }, got);
+    }
+
+    [Fact]
+    public void OneSite_SeveralConstantAddresses_OneOutboundEach_RouteParameterStaysUnresolved()
+    {
+        WriteShopRoutes();
+        _fx.Write("web/src/hooks/useShopExport.ts", """
+            import { useApi } from "@/hooks/useApi";
+            import { SHOP_ROUTES } from "@/config/shopRoutes";
+            const FORMAT_META = {
+              xlsx: { endpoint: SHOP_ROUTES.ORDERS.EXPORT_XLSX, accept: "application/x" },
+              json: { endpoint: SHOP_ROUTES.ORDERS.EXPORT_JSON, accept: "application/octet-stream" },
+            };
+            export const useShopExport = (format: "xlsx" | "json", importNew: boolean) => {
+              const api = useApi();
+              const meta = FORMAT_META[format];
+              const run = () => api.post<Blob>(meta.endpoint, {});
+              const endpoint = importNew ? SHOP_ROUTES.ORDERS.IMPORT_NEW : SHOP_ROUTES.ORDERS.IMPORT_UPDATE;
+              const validate = () => api.post(endpoint, {});
+              const compare = (route: string) => api.post(route, {});
+              return { run, validate, compare };
+            };
+            """);
+        var (ctx, rule) = Run();
+        var got = ctx.Outbound.Where(o => o.File == "web/src/hooks/useShopExport.ts").OrderBy(o => o.Line).ThenBy(o => o.Url, StringComparer.Ordinal).Select(o => (o.Line, o.Url)).ToList();
+        Assert.Equal(new (int, string?)[]
+        {
+            (10, "/api/proxy-gateway/api/v5/shop/orders/export"),
+            (10, "/api/proxy-gateway/api/v5/shop/orders/export/json"),
+            (12, "/api/proxy-gateway/api/v5/shop/orders/import/new/validate"),
+            (12, "/api/proxy-gateway/api/v5/shop/orders/import/update/validate"),
+        }, got);
+        // 调用方传进来的 route：没有常量可查，照旧不认
+        var u = Assert.Single(rule.Unresolved, u => u.File == "web/src/hooks/useShopExport.ts");
+        Assert.Equal((13, "未定义: route"), (u.Line, u.Reason));
+    }
+
+    [Fact]
+    public void Placeholders_KeycloakByTokenEndpointOrHostName_SignalRNegotiateKeepsHubPath()
+    {
+        _fx.Write("web/src/services/auth.ts", """
+            export const refresh = (realm: string) => fetch(`${process.env.AUTH_DOMAIN}/realms/${realm}/protocol/openid-connect/token`, { method: "POST" });
+            export const users = () => fetch(`${process.env.KEYCLOAK_URL}/realms/acme/users`);
+            export const other = () => fetch(`${process.env.AUTH_DOMAIN}/realms/acme/users`);
+            """);
+        _fx.Write("web/src/services/live.ts", """
+            const ORIGINS = { dev: "https://api.dev.acme.test", prod: "https://api.acme.test" };
+            const hubUrl = (): string | null => {
+              const origin: string | undefined = ORIGINS[currentEnv()];
+              return origin ? `${origin}/hubs/orders` : null;
+            };
+            export async function probe() {
+              const url = hubUrl();
+              return fetch(`${url}/negotiate?negotiateVersion=1`, { method: "POST" });
+            }
+            """);
+        var (ctx, _) = Run();
+        Assert.Equal(new[]
+        {
+            ("web/src/services/auth.ts", 1, "external:http-service:keycloak"),        // 令牌端点的路径形状
+            ("web/src/services/auth.ts", 2, "external:http-service:keycloak"),        // 主机变量名带 keycloak
+            ("web/src/services/auth.ts", 3, "external:http-service:api-realms-acme"), // 两样都不沾：照旧按前两段路径
+            ("web/src/services/live.ts", 8, "external:http-service:api-hubs-orders"), // 没有后端容器：Hub 路径进占位名，不再是 "API /negotiate"
+        }, ctx.Outbound.Where(o => o.File is "web/src/services/auth.ts" or "web/src/services/live.ts")
+            .OrderBy(o => o.File, StringComparer.Ordinal).ThenBy(o => o.Line).Select(o => (o.File, o.Line, o.TargetKey!)));
+        Assert.Equal("/hubs/orders/negotiate", ctx.Outbound.Single(o => o.File == "web/src/services/live.ts").Url);
+        Assert.Equal("Keycloak", ctx.Externals["external:http-service:keycloak"].Name);
+        Assert.Equal("API /hubs/orders", ctx.Externals["external:http-service:api-hubs-orders"].Name);
+    }
+
+    [Fact]
+    public void SignalRNegotiate_GoesToTheContainerWhoseConfigDeclaresTheHubPath_AmbiguousStaysExternal()
+    {
+        _fx.Write("web/src/services/live.ts", "export const probe = () => fetch(`${process.env.API_ORIGIN}/hubs/orders/negotiate`, { method: \"POST\" });\n");
+        _fx.Write("shop/Shop.Infra/Shop.Infra.csproj", """<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>""");
+        _fx.Write("shop/Shop.Infra/Realtime.cs", """
+            public static class Realtime
+            {
+                // Hub 路径来自配置：两个宿主都引用这个库
+                public static void MapRealtime(this IEndpointRouteBuilder endpoints, RealtimeOptions options) => endpoints.MapHub<OrdersHub>(options.HubPath);
+            }
+            """);
+        foreach (var host in new[] { "Shop.Api", "Shop.Worker" })
+            _fx.Write($"shop/{host}/{host}.csproj", """
+                <Project Sdk="Microsoft.NET.Sdk.Web">
+                  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+                  <ItemGroup><ProjectReference Include="..\Shop.Infra\Shop.Infra.csproj" /></ItemGroup>
+                </Project>
+                """);
+        _fx.Write("shop/Shop.Api/appsettings.json", """{ "Realtime": { "HubPath": "/hubs/orders" } }""");
+        _fx.Write("shop/Shop.Worker/appsettings.json", """{ "Realtime": { "Enabled": false } }""");
+        var (ctx, _) = Run();
+        Assert.Equal("shop/Shop.Api", ctx.Outbound.Single(o => o.File == "web/src/services/live.ts").TargetKey);
+        Assert.DoesNotContain(ctx.Externals.Keys, k => k.Contains("hubs", StringComparison.Ordinal));
+
+        // 两个宿主的配置都写了这个路径：不猜，留在占位外部系统
+        _fx.Write("shop/Shop.Worker/appsettings.json", """{ "Realtime": { "HubPath": "/hubs/orders/" } }""");
+        (ctx, _) = Run();
+        Assert.Equal("external:http-service:api-hubs-orders", ctx.Outbound.Single(o => o.File == "web/src/services/live.ts").TargetKey);
+    }
 }

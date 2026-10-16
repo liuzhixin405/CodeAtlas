@@ -16,7 +16,8 @@ internal static class QueryCommand
             stderr.WriteLine("用法：codeatlas query <repo> <name|qualified-name> [--in] [--out] [--depth N] [--kinds a,b] [--db <path>]\n" +
                              "       codeatlas query <repo> <name|qualified-name> --outline [--depth N] [--no-externals] [--tests] [--db <path>]\n" +
                              "       codeatlas query <repo> <name|qualified-name> --impact [--depth N] [--tests] [--db <path>]\n" +
-                             "       codeatlas query <repo> <name|qualified-name> --relations [--depth 1|2] [--tests] [--db <path>]");
+                             "       codeatlas query <repo> <name|qualified-name> --relations [--depth 1|2] [--tests] [--db <path>]\n" +
+                             "       codeatlas query <repo> <name|qualified-name|#符号id> --flow [--depth N] [--json] [--db <path>]");
             return 2;
         }
         var repo = args.Positional[0];
@@ -51,8 +52,11 @@ internal static class QueryCommand
         {
             var reader = new IndexReader(db);
             var files = reader.GetAllFiles().ToDictionary(f => f.Id, f => f.Path);
-            var matches = reader.FindByQualifiedName(target);
-            if (matches.Count == 0) matches = reader.FindByName(target);
+            // #12345：按符号 id（入口清单、--json 输出里的 symbolId）
+            var matches = target.StartsWith('#') && long.TryParse(target[1..], out var byId)
+                ? (reader.GetSymbol(byId) is { } one ? [one] : [])
+                // 完整限定名 → 短名 → 按段对齐的限定名后缀（"类型.方法"、省略参数表 / 泛型），见 OutlineQuery.FindSymbols
+                : OutlineQuery.FindSymbols(db, target);
             if (matches.Count == 0) { stderr.WriteLine($"未找到符号：{target}"); return 1; }
 
             if (matches.Count > 3)
@@ -60,6 +64,13 @@ internal static class QueryCommand
                 stdout.WriteLine($"有 {matches.Count} 个同名符号，请用限定名：");
                 foreach (var m in matches) stdout.WriteLine($"  {m.QualifiedName}  [{DbNames.ToDb(m.Kind)}]  {files.GetValueOrDefault(m.FileId, "?")}:{m.StartLine}");
                 return 0;
+            }
+
+            if (args.Has("--flow"))
+            {
+                // 与 GET /api/symbols/{id}/flow 同一份数据；--depth 是时序树的深度（1..20，默认 12），不是上面邻居查询的 1..6
+                int? flowDepth = int.TryParse(args.Value("--depth"), out var fd) ? fd : null;
+                return PrintFlow(db, repo, args, matches, flowDepth, stdout, stderr);
             }
 
             if (args.Has("--relations"))
@@ -102,6 +113,42 @@ internal static class QueryCommand
             }
             return 0;
         }
+    }
+
+    /// <summary>
+    /// 从任意符号出发的时序树（与 GET /api/symbols/{id}/flow 同一份数据，打印格式同 arch --flow）。--json：一个符号输出一个对象，多个同名时输出数组。
+    /// </summary>
+    private static int PrintFlow(IndexDatabase db, string repo, ParsedArgs args, IReadOnlyList<SymbolRecord> matches, int? depth, TextWriter stdout, TextWriter stderr)
+    {
+        var maxDepth = Math.Clamp(depth ?? FlowBuilder.DefaultMaxDepth, 1, 20);
+        var (entries, routeMatches) = EntryStorage.Read(db);
+        var arch = ArchStorage.Read(db);
+        var containers = arch.Nodes.Where(n => n.Kind == Core.Architecture.ArchNodeKind.Container).ToList();
+        var externals = arch.Nodes.Where(n => n.Kind == Core.Architecture.ArchNodeKind.External).ToList();
+        var (symbols, edges) = MapData.Load(new IndexReader(db));
+        var byId = symbols.ToDictionary(s => s.Id);
+        Core.Architecture.ArchNode? repoContainer = null;
+        var roots = CommonOptions.Roots(Path.GetFullPath(repo), args, stderr);
+        var flows = new List<FlowDto>();
+        foreach (var m in matches)
+        {
+            if (!byId.TryGetValue(m.Id, out var symbol)) continue;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var flow = SymbolFlow.Build(symbols, edges, symbol, containers, routeMatches, entries, maxDepth, arch.Outbound, externals,
+                () => repoContainer ??= DsmBuilder.RepoContainer(roots));
+            flow = MessagePipeline.InjectFromDb(db, roots.Main, flow, containers, symbols, edges);
+            flows.Add(flow);
+            if (args.Has("--json")) continue;
+            var asEntry = entries.FirstOrDefault(e => e.SymbolId == flow.EntrySymbolId);
+            var containerName = containers.FirstOrDefault(c => c.Key == flow.ContainerKey)?.Name ?? flow.ContainerKey;
+            ArchCommand.PrintFlowTree(flow, asEntry is null ? "起点" : "入口", asEntry?.HttpMethod, containerName, sw.Elapsed.TotalMilliseconds, stdout);
+            stdout.WriteLine();
+        }
+        if (args.Has("--json"))
+            stdout.WriteLine(flows.Count == 1
+                ? System.Text.Json.JsonSerializer.Serialize(flows[0], ArchCommand.FlowJson)
+                : System.Text.Json.JsonSerializer.Serialize(flows, ArchCommand.FlowJson));
+        return 0;
     }
 
     /// <summary>

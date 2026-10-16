@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 
 namespace CodeAtlas.Core.Architecture.Rules;
 
@@ -88,19 +88,36 @@ public static class AddressResolver
     }
 }
 
-/// <summary>services.AddHttpClient(...)：命名 / 类型化 HTTP 客户端 → 出口。地址从 BaseAddress = new Uri(x) 解析。</summary>
+/// <summary>
+/// services.AddHttpClient(...)：命名 / 类型化 HTTP 客户端 → 出口。地址从 BaseAddress = new Uri(x) 解析。
+/// 只占了名字（没有地址）、业务代码里又没人按这个名字取的命名客户端不算出口（只有测试在用的旧客户端）。
+/// 另认"地址来自配置对象"的直接调用：client.PostAsJsonAsync(_emailConfig.ApiUrl, …)，_emailConfig 的类型 T 按 Configure&lt;T&gt;(GetSection(…)) 找到配置节，
+/// 配置里确实有 节:属性 这个键才算（配置键交给 EdgeMatcher 解析成 URL）。
+/// </summary>
 public sealed class HttpClientRule : IDiscoveryRule
 {
     public string Id => "http-client";
-    public string Description => "AddHttpClient 注册的 HTTP 客户端，地址来自 BaseAddress 的字面量或配置键";
+    public string Description => "AddHttpClient 注册的 HTTP 客户端（地址来自 BaseAddress 的字面量或配置键），以及地址取自配置对象属性的 HttpClient 调用";
 
     private static readonly Regex Call = new(@"AddHttpClient(?:<[^>]+>)?\s*\(", RegexOptions.Compiled);
+    private static readonly Regex NamedCall = new(@"AddHttpClient\s*\(", RegexOptions.Compiled);
     // BaseAddress = new Uri(x) / new(x)（目标类型 new）/ = x
     private static readonly Regex NewUri = new(@"BaseAddress\s*=\s*(?:new\s*(?:Uri)?\s*\((.+?)\)|([^;,)]+))\s*[;,)]", RegexOptions.Compiled);
+    // client.PostAsJsonAsync(_emailConfig.ApiUrl, …) / GetAsync(new Uri(_options.BaseUrl)) / GetAsync($"{_cfg.Endpoint}/x")：接收者.属性 是地址
+    private static readonly Regex ConfigUrlCall = new(
+        @"\.(?:Get|Post|Put|Patch|Delete|Send)(?:AsJson|FromJson|String|Stream|ByteArray)?Async\s*(?:<[^>]*>)?\s*\(\s*(?:new\s+Uri\s*\(\s*)?(?:\$""\{)?(?<recv>_?[A-Za-z]\w*)\s*\.\s*(?<prop>\w*(?:Url|Uri|Endpoint|Address))\b",
+        RegexOptions.Compiled);
 
     public void Apply(RuleContext ctx)
     {
+        ApplyRegistrations(ctx);
+        ApplyConfigUrlCalls(ctx);
+    }
+
+    private void ApplyRegistrations(RuleContext ctx)
+    {
         var found = new List<Outbound>();
+        var namedOnly = new HashSet<(string File, int Line)>(); // 非泛型 AddHttpClient("名字") / AddHttpClient(常量)
         foreach (var file in ctx.CSharpFiles())
         {
             var lines = ctx.Lines(file);
@@ -123,16 +140,112 @@ public sealed class HttpClientRule : IDiscoveryRule
                     break;
                 }
                 if (name is null && address.ConfigKey is null && address.Url is null) continue; // 转发名字的封装方法，不是客户端
+                if (NamedCall.IsMatch(lines[i][m.Index..])) namedOnly.Add((file, i + 1));
                 foreach (var c in containers)
                     found.Add(new Outbound(c.Key, Id, "http", name, address.ConfigKey, address.Url, file, i + 1, null));
             }
         }
+        var registrationLines = found.Select(o => (o.File, o.Line)).ToHashSet();
+        var usage = new Dictionary<string, bool>(StringComparer.Ordinal);
         // 同一容器里同名客户端注册多次（先占名再配地址）：有地址的那条说了算
         foreach (var group in found.GroupBy(o => (o.ContainerKey, o.ClientName)))
         {
             var withAddress = group.Where(o => o.ConfigKey is not null || o.Url is not null).ToList();
+            if (group.Key.ClientName is { } clientName && withAddress.Count == 0 && group.All(o => namedOnly.Contains((o.File, o.Line)))
+                && !(usage.TryGetValue(clientName, out var used) ? used : usage[clientName] = NameUsed(ctx, clientName, registrationLines)))
+                continue; // 只占了名字、没人按名字取：不是出口
             ctx.Outbound.AddRange(group.Key.ClientName is not null && withAddress.Count > 0 ? withAddress : group);
         }
+    }
+
+    /// <summary>
+    /// 命名客户端的名字（字面量 "Foo" 或常量名 FOO）在注册行之外的业务代码里有没有被用到：出现 "Foo" 字面量，或出现值为 "Foo" 的常量的名字
+    /// （CreateClient(Consts.FOO)）。常量自己的定义行不算。测试文件不在 CSharpFiles 里。
+    /// </summary>
+    private static bool NameUsed(RuleContext ctx, string name, HashSet<(string File, int Line)> registrations)
+    {
+        var literal = "\"" + name + "\"";
+        var identifiers = new HashSet<string>(StringComparer.Ordinal);
+        if (Regex.IsMatch(name, @"^[A-Za-z_]\w*$")) identifiers.Add(name);
+        var constDef = new Regex(@"\bconst\s+string\s+(\w+)\s*=\s*""" + Regex.Escape(name) + @"""");
+        var files = ctx.CSharpFiles().ToList();
+        foreach (var f in files)
+            foreach (var line in ctx.Lines(f))
+                if (line.Contains(literal, StringComparison.Ordinal) && constDef.Match(line) is { Success: true } d) identifiers.Add(d.Groups[1].Value);
+        var idPattern = identifiers.Count == 0 ? null : new Regex(@"\b(?:" + string.Join('|', identifiers.Select(Regex.Escape)) + @")\b");
+        foreach (var f in files)
+        {
+            var lines = ctx.Lines(f);
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (registrations.Contains((f, i + 1))) continue;
+                var line = lines[i];
+                var trimmed = line.TrimStart();
+                if (trimmed.StartsWith("//", StringComparison.Ordinal) || trimmed.StartsWith("///", StringComparison.Ordinal)) continue;
+                var isDefinition = constDef.IsMatch(line) || Regex.IsMatch(line, @"\bconst\s+string\s+" + Regex.Escape(name) + @"\b");
+                if (isDefinition) continue;
+                if (line.Contains(literal, StringComparison.Ordinal)) return true;
+                if (idPattern is not null && idPattern.IsMatch(line)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>client.XxxAsync(_cfg.ApiUrl, …)：接收者的类型是绑定了配置节的选项类 → 出口（配置键 节:属性）。</summary>
+    private void ApplyConfigUrlCalls(RuleContext ctx)
+    {
+        Dictionary<string, string>? sections = null; // 选项类名 → 配置节
+        var keys = ctx.Inventory.ConfigEntries.Select(e => e.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in ctx.CSharpFiles())
+        {
+            var lines = ctx.Lines(file);
+            if (!Array.Exists(lines, l => l.Contains("Async", StringComparison.Ordinal) && ConfigUrlCall.IsMatch(l))) continue;
+            var containers = ctx.ContainersOf(file);
+            if (containers.Count == 0) continue;
+            for (var i = 0; i < lines.Length; i++)
+            {
+                var m = ConfigUrlCall.Match(lines[i]);
+                if (!m.Success || RuleContext.InCommentOrString(lines[i], m.Index)) continue;
+                var type = DeclaredType(lines, m.Groups["recv"].Value);
+                if (type is null) continue;
+                sections ??= OptionSections(ctx);
+                var section = sections.TryGetValue(type, out var s) ? s : type;
+                var key = section + ":" + m.Groups["prop"].Value;
+                if (!keys.Contains(key)) continue; // 配置里没有这个键：多半不是配置对象（实体上的 Url 字段）
+                foreach (var c in containers) ctx.Outbound.Add(new Outbound(c.Key, Id, "http", null, key, null, file, i + 1, null));
+            }
+        }
+    }
+
+    /// <summary>文件里 recv 的声明类型：`private readonly EmailConfig _emailConfig;`、参数 `EmailConfig cfg`；IOptions&lt;T&gt; 取 T。只认大写开头的类型名。</summary>
+    private static string? DeclaredType(string[] lines, string recv)
+    {
+        var decl = new Regex(@"(?:\bI?Options(?:Snapshot|Monitor)?<\s*(?<t>[A-Z]\w*)\s*>|\b(?<t>[A-Z]\w*))\??\s+" + Regex.Escape(recv) + @"\s*[;=,)]");
+        foreach (var line in lines)
+        {
+            var d = decl.Match(line);
+            if (d.Success && d.Groups["t"].Value is not ("var" or "HttpClient" or "Uri" or "string" or "String")) return d.Groups["t"].Value;
+        }
+        return null;
+    }
+
+    /// <summary>Configure&lt;T&gt;(x.GetSection(nameof(T)) / GetSection("Name")) 与 GetSection(…).Get&lt;T&gt;() / Bind：选项类 → 配置节。</summary>
+    private static Dictionary<string, string> OptionSections(RuleContext ctx)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var configure = new Regex(@"Configure<\s*(?:[\w.]+\.)?(?<t>\w+)\s*>\s*\(\s*[\w.]*GetSection\(\s*(?:""(?<s>[^""]+)""|nameof\(\s*(?:[\w.]+\.)?(?<n>\w+)\s*\))");
+        var get = new Regex(@"GetSection\(\s*(?:""(?<s>[^""]+)""|nameof\(\s*(?:[\w.]+\.)?(?<n>\w+)\s*\))\s*\)\s*\.\s*Get<\s*(?:[\w.]+\.)?(?<t>\w+)\s*>");
+        foreach (var f in ctx.CSharpFiles())
+            foreach (var line in ctx.Lines(f))
+            {
+                if (!line.Contains("GetSection", StringComparison.Ordinal)) continue;
+                foreach (var re in new[] { configure, get })
+                {
+                    var m = re.Match(line);
+                    if (m.Success) map.TryAdd(m.Groups["t"].Value, m.Groups["s"].Success ? m.Groups["s"].Value : m.Groups["n"].Value);
+                }
+            }
+        return map;
     }
 }
 
@@ -300,7 +413,8 @@ public sealed class FrontendHttpRule : IDiscoveryRule
     public List<Proxy> Proxies { get; } = [];
 
     private sealed record Site(int Line, string Method, TsVal Value, string? Base);
-    private sealed record Call(string File, int Line, string Method, string Url, string? Proxy, string BusinessPath);
+    /// <param name="Raw">常量展开后、剥主机前的原文（`${process.env.KEYCLOAK_DOMAIN}/realms/…`），给外部系统命名用。</param>
+    private sealed record Call(string File, int Line, string Method, string Url, string? Proxy, string BusinessPath, string Raw);
     private sealed record ApiRoute(string[] Template, string File, bool IsProxy, string Prefix);
     private readonly Dictionary<(string File, int Depth), (bool Http, HashSet<string> Bases)> _httpModules = new();
 
@@ -313,12 +427,13 @@ public sealed class FrontendHttpRule : IDiscoveryRule
         var declared = (ArchitectureDeclarations.Load(ctx.Inventory.Root)?.Document.Proxies ?? [])
             .Where(p => p.Strip && !string.IsNullOrWhiteSpace(p.Prefix) && p.Prefix.Trim().Trim('/').Length > 0)
             .Select(p => "/" + p.Prefix!.Trim().Trim('/')).Distinct(StringComparer.Ordinal).ToList();
-        foreach (var c in ctx.Containers.Where(c => c.SubKind == "frontend"))
+        var frontends = ctx.Containers.Where(c => c.SubKind == "frontend").ToList();
+        resolver.Preload(frontends.SelectMany(c => FrontendFiles(ctx, c.Path ?? "")));
+        foreach (var c in frontends)
         {
             var root = c.Path ?? "";
             // 只要 TS / JS：清单里还有 .cs / .go / .py（前端目录在仓库根时会把它们都圈进来）
-            var files = ctx.Inventory.SourceFiles.Where(f => RuleContext.Under(f, root) && !RuleContext.IsTestFile(f)
-                && PolyText.LangOf(f) == SourceLang.JavaScript && !f.EndsWith(".d.ts", StringComparison.OrdinalIgnoreCase)).ToList();
+            var files = FrontendFiles(ctx, root);
             var routes = ApiRoutes(resolver, root, files);
             foreach (var r in routes.Where(r => r.IsProxy)) Proxies.Add(new Proxy(c.Key, r.Prefix, r.File));
             foreach (var d in declared)
@@ -332,11 +447,15 @@ public sealed class FrontendHttpRule : IDiscoveryRule
                 var m = resolver.Module(file);
                 if (m is null) continue;
                 foreach (var site in Sites(resolver, m))
-                    if (Classify(c.Key, file, site, prefixes, own) is { } call) calls.Add(call);
+                    calls.AddRange(Classify(c.Key, file, site, prefixes, own));
             }
-            Register(ctx, c.Key, calls, prefixes);
+            Register(ctx, c.Key, calls.DistinctBy(x => (x.File, x.Line, x.Method, x.Url)).ToList(), prefixes);
         }
     }
+
+    private static List<string> FrontendFiles(RuleContext ctx, string root) =>
+        ctx.Inventory.SourceFiles.Where(f => RuleContext.Under(f, root) && !RuleContext.IsTestFile(f)
+            && PolyText.LangOf(f) == SourceLang.JavaScript && !f.EndsWith(".d.ts", StringComparison.OrdinalIgnoreCase)).ToList();
 
     // ───── 调用处 ─────
 
@@ -580,26 +699,54 @@ public sealed class FrontendHttpRule : IDiscoveryRule
         return null;
     }
 
-    /// <summary>open 是泛型实参的 "&lt;"：返回配对 "&gt;" 之后的下标；配不上返回 open（调用方再看是不是 "("）。</summary>
+    private const int GenericScanLimit = 400;
+
+    /// <summary>
+    /// open 是泛型实参的 "&lt;"：按尖括号配对跳过，返回配对 "&gt;" 之后的下标；配不上返回 open（调用方再看是不是 "("）。
+    /// 泛型实参里可以有对象类型 { a: number; b?: string }、函数类型 () =&gt; T、元组 [A, B]、换行——( [ { 只要成对就跨过去。
+    /// 括号先于尖括号闭合（a.get &lt; b) 这类比较）、同层出现 ; 或扫得太远，都当不是泛型。
+    /// </summary>
     private static int SkipGeneric(TsModule m, int open)
     {
-        var d = 0;
-        for (var i = open; i < m.Tokens.Count; i++)
+        var angle = 0;
+        var brackets = 0;
+        for (var i = open; i < m.Tokens.Count && i - open < GenericScanLimit; i++)
         {
             var t = m.Tokens[i];
             if (t.Kind != TsTokKind.Punct) continue;
-            if (t.Text == "<") d++;
-            else if (t.Text == ">") { d--; if (d == 0) return i + 1; }
-            else if (t.Text is ";" or "{" or "}" or "=>") return open;
+            switch (t.Text)
+            {
+                case "(" or "[" or "{": brackets++; break;
+                case ")" or "]" or "}":
+                    if (brackets == 0) return open;
+                    brackets--;
+                    break;
+                case "<": angle++; break;
+                case ">":
+                    angle--;
+                    if (angle == 0) return brackets == 0 ? i + 1 : open;
+                    break;
+                case ";" when brackets == 0: return open;
+            }
         }
         return open;
     }
 
-    private Call? Classify(string containerKey, string file, Site site, IReadOnlyList<Proxy> proxies, IReadOnlyList<ApiRoute> own)
+    /// <summary>一处调用的全部地址：常量表 / 三元 / 多个 return 解析出几个取值就是几条出口（同一行）；解析不了的记进 <see cref="Unresolved"/>。</summary>
+    private IEnumerable<Call> Classify(string containerKey, string file, Site site, IReadOnlyList<Proxy> proxies, IReadOnlyList<ApiRoute> own)
     {
-        var res = TsConstantResolver.ToResolution(site.Value);
-        if (res.Value is null) { Unresolved.Add(new UnresolvedCall(containerKey, file, site.Line, res.Failure ?? "无法解析")); return null; }
-        var raw = res.Value;
+        if (TsConstantResolver.Alternatives(site.Value) is not { } values)
+        {
+            Unresolved.Add(new UnresolvedCall(containerKey, file, site.Line, TsConstantResolver.ToResolution(site.Value).Failure ?? "无法解析"));
+            yield break;
+        }
+        foreach (var value in values)
+            if (Classify(containerKey, file, site, value, proxies, own) is { } call) yield return call;
+    }
+
+    private Call? Classify(string containerKey, string file, Site site, string value, IReadOnlyList<Proxy> proxies, IReadOnlyList<ApiRoute> own)
+    {
+        var raw = value;
         if (site.Base is not null && !IsAbsolute(raw) && !raw.StartsWith("${", StringComparison.Ordinal)) raw = site.Base.TrimEnd('/') + "/" + raw.TrimStart('/');
         var path = PathOf(raw);
         if (path is null)
@@ -607,7 +754,7 @@ public sealed class FrontendHttpRule : IDiscoveryRule
             Unresolved.Add(new UnresolvedCall(containerKey, file, site.Line, (OnlyHoles(raw) ? "运行时变量: " : "不是路径: ") + raw));
             return null;
         }
-        if (IsAbsolute(path)) return new Call(file, site.Line, site.Method, path, null, path);
+        if (IsAbsolute(path)) return new Call(file, site.Line, site.Method, path, null, path, raw);
         var proxy = proxies.FirstOrDefault(p => path == p.Prefix || path.StartsWith(p.Prefix + "/", StringComparison.Ordinal))?.Prefix;
         if (proxy is null && own.Any(r => RouteMatches(r.Template, path)))
         {
@@ -615,13 +762,15 @@ public sealed class FrontendHttpRule : IDiscoveryRule
             return null;
         }
         var business = proxy is null ? path : path.Length == proxy.Length ? "/" : path[proxy.Length..];
-        return new Call(file, site.Line, site.Method, path, proxy, business);
+        return new Call(file, site.Line, site.Method, path, proxy, business, raw);
     }
 
     // ───── 登记 ─────
 
     private void Register(RuleContext ctx, string containerKey, List<Call> calls, IReadOnlyList<Proxy> proxies)
     {
+        var placeholders = new List<Call>();
+        var hubHosts = new Dictionary<string, ArchNode?>(StringComparer.OrdinalIgnoreCase);
         foreach (var call in calls)
         {
             string key;
@@ -630,13 +779,20 @@ public sealed class FrontendHttpRule : IDiscoveryRule
                 if (!Uri.TryCreate(call.Url, UriKind.Absolute, out var u)) continue;
                 key = ctx.External("http-service", u.Host, new Evidence(call.File, call.Line, call.Url));
             }
-            else key = $"external:http-service:{RuleContext.Slug("API " + Group(call.BusinessPath))}";
+            else if (SignalRHub(call.BusinessPath) is { } hub
+                     && (hubHosts.TryGetValue(hub, out var host) ? host : hubHosts[hub] = HubHost(ctx, containerKey, hub)) is { } hostContainer)
+                key = hostContainer.Key; // SignalR 握手：直接记到映射这个 Hub 的容器上，不另造外部系统
+            else
+            {
+                key = $"external:http-service:{RuleContext.Slug(NodeName(call))}";
+                placeholders.Add(call);
+            }
             ctx.Outbound.Add(new Outbound(containerKey, Id, "http", FormatCall(call.Method, call.Proxy), null, call.Url, call.File, call.Line, key));
         }
-        // 占位外部系统：每个 API 根一个节点；证据按路径聚合（次数降序）列前 20 条，再加一条汇总（业务段分布、经哪个代理）
-        foreach (var g in calls.Where(c => !IsAbsolute(c.Url)).GroupBy(c => Group(c.BusinessPath)))
+        // 占位外部系统：每个 API 根一个节点（认得出的身份服务用它的名字）；证据按路径聚合（次数降序）列前 20 条，再加一条汇总（业务段分布、经哪个代理）
+        foreach (var g in placeholders.GroupBy(NodeName))
         {
-            var name = "API " + g.Key;
+            var name = g.Key;
             var byPath = g.GroupBy(c => (c.BusinessPath, c.Method))
                 .OrderByDescending(x => x.Count()).ThenBy(x => x.Key.BusinessPath, StringComparer.Ordinal).ThenBy(x => x.Key.Method, StringComparer.Ordinal).ToList();
             foreach (var p in byPath.Take(EvidencePaths))
@@ -654,6 +810,59 @@ public sealed class FrontendHttpRule : IDiscoveryRule
             var summaryFile = usedProxy is not null ? proxies.First(p => p.Prefix == usedProxy).Evidence : g.First().File;
             ctx.External("http-service", name, new Evidence(summaryFile, null, note));
         }
+    }
+
+    /// <summary>
+    /// 占位外部系统的名字："API " + 前两段路径；Keycloak 的令牌 / 用户信息端点（/realms/{realm}/protocol/openid-connect/…，
+    /// 或主机变量名里带 keycloak 的 /realms/…）叫 Keycloak——它是身份服务，不是业务 API。
+    /// </summary>
+    private static string NodeName(Call call) => IsKeycloak(call) ? "Keycloak" : "API " + Group(call.BusinessPath);
+
+    private static bool IsKeycloak(Call call)
+    {
+        if (!call.BusinessPath.StartsWith("/realms/", StringComparison.OrdinalIgnoreCase)) return false;
+        if (call.BusinessPath.Contains("/protocol/openid-connect", StringComparison.OrdinalIgnoreCase)) return true;
+        var host = call.Raw.IndexOf("/realms/", StringComparison.OrdinalIgnoreCase) is var i and > 0 ? call.Raw[..i] : "";
+        return host.Contains("keycloak", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>SignalR 的握手 POST {hub}/negotiate → hub 路径（/hubs/chat/negotiate → /hubs/chat）；不是这种形状 → null。</summary>
+    private static string? SignalRHub(string path)
+    {
+        const string suffix = "/negotiate";
+        if (!path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) || path.Length <= suffix.Length + 1) return null;
+        var hub = path[..^suffix.Length];
+        return hub.Contains("${", StringComparison.Ordinal) ? null : hub;
+    }
+
+    /// <summary>
+    /// 映射这个 Hub 的后端容器：自己的源码里有 MapHub&lt;T&gt;(…)，且 Hub 路径写在 MapHub 的字面量里、或写在容器宿主项目的 appsettings 里
+    /// （"HubPath": "/hubs/broadcast"，MapHub 读配置的写法）。恰好一个容器符合才算，几个容器都像（共享库里写死路径）不猜。
+    /// </summary>
+    private static ArchNode? HubHost(RuleContext ctx, string fromContainer, string hub)
+    {
+        var literal = "\"" + hub.TrimEnd('/') + "\"";
+        var hits = new List<ArchNode>();
+        foreach (var c in ctx.Containers.Where(c => c.Key != fromContainer && c.SubKind != "frontend"))
+        {
+            var mapsHub = false;
+            var literalHere = false;
+            foreach (var file in ctx.CSharpFiles().Where(f => c.Members.Any(m => RuleContext.Under(f, m))))
+            {
+                foreach (var line in ctx.Lines(file))
+                {
+                    var at = line.IndexOf("MapHub<", StringComparison.Ordinal);
+                    if (at < 0 || RuleContext.InCommentOrString(line, at)) continue;
+                    mapsHub = true;
+                    literalHere |= line.Contains(literal, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            if (!mapsHub) continue;
+            var configured = c.Path is not null && ctx.Inventory.ConfigEntries.Any(e => e.ProjectDir == c.Path
+                && string.Equals(e.Value.Trim().TrimEnd('/'), hub.TrimEnd('/'), StringComparison.OrdinalIgnoreCase));
+            if (literalHere || configured) hits.Add(c);
+        }
+        return hits.Count == 1 ? hits[0] : null;
     }
 
     // ───── Next.js API 路由与代理识别 ─────

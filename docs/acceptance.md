@@ -1,5 +1,19 @@
 # 验收记录
 
+## 0.1.1 发布验收 — 2026-10-16
+
+以下为当前源码验证；后续里程碑章节保留历史结果，不代表当前版本的功能缺失。
+
+- 市场身份保持 `164910441.codetrail-graph`，显示名 CodeTrail Graph，版本升为 **0.1.1**；五平台服务与 Webview 一起重新构建。
+- 文档与当前代码同步：默认调用时序图、框架流程、跨模式导航、增量 Roslyn、索引格式 **12** 自动重建，以及远程 AI 数据发送说明。
+- 扩展：类型检查和生产构建通过，32 个测试文件、**421** 项通过。
+- .NET：Core 200、TreeSitter 335、Roslyn 110、CLI 25、Server 501，合计 **1171** 项通过，0 失败、0 跳过。框架流程替换后遗留的旧管道布局 / DTO 测试已清理，测试路径判定的工具函数回归保留。
+- 依赖：恢复 Microsoft.Data.Sqlite 10.0.13、Pkcs / Xml 10.0.13；CLI 与 Roslyn worker 的传递依赖报告未发现已知漏洞。
+- Windows 正式产物实测：3 个夹具文件全量解析成功（134 符号、136 边）；第二次增量 parsed 0、unchanged 3，架构及入口后处理按指纹跳过；worker 成功探测 .NET 10.0.402。
+- 五个平台的 VSIX 均检查包内 publisher / name / version、平台标记、图标、扩展 bundle、自带运行时、原生 SQLite 和 Roslyn worker；未混入其他 VSIX、源代码目录或 node_modules。
+- Marketplace 已接收并通过服务端版本记录确认五个平台的 `0.1.1`，沿用 `164910441.codetrail-graph`；上传完成时仍在等待市场验证扫描，上传成功不等同于扫描通过。
+- 边界：Linux / macOS 仅完成交叉构建和包内容验证，未在对应系统执行 UI 验收；无大型真实仓库的新增性能基准，不把夹具耗时当作全仓性能保证。保留现有可空性、过时 API 等编译告警。
+
 ## 里程碑 1（tree-sitter + CLI）— 2026-10-13
 
 机器：Core Ultra 9 285H / 64GB，Release 构建，SQLite 索引库。
@@ -206,6 +220,143 @@
 3. 接口 → 实现的派生边按 implements 关系推导、不看 DI 注册；多实现时给候选而非挑一个。符合"以实际代码为准"的要求。
 4. obj/ bin/ 下的生成代码按仓库外处理（gRPC stub、AssemblyInfo）。
 5. 基类虚方法 → 重写 的派生边还没做（只处理接口）。
+
+## 真实项目审计后的并行修复 — 2026-10-16（晚）
+- **起因**：用户在 CodeAtlas 自己的仓库里看到测试夹具被当成"shop / svc Go 服务"，还推出一个假 PostgreSQL，说"测试写了一堆，但是拿实际项目一试，一堆问题"。当时回归 55 项全绿：检查全是"该有的有没有"，挡不住假入口、错连、假边。
+- **审计**：四个只读代理对照源码逐视图挑错，覆盖 CodeAtlas 自身、ccs-backend、ccs-ui（单独 / 合并）和 9 个公开项目，归并成 19 类问题，见 `docs/audit-2026-10-16.md`。
+- **并行修复**：用户要求"多开一起修复，以最快的时间修复"。9 个代理按文件归属并行修，共同规则写在 brief 里，构建经全局锁排队。主线负责索引版本 10→11、跨组配合、面板显示、回归反例和收尾。
+- **修前 → 修后**（都在真实项目上核对过源码）：
+  - **前端续接**：ccs-ui 错连 22 → 0，`${x}` 不再匹配字面量段，HTTP 方法不同的不连。
+  - **读写颠倒**：MT4 列表 GET 不再续接到 bulk-update，CfgUpdateSymbol 9 → 0 次。
+  - **后端续接**：Api→Publisher 0 → 162；Api→MT4Proxy 18（12 条错）→ 68。
+  - **前端出口**：372 → 409 处识别；`api.post` 能连到 `ApiClient.post`（423 / 425 处），ApiClient.post 的影响范围 0 → 33 个页面。
+  - **常驻服务 / Hub 按宿主真实注册归属**：ccs Api 去掉 6 个 Worker 服务，Worker 去掉 4 个服务和 8 个 Hub；Kafka→Worker 假边去掉。
+  - **eShop**：RabbitMQ 发布边 7 → 4 个容器；共享库的假 GET / 只留在 3 个真调用的容器。
+  - **lambda 路由**：CodeAtlas 的 23 条路由 1 → 23 个符号，影响范围不再把 23 个入口全算上。
+  - **异步命令**：19 个分派到 EnqueueJobHandler（只入队），不再连到后台作业 Handler；Handler 清单 557 → 473，去掉 79 个假的。
+  - **请求流程里的管道**：补上 Publish 领域事件、审批回放的分派、行为 `next()` 之后的提交，以及 7 个漏掉的验证器和 Fetcher；不经分派器的入口不再挂"管道行为"。
+  - **时序图**：同档分支按"分量"排（子树规模、I/O、公共工具降权、名字相关度、取数据的 hook 优先），主调用不再被字母序折掉。flow-coverage 召回 97.2% → 98.7%；同一符号一张图只展开一次，ccs-ui 平均节点 108 → 60。
+  - **显示**：局部函数显示真名（原来 83 行都叫 `Build`）；外部调用按类别成行（`JpaRepository.save` 单独一行，不再藏在 [Logger] 下）。
+  - **TS 同名错连**：Set.has、Map.get 这类 12 条错边清零；以回调传出的函数补上边，fastapi 的 /login 能一路走到 `login_access_token`。
+  - **入口**：Express 8 → 20 条且带 /api 前缀；补上 DRF 继承方法、GraphQL 29 条、MVC 约定路由、健康检查；测试客户端不再算入口。
+  - **容器图**：
+    - 测试字符串里的规则 7 → 0，整库 DSM 的夹具 / 生成代码组件去掉；
+    - VS Code 扩展算成一个容器，连到 CLI；
+    - 补上 AWS SSM、Keycloak、MT4 x86 gRPC、Redis、AI 端点；
+    - Lark / SendGrid 按服务命名，Keycloak 合成一个。
+  - **框架流程**：
+    - CLI 容器按 Web 画；ccs Worker 改成常驻服务驱动分派器；
+    - Send / Query 合并，部分 Handler 自己提交（25 直接 / 63 经服务），阶段计数与树一致；
+    - gin 的说明按注册函数点名，ccs-ui 补上代理一跳和 6 个局部布局守卫，gRPC 服务统一画法。
+  - **编辑器与面板**：右键收进「CodeAtlas」子菜单，CodeLens 加 `ctg:` 标识，「调用 N 个」能直接跳到经分派的 Handler；面板有了后退 / 前进（← →、Alt+← / Alt+→、鼠标侧键）。
+- **主线收尾时发现并修掉**：
+  - 回归第一轮 6 项不通过，3 项是真问题：MT5 分组表的主数据 hook `useMT5GroupByServerId` 被导入模板 hook 挤掉，因为名字相关度 2/5 < 2/4 → 加了"取数据的 hook 优先"。
+  - 另外 3 项是脚本问题：`[roots]` 提示行让 Get-Json 解析失败、合并模式要存库才去重、Django 第一条入口变成 `/admin/`。
+  - 我自己改文案时引入了两处变量重名，造成编译错误，已修。
+- **测试**：.NET 1081 个（Server 488 / Core 197 / TreeSitter 269 / Roslyn 102 / Cli 25），vitest 403 个。每个代理都把关键规则逐条还原，确认测试会变红（共 100 多处）。
+- **回归**：`scripts/regression.ps1` 17 个场景 75 项，全部通过。新增 20 项"反例："检查，即"不得出现"类：常驻服务不串容器、假边 / 假外部系统、异步命令不画成同步、列表查询不续接到批量写入、lambda 路由不共用符号、测试夹具不是容器等。
+- **面板实测**（新索引）：ccs-backend `RestartDataFeeds` 画成 验证（RestartMt4DataFeedsCommandValidator）→ 权限 → 审计 → RestartMt4DataFeedsHandler → MT4Proxy HTTP，并标出跳过 Approval。
+- **未做**（详见 audit 文档）：
+  - hook 只画页面用到的返回成员；
+  - Blazor .razor 进索引；
+  - `@/auth` 再导出；
+  - 分部类父符号；
+  - DSM 提交号入库；
+  - .NET 生成 gRPC 客户端续接；
+  - 默认扇出仍为 6。
+
+## 框架流程覆盖五种语言 + 请求流程里的管道 + SPA 页面入口 — 2026-10-16（下午）
+- 起因：
+  - 用户问"其它语言的也改过来了吗"，选了"一起做吧"。
+  - 做的过程中又指出（ccs-backend）："控制器调用 handler 之前有一道 validation 验证……没有任何地方体现出来"，"还有其他的可能是通过反射来的，不是直接引用"。
+- **分工**：主线先抽共用工具，在 FrameworkFlowBuilder 里加了 internal 的 `CallNode` / `Assemble` / `Empty` 等，以及新的阶段键；按容器 SubKind 分派；页面的入口占位和清单标题改成用服务端给的名字。然后五个代理并行，各写一个 `*FrameworkFlow.cs`，构建经全局锁脚本排队。
+- **各语言**（实测摘要）：
+  - **Spring**：
+    - spring-boot-realworld：Security 过滤器链里的 `JwtTokenFilter.doFilterInternal`（`addFilterBefore`）→ DispatcherServlet → 控制器 ×19；收尾有 `@Transactional` 和 `CustomizeExceptionHandler` 的 3 个 `@ExceptionHandler`。
+    - petclinic：`LocaleChangeInterceptor`。
+    - 微服务网关：CircuitBreaker → Retry → 各路由过滤器（读 yml）。
+  - **Go**：
+    - gin：`gin.Default()` 自带的 Logger / Recovery，以及只作用于 `/api` 组的 `AuthMiddleware`；Note 写清 `Use` 只对之后注册的路由生效。
+    - microservices-demo 前端：手工包装链按执行顺序 otelhttp → ensureSessionID → logHandler，`defer` 进收尾。
+  - **Python**：
+    - FastAPI：CORSMiddleware；依赖链 get_db（22 个路由）、get_current_user（17 个）、get_current_active_superuser（6 个，与源码里 6 处 `Depends` 一致）；yield 依赖的收尾。
+    - Django：MIDDLEWARE 8 项按列表顺序；DRF 的 JWTAuthentication；EXCEPTION_HANDLER 进收尾"出错时"。
+  - **Node**：
+    - Express：cors / bodyParser / 路由挂载树 / 四参数错误中间件。
+    - NestJS：3 个模块的 `AuthMiddleware`，带 forRoutes 摘要。
+    - 纯 gRPC 服务只给说明。
+  - **前端**：
+    - fastapi 模板（React + TanStack）：挂载前 `client.setConfig` → StrictMode → ThemeProvider → QueryClientProvider → `/_layout` 的登录守卫 → 页面 ×8 → 生成的客户端（axios）→ 收尾 `QueryCache.onError`（401 / 403 跳登录）。
+    - Next.js App Router：middleware、layout 链、error.tsx。
+- **请求流程里的管道**（`MessagePipeline.cs`；服务的入口流程、任意方法时序、CLI `arch --flow` / `query --flow` 都走它）：
+  - 每个 dispatch:M 前面插入这条消息生效的行为，按注册顺序（取自框架流程）。泛型约束和 Handle 开头的 `if (request is not IX) return await next()` 守卫（含代码块写法）不满足就跳过，原因写进标题下的 Note。
+  - 行为里 `IValidator<TRequest>` / `GetService(typeof(IRequestEnricher<TRequest>))` 一类依赖，按消息找声明为 `: AbstractValidator<M>` / `: IRequestEnricher<M>` 的类，挂在对应调用下面。
+  - 索引里验证器的继承边是 `AbstractValidator<T>`，类型实参丢了，必须读声明头文本。
+  - 事件 Handler 前面不插。
+  - ccs-backend `POST /api/v5/audit-logs/client-export`：
+    - 原来是"控制器 → Handler"两步，行为只在标题里按字母序列一行；
+    - 现在是 ValidationBehavior（`IValidator.ValidateAsync` 下挂 `LogClientExportCommandValidator`）→ Permission → Audit → ComparePreviewCaching → Handler；
+    - 标题下写"管道里跳过：ApprovalBehavior（LogClientExportCommand 没实现 IApprovable）"，对照源码：该命令只实现 ICommand / IRequiresPermission / IAuditable。
+  - `PATCH /api/v5/mt4/accounts/patch`：Approval 生效，`UpdateMt4AccountEnricher`（通过 GetService 反射拿到）挂在 ApprovalBehavior 下。
+- **顺带修掉**：
+  - SPA 页面入口：TanStack 文件路由、React Router 的 JSX（按嵌套拼路径）和对象写法，见 `EntryDiscovery.Spa.cs`。fastapi 模板前端从 0 个页面变成 8 个，`__root` / `_layout` 不算。
+    - 写的时候私有方法和 Go 的 `JoinRoute(params string[])` 重名，抢走了 Java / Node 的两参数调用，入口测试红了一片；已加 Spa 前缀。
+  - JSX 布局路由关闭时会把前面的同级页面一起作废；已改成每层只作废自己那一条。
+  - NestJS 示例没有 Dockerfile，不被当成容器；改成依赖服务端框架、且 package.json 有 start 脚本也算 node-service。
+  - 入口和容器在每次建索引后都会重算，不升索引版本。
+- **样本**：用户同意后克隆了 node-express-realworld、nestjs-realworld、spring-boot-realworld 三个公开仓库到 `D:\github\reference`，只解析不执行。
+- **测试**：
+  - .NET 922 个（Server 362 / Core 175 / TreeSitter 262 / Roslyn 98 / Cli 25），vitest 392 个。
+  - 新增：Spring 11（14 个用例）、Go 9、Python 11、Node 9、前端 8、MessagePipeline 3、SPA 入口 2（6 个用例）、Node 容器正反例。
+  - 关键规则逐条还原都会变红：各代理共 80 条（Go 11、Python 12、前端 9、Spring 14、Node 34），主线 MessagePipeline 4 条、SPA 2 条、start 脚本 1 条。
+- **回归**：`scripts/regression.ps1` 17 个场景 55 项，全部通过。
+  - 新增：各语言框架流程 10 项；场景 1 请求流程带管道；场景 8 SPA 页面入口与前端框架流程；场景 15–17 三个新样本。
+- **已知**：
+  - Go / Node 的路由级中间件（`r.GET(path, mw, h)`、`router.get('/x', auth, h)`）只在 Note 里计数。
+  - Django 的 `process_view` 画在各自中间件下，实际是全部中间件跑完才统一调用。
+  - FastAPI 只认创建 app 的那个文件里的注册。
+  - Next.js Pages Router 规则对任何 `pages/` 目录都生效，SPA 的 `src/pages/X.tsx` 会多出按文件名猜的页面（原有行为，没改）。
+  - 请求流程里管道行的列取 Handler 所在那一列。
+  - `D:\github\reference` 根目录有 6 个 10-15 留下的 0 字节 .cs 文件（EntryDiscovery.cs 等），没动。
+
+## 调用图改成时序 + 「管道」改成「框架流程」 — 2026-10-16
+- 起因：
+  - 用户的原话是："调用图……没有使用它的欲望"，以及"调用大纲看起来还可以，为什么调用图就这么拉跨"。
+  - 取证结果：旧网状图默认每层只挑 2 个分支，在抽样端点里有 65% 把业务调用藏掉了。
+  - 原因有三条：调用方的扣分；`new` 一个 DTO 和真正的调用同分；默认画出类型关系。
+  - 用户选了方案 A。
+- **调用图（方案 A）**：
+  - 新增 `GET /api/symbols/{id}/flow`：任意方法都能出时序图，和入口流程共用 `seqDiagram.ts`。
+  - 子节点按分数挑，但按源码位置排。接口只有一个实现时合成一步。
+  - 面板加了「时序 | 网状」切换。网状图的排序也改了：分派 +100、调用 +30、构造 −20、继承 / 实现 −25，去掉了调用方扣分；默认只画 calls 和 dispatches。
+  - 覆盖率指标：`arch --flow-coverage` 和 `scripts/flow-metric.py`。在 ccs-backend 上：
+    - 以 Handler 为根抽样 30 个，前 2 层业务调用全部命中（100%，旧网状图约 35%），平均召回 97.2%；
+    - 以下一层方法为根抽样 21 个，100%。
+- **框架流程**（替换原来的「管道」统计格子）：
+  - 用户的定义："从框架层面展示调用流程和从实际的请求调用时不一样"，范围是"从 HTTP 进来到收尾"。
+  - 新增 `GET /api/arch/framework?container=`、CLI `arch --framework`，页面是项目地图里的「容器 | 框架流程 | 命名空间」。
+  - 各阶段的取法：
+    - 中间件：`app.UseXxx` 的书写顺序；
+    - 控制器：占位行，点开是清单；
+    - 分派器：conduit 目标，自研分派器会展开实现；
+    - 行为链：按 DI / `AddOpenBehavior` 的注册顺序，`next()` 前是前置、后是后置；
+    - Handler：占位行，按模块列清单；
+    - 收尾：`next()` 之后的调用、工作单元提交、事件发布。
+  - 非 Web 容器把控制器占位换成"入口（常驻服务 / 任务 / 消息消费）"。
+  - 旧的 `PipelineBuilder` 统计、`/api/pipeline` 和 `PipelineTests` 已删，只留下共用的 `IsTest` 和 `CommonPrefix`。
+  - 第一屏不再恢复"上次点的视图"，按原规则走：只有一个容器时直接进入口流程，否则显示容器图。
+- **整合时发现并修掉**：
+  - eShop 的 `IdentifiedCommandHandler<T, R>` 有 8 个子类。它们自己不写 `Handle`，都落到基类方法上，Handler 清单里出现 8 行一模一样的"IdentifiedCommand"，展开 key 也撞了。
+    - 现在从子类声明里读基类的泛型实参代进去，显示成 `IdentifiedCommand<CancelOrderCommand, bool>`；读不到时显示"消息名（子类名）"。
+    - 补了测试，还原实现后确认会变红。
+  - `extension/` 下一个 296 MB 的 `.7z` 被打进了 VSIX（357 MB）。`.vscodeignore` 加了 `*.vsix / *.7z / *.zip`，VSIX 回到 62 MB。
+- **实测**：
+  - eShop Ordering.API：控制器 8 → 分派器 1（MediatR `ISender.Send`）→ 行为链 3（Logging → Validator → Transaction）→ Handler 28 → 收尾 4，收尾里有 `CommitTransactionAsync` 和 `PublishEventsThroughEventBusAsync`。浏览器里用真实服务端数据确认了占位展开和 Handler 清单。
+  - ccs-backend：中间件 → 控制器 → 自研分派器 → 行为链 5 个（顺序已知）→ Handler → 收尾。
+- **测试**：.NET 862 个（Server 302 / Core 175 / TreeSitter 262 / Roslyn 98 / Cli 25），vitest 392 个。
+- **回归**：`scripts/regression.ps1` 共 14 个场景 43 项，全部通过。新增的检查有：两项覆盖率、ccs 框架流程识别出分派器与行为链、eShop 三个行为按注册顺序且收尾有提交、时序图里接口与唯一实现合成一步。
+- **交付**：只打了 `extension/codeatlas-win32-x64-0.1.0.vsix`（62 MB）。
+- **已知**：框架流程只认 .NET 容器，其他语言只给一句说明。
 
 ## 影响范围 + 模块关系 + 快速跳转 — 2026-10-16
 - 起因：用户要的四个视角里，"一步步做了什么"已经用调用大纲做完，这次把另外三个也做了。三条要求依次是："继续把影响范围的反向树也做了"、"把模块关系那个视图也一起做了"、"快速跳转那个也一起做了"。
@@ -684,4 +835,3 @@ C# tree-sitter 精度，以 Roslyn 为答案，按（文件, 行）对齐 calls 
 - `TestPathPattern` 的 `Tests?\.cs$` 不区分大小写也不看单词边界，`Contests.cs` 会被当成测试文件；页面与服务端同一条规则，没改。
 - 行为链是否对某条消息生效取决于运行时 DI；闭合泛型的 Behavior（只对某类消息）与开放泛型分不开，全部按"对所有消息生效"显示。
 - 旧索引（版本 2）的工作区要全量重建一次才有 `di_registrations`；否则行为链显示"顺序未知"。
-

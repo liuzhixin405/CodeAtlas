@@ -7,7 +7,7 @@ public sealed record MapSymbol(long Id, SymbolKind Kind, string QualifiedName, s
 {
     /// <summary>
     /// 短名：模块取文件名（page.tsx）；其余去掉 external: 前缀与脚本限定名的 "路径:" 前缀（路径里的 (group)、[param]、扩展名的点
-    /// 不能参与切分），再去掉参数列表、泛型参数，取最后一段。
+    /// 不能参与切分），再取最后一个成员段（见 <see cref="MapBuilder.MemberName"/>：局部函数 Outer(int).Local() 取 Local，顶级语句 &lt;Main&gt;$ 取 Main）。
     /// </summary>
     public string Name
     {
@@ -17,10 +17,7 @@ public sealed record MapSymbol(long Id, SymbolKind Kind, string QualifiedName, s
             var q = QualifiedName.StartsWith("external:", StringComparison.Ordinal) ? QualifiedName["external:".Length..] : QualifiedName;
             var colon = q.IndexOf(':');
             if (colon > 0 && IsScriptPath(q[..colon])) q = q[(colon + 1)..];
-            var paren = q.IndexOf('(');
-            if (paren >= 0) q = q[..paren];
-            // 泛型参数可能在中间：Roslyn 给泛型类成员的限定名是 Ns.Repo<T>.Find，从第一个 < 截断会得到类名
-            return MapBuilder.LastSegment(MapBuilder.StripGenericArgs(q));
+            return MapBuilder.MemberName(q);
         }
     }
 
@@ -32,7 +29,9 @@ public sealed record MapSymbol(long Id, SymbolKind Kind, string QualifiedName, s
 }
 
 /// <param name="Via">边的来历：dispatches 的 handles / dispatch:T，calls 的 conduit / impl / render（JSX 渲染组件）；普通边为 null。命名空间地图不用，管道视图与流程用。</param>
-public sealed record MapEdge(long FromId, long ToId, EdgeKind Kind, double Confidence = 1.0, string? Via = null);
+/// <param name="Line">调用处的行（1 起；0 = 不知道）。流程按它与 <paramref name="Pos"/> 把选进来的分支排成源码顺序，其余视图不用。</param>
+/// <param name="Pos">调用处在文件里的 UTF-16 偏移（tree-sitter / Roslyn 都给；旧索引为 null）。</param>
+public sealed record MapEdge(long FromId, long ToId, EdgeKind Kind, double Confidence = 1.0, string? Via = null, int Line = 0, int? Pos = null);
 
 /// <param name="Key">分组键：命名空间（Acme.Api）、目录（src/app）或类型限定名。</param>
 /// <param name="HasChildren">还能往下钻（有子命名空间 / 子目录）。类型节点恒为 false。</param>
@@ -254,6 +253,75 @@ public static class MapBuilder
             else if (depth == 0) sb.Append(c);
         }
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// 限定名里最后一个成员段的名字（不带参数表、泛型参数）。只认括号 / 尖括号外面的 '.' 与 '/' 为分隔符：
+    /// <list type="bullet">
+    /// <item>C# 局部函数：Ns.T.Build(IReadOnlyList&lt;X&gt;, int).Reach(MapSymbol) → Reach（原来从第一个 '(' 截断，得到外层方法名 Build）；</item>
+    /// <item>参数表里的点不算：Ns.T.M(System.String) → M；泛型参数在中间：Ns.Repo&lt;T&gt;.Find(int) → Find；</item>
+    /// <item>编译器生成的名字 &lt;X&gt;$（顶级语句 Program.&lt;Main&gt;$）→ X；</item>
+    /// <item>Go 包目录（src/pkg/v1.2.F）、脚本名（Component.method）与原来一样取最后一段。</item>
+    /// </list>
+    /// </summary>
+    public static string MemberName(string q)
+    {
+        var start = 0;
+        var paren = 0;
+        var angle = 0;
+        for (var i = 0; i < q.Length; i++)
+        {
+            var c = q[i];
+            if (c == '(') paren++;
+            else if (c == ')') { if (paren > 0) paren--; }
+            // 段首的 < 是编译器生成名（<Main>$），不当泛型；operator < 之类后面没有配对的 >，也只会让后面的分隔符不算，不会切错
+            else if (c == '<' && i > start) angle++;
+            else if (c == '>' && angle > 0) angle--;
+            else if ((c == '.' || c == '/') && paren == 0 && angle == 0) start = i + 1;
+        }
+        var seg = q[start..];
+        if (seg.StartsWith('<') && seg.IndexOf('>') is var close and > 1) return seg[1..close];
+        var cut = seg.IndexOf('(');
+        if (cut >= 0) seg = seg[..cut];
+        // 运算符名里的 < > 不是泛型：operator <、operator >=
+        return seg.StartsWith("operator ", StringComparison.Ordinal) ? seg.TrimEnd() : StripGenericArgs(seg);
+    }
+
+    /// <summary>
+    /// 限定名里成员前面那一段（声明它的类型名）：Ns.Repo&lt;T&gt;.Find(int) → Repo；前一段是方法（局部函数 Outer(int).Local()）或没有前一段时 null。
+    /// 给父符号不是类型的方法补"类型."前缀用（分部类的方法有时挂在命名空间下）。
+    /// </summary>
+    public static string? DeclaringTypeSegment(string q)
+    {
+        var seps = new List<int>();
+        var paren = 0;
+        var angle = 0;
+        var start = 0;
+        for (var i = 0; i < q.Length; i++)
+        {
+            var c = q[i];
+            if (c == '(') paren++;
+            else if (c == ')') { if (paren > 0) paren--; }
+            else if (c == '<' && i > start) angle++;
+            else if (c == '>' && angle > 0) angle--;
+            else if (c == '.' && paren == 0 && angle == 0) { seps.Add(i); start = i + 1; }
+        }
+        if (seps.Count == 0) return null;
+        var from = seps.Count >= 2 ? seps[^2] + 1 : 0;
+        var seg = q[from..seps[^1]];
+        return seg.Length == 0 || seg.Contains('(') ? null : MemberName(seg);
+    }
+
+    /// <summary>C# 顶级语句（限定名最后一段是 &lt;Main&gt;$）的显示名 "Program.Main"；其余 null。</summary>
+    public static string? TopLevelLabel(string qualifiedName)
+    {
+        var at = qualifiedName.IndexOf("<Main>$", StringComparison.Ordinal);
+        if (at < 0) return null;
+        var rest = qualifiedName[(at + "<Main>$".Length)..];
+        if (rest.Length > 0 && rest[0] != '(') return null;
+        if (rest.Length > 0 && rest.IndexOf(')') is var close and >= 0 && close + 1 < rest.Length) return null; // 顶级语句里的局部函数
+        var owner = at > 1 && qualifiedName[at - 1] == '.' ? MemberName(qualifiedName[..(at - 1)]) : "Program";
+        return owner + ".Main";
     }
 
     internal static string LastSegment(string key)

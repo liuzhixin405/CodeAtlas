@@ -1,4 +1,4 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 
 namespace CodeAtlas.Core.Architecture.Rules;
 
@@ -13,22 +13,32 @@ public interface IDiscoveryRule
 /// <summary>包引用等不经代码就能确定的边：容器 → 外部系统，置信度 0.5。</summary>
 public sealed record DirectEdge(string ContainerKey, string ExternalKey, string Protocol, Evidence Evidence);
 
+/// <param name="Library">出口所在的共享库目录。</param>
+/// <param name="Usage">容器自己的代码里用到它的那一行（顺着库内调用往上找到的）；没找到为 null。</param>
+/// <param name="Token">用到的是库里的哪个方法 / 类型。</param>
+/// <param name="Certain">false = 本容器里没找到调用（可能经分派 / 反射），置信度降低。</param>
+public sealed record SharedLibraryUse(string Library, Evidence? Usage, string? Token, bool Certain);
+
 public sealed class RuleContext
 {
     // Go 的 x_test.go、Python 的 test_x.py / x_test.py / conftest.py 也是测试文件
     private static readonly Regex TestPath = new(@"(^|[/.])(tests?|__tests__|spec|specs)([/.]|$)|\.(test|spec)\.[tj]sx?$|Tests?\.cs$|_test\.go$|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private readonly Dictionary<string, string[]> _lines = new(StringComparer.Ordinal);
+    private readonly SourceTextCache _sources;
 
     public ProjectInventory Inventory { get; }
     public IReadOnlyList<ArchNode> Containers { get; }
     public List<Outbound> Outbound { get; } = [];
     public List<DirectEdge> DirectEdges { get; } = [];
     public Dictionary<string, ArchNode> Externals { get; } = new(StringComparer.Ordinal);
+    /// <summary>出口在共享库的文件里时，该容器怎么用到它（<see cref="SharedLibraryAttribution"/> 填）；EdgeMatcher 据此改证据说明与置信度。</summary>
+    public Dictionary<Outbound, SharedLibraryUse> SharedUses { get; } = [];
 
-    public RuleContext(ProjectInventory inventory, IReadOnlyList<ArchNode> containers)
+    /// <param name="sources">源码行缓存；不给就自建一个（按需逐个读）。</param>
+    public RuleContext(ProjectInventory inventory, IReadOnlyList<ArchNode> containers, SourceTextCache? sources = null)
     {
         Inventory = inventory;
         Containers = containers;
+        _sources = sources ?? new SourceTextCache(inventory.Root);
     }
 
     public static bool IsTestFile(string rel) => TestPath.IsMatch(rel);
@@ -58,19 +68,11 @@ public sealed class RuleContext
     /// <summary>C# 源码文件，排除测试文件与 obj/bin（清单已排除目录）。</summary>
     public IEnumerable<string> CSharpFiles() => Inventory.SourceFiles.Where(f => f.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) && !IsTestFile(f));
 
-    /// <summary>某扩展名的源码文件（如 ".go"、".py"），排除测试文件与 protoc 生成的桩代码。</summary>
+    /// <summary>某扩展名的源码文件（如 ".go"、".py"），排除测试文件与生成代码（文件名约定或文件头的生成标记）。</summary>
     public IEnumerable<string> SourceFilesOf(string extension) =>
-        Inventory.SourceFiles.Where(f => f.EndsWith(extension, StringComparison.OrdinalIgnoreCase) && !IsTestFile(f) && !ProjectInventory.IsGeneratedSource(f));
+        Inventory.SourceFiles.Where(f => f.EndsWith(extension, StringComparison.OrdinalIgnoreCase) && !IsTestFile(f) && !ProjectInventory.IsGeneratedSource(f, Lines(f)));
 
-    public string[] Lines(string rel)
-    {
-        if (_lines.TryGetValue(rel, out var cached)) return cached;
-        string[] lines;
-        try { lines = File.ReadAllLines(Inventory.Absolute(rel)); }
-        catch (IOException) { lines = []; }
-        catch (UnauthorizedAccessException) { lines = []; }
-        return _lines[rel] = lines;
-    }
+    public string[] Lines(string rel) => _sources.Lines(rel);
 
     /// <summary>登记（或取回）一个外部系统节点。key = external:{subkind}:{slug}。</summary>
     public string External(string subKind, string name, Evidence evidence)

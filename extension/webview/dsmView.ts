@@ -1,10 +1,15 @@
-import type { DsmCellDto, DsmComponentDto, DsmCouplingDto, DsmDto, DsmRuleDto } from "./types";
+import type { DsmCellDto, DsmComponentDto, DsmCouplingDto, DsmDto, DsmHotDto, DsmRuleDto } from "./types";
 
 /** 格子着色分档：按与最大值的比例分 4 档，0 不画。 */
 export function bucket(count: number, max: number): 0 | 1 | 2 | 3 | 4 {
   if (count <= 0 || max <= 0) return 0;
   const r = count / max;
   return r > 0.75 ? 4 : r > 0.5 ? 3 : r > 0.25 ? 2 : 1;
+}
+
+/** 组件的修订数文案：有去重后的提交数写"N 次提交"，没有写"文件修订合计 N"（同一次提交改了几个文件算几次）。 */
+export function hotRevisionsText(hot: DsmHotDto): string {
+  return hot.commits !== undefined && hot.commits !== null ? `${hot.commits} 次提交` : `文件修订合计 ${hot.revisions}`;
 }
 
 /** 热度分档：按修订数相对最大值。 */
@@ -190,7 +195,7 @@ export class DsmView {
       th.className = "row" + (model.cycleSccs.has(comp.scc) ? " cycle" : "") + (comp.hasChildren ? " drill" : "");
       const heatLevel = heat(comp.hot?.revisions ?? 0, model.maxRevisions);
       th.innerHTML = `<span class="idx">${r + 1}</span><span class="name" title="${esc(comp.key)}">${esc(comp.label)}</span><span class="count">${comp.symbols}</span>` +
-        (comp.hot ? `<span class="heat h${heatLevel}" title="修订 ${comp.hot.revisions} 次，最近 ${comp.hot.lastCommit}"></span>` : "");
+        (comp.hot ? `<span class="heat h${heatLevel}" title="${hotRevisionsText(comp.hot)}，最近 ${comp.hot.lastCommit}"></span>` : "");
       th.onclick = () => this.cb.onComponentSelect(comp);
       th.ondblclick = () => this.cb.onComponentDoubleClick(comp);
       tr.appendChild(th);

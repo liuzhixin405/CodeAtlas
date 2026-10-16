@@ -6,9 +6,10 @@ namespace CodeAtlas.Indexing.TreeSitter.Adapters;
 /// <summary>
 /// TS / TSX / JS 共用：可见性（export / export default，CommonJS 的 module.exports / exports.f）、默认导出的标记、
 /// import 与 require 绑定表、类的带类型成员与父类，以及给每条引用补上 <see cref="ScriptBinding"/>（名字或接收者来自哪条 import、
-/// 接收者是什么类型），解析器据此按模块解析而不是按名字猜。JSX 的 on 开头属性里传出去的处理函数标 via = "event"。
+/// 接收者是什么类型），解析器据此按模块解析而不是按名字猜。JSX 的 on 开头属性里传出去的处理函数标 via = "event"；
+/// 作为实参 / 实参对象属性值传出去的函数标 via = "callback"；函数的返回值形态记 via = "returns"（见 ScriptAdapterBase.Inference.cs）。
 /// </summary>
-public abstract class ScriptAdapterBase(string languageId, string grammarName, IReadOnlyList<string> extensions, string definitionsQuery, string referencesQuery)
+public abstract partial class ScriptAdapterBase(string languageId, string grammarName, IReadOnlyList<string> extensions, string definitionsQuery, string referencesQuery)
     : LanguageAdapterBase(languageId, grammarName, extensions, definitionsQuery, referencesQuery)
 {
     public const string ExportDefault = "export default";
@@ -16,13 +17,16 @@ public abstract class ScriptAdapterBase(string languageId, string grammarName, I
 
     /// <summary>
     /// 本文件的绑定：本地名 → (模块说明符, 导出名)，导出名是 "default"、"*" 或具名导出的原名；
-    /// Classes 按类节点起点索引：带类型的成员（字段 / 构造参数属性 → 类型名）与父类名。
+    /// Classes 按类节点起点索引：推得出形态的成员与父类名；Shapes 是形态推断用的作用域缓存。
     /// </summary>
-    internal sealed record ImportBindings(Dictionary<string, (string Source, string Imported)> ByLocal, Dictionary<int, ClassInfo> Classes);
+    internal sealed record ImportBindings(Dictionary<string, (string Source, string Imported)> ByLocal, Dictionary<int, ClassInfo> Classes, ShapeState Shapes);
 
-    /// <param name="FieldTypes">this.x 的 x → 类型名（本文件里写的名字，可能是 import 的别名）。</param>
+    /// <param name="FieldShapes">this.x 的 x → 形态：类型标注（本文件里写的名字，可能是 import 的别名）、构造参数属性的类型、初始值（new Map()、new Svc()）。</param>
     /// <param name="BaseName">extends 的父类名（标识符）；没有或是成员表达式（React.Component）为 null。</param>
-    internal sealed record ClassInfo(Dictionary<string, string> FieldTypes, string? BaseName);
+    internal sealed record ClassInfo(Dictionary<string, ValueShape> FieldShapes, string? BaseName);
+
+    /// <summary>PrepareFile 的结果留给 <see cref="CompleteFile"/>（同一次 Parse 里、同一线程上同步调用）。</summary>
+    [ThreadStatic] private static ImportBindings? _currentBindings;
 
     protected override string? ExtractVisibility(Node definition) => ScriptVisibility(definition);
 
@@ -292,15 +296,32 @@ public abstract class ScriptAdapterBase(string languageId, string grammarName, I
             }
         }
         var classes = new Dictionary<int, ClassInfo>();
-        Scan(root, byLocal, classes, 0);
-        return new ImportBindings(byLocal, classes);
+        var shapes = new ShapeState(byLocal);
+        CollectDeclaredTypes(root, shapes, 0);
+        Scan(root, byLocal, classes, shapes, 0);
+        var bindings = new ImportBindings(byLocal, classes, shapes);
+        _currentBindings = bindings;
+        return bindings;
+    }
+
+    /// <summary>引用收齐后补三类引用：同一行同名、接收者不同的成员调用，传出去的回调（via = callback），函数的返回值提示（via = returns）。</summary>
+    protected override ParsedFile CompleteFile(Node root, ParsedFile file)
+    {
+        var bindings = _currentBindings;
+        _currentBindings = null;
+        if (bindings is null) return file;
+        var extra = new List<ParsedReference>();
+        CollectSameLineMemberCalls(root, file, bindings, extra);
+        CollectCallbackReferences(root, file, bindings, extra);
+        CollectReturnHints(root, file, bindings, extra);
+        return extra.Count == 0 ? file : file with { References = [.. file.References, .. extra] };
     }
 
     /// <summary>
     /// 全文件找 require 绑定（可能写在函数里、if 里）与类。不进 JSX、字符串、类型标注这类不会有它们的子树。
     /// require 的绑定不覆盖同名的 ES import。
     /// </summary>
-    private static void Scan(Node node, Dictionary<string, (string, string)> byLocal, Dictionary<int, ClassInfo> classes, int depth)
+    private static void Scan(Node node, Dictionary<string, (string, string)> byLocal, Dictionary<int, ClassInfo> classes, ShapeState shapes, int depth)
     {
         if (depth > 256) return;
         foreach (var child in node.NamedChildren)
@@ -314,10 +335,10 @@ public abstract class ScriptAdapterBase(string languageId, string grammarName, I
                     CollectRequire(child, byLocal);
                     break;
                 case "class_declaration" or "abstract_class_declaration" or "class":
-                    classes[child.StartIndex] = ClassInfoOf(child);
+                    classes[child.StartIndex] = ClassInfoOf(child, shapes);
                     break;
             }
-            Scan(child, byLocal, classes, depth + 1);
+            Scan(child, byLocal, classes, shapes, depth + 1);
         }
     }
 
@@ -365,12 +386,12 @@ public abstract class ScriptAdapterBase(string languageId, string grammarName, I
     }
 
     /// <summary>
-    /// 类的带类型成员：带类型标注的字段、构造参数属性（constructor(private readonly svc: T)），
-    /// 以及构造函数体里 this.x = 带类型的参数；再加 extends 的父类名。
+    /// 类的成员形态：带类型标注的字段、带初始值的字段（cache = new Map()）、构造参数属性（constructor(private readonly svc: T)），
+    /// 以及构造函数体里 this.x = 带类型的参数 / new X()；再加 extends 的父类名。
     /// </summary>
-    private static ClassInfo ClassInfoOf(Node classNode)
+    private static ClassInfo ClassInfoOf(Node classNode, ShapeState shapes)
     {
-        var fields = new Dictionary<string, string>(StringComparer.Ordinal);
+        var fields = new Dictionary<string, ValueShape>(StringComparer.Ordinal);
         string? baseName = null;
         foreach (var child in classNode.NamedChildren)
         {
@@ -388,55 +409,47 @@ public abstract class ScriptAdapterBase(string languageId, string grammarName, I
             if (child.Type != "class_body") continue;
             foreach (var member in child.NamedChildren)
             {
-                if (member.Type == "public_field_definition")
+                if (member.Type is "public_field_definition" or "field_definition")
                 {
-                    if (member.GetChildForField("name") is { Type: "property_identifier" } n && TypeNameOf(member.GetChildForField("type")) is { } t)
-                        fields[n.Text] = t;
+                    var n = member.GetChildForField("name") ?? member.GetChildForField("property");
+                    if (n is not { Type: "property_identifier" or "private_property_identifier" }) continue;
+                    var shape = ShapeOfType(member.GetChildForField("type"), shapes)
+                                ?? (member.GetChildForField("value") is { } v && v.Type is not ("arrow_function" or "function_expression") ? ShapeOfExpr(v, shapes, 0) : null);
+                    if (shape is not null) fields[n.Text] = shape;
                 }
                 else if (member.Type == "method_definition" && member.GetChildForField("name") is { Text: "constructor" })
-                    CollectConstructorFields(member, fields);
+                    CollectConstructorFields(member, fields, shapes);
             }
         }
         return new ClassInfo(fields, baseName);
     }
 
-    private static void CollectConstructorFields(Node constructor, Dictionary<string, string> fields)
+    private static void CollectConstructorFields(Node constructor, Dictionary<string, ValueShape> fields, ShapeState shapes)
     {
-        var typedParams = new Dictionary<string, string>(StringComparer.Ordinal);
+        var typedParams = new Dictionary<string, ValueShape>(StringComparer.Ordinal);
         if (constructor.GetChildForField("parameters") is { } parameters)
         {
             foreach (var p in parameters.NamedChildren)
             {
                 if (p.Type is not ("required_parameter" or "optional_parameter")) continue;
-                if (p.GetChildForField("pattern") is not { Type: "identifier" } pattern || TypeNameOf(p.GetChildForField("type")) is not { } type) continue;
+                if (p.GetChildForField("pattern") is not { Type: "identifier" } pattern || ShapeOfType(p.GetChildForField("type"), shapes) is not { } type) continue;
                 typedParams[pattern.Text] = type;
                 if (p.Children.Any(c => c.Type is "accessibility_modifier" or "readonly")) fields[pattern.Text] = type;
             }
         }
-        if (typedParams.Count == 0 || constructor.GetChildForField("body") is not { } body) return;
-        // this.svc = svc;
+        if (constructor.GetChildForField("body") is not { } body) return;
+        // this.svc = svc; this.cache = new Map();
         foreach (var stmt in body.NamedChildren)
         {
             if (stmt.Type != "expression_statement" || stmt.NamedChildren.FirstOrDefault() is not { Type: "assignment_expression" } assignment) continue;
-            if (assignment.GetChildForField("left") is { Type: "member_expression" } left
-                && left.GetChildForField("object") is { Type: "this" }
-                && left.GetChildForField("property") is { } property
-                && assignment.GetChildForField("right") is { Type: "identifier" } right
-                && typedParams.TryGetValue(right.Text, out var t))
-                fields.TryAdd(property.Text, t);
+            if (assignment.GetChildForField("left") is not { Type: "member_expression" } left
+                || left.GetChildForField("object") is not { Type: "this" }
+                || left.GetChildForField("property") is not { } property
+                || assignment.GetChildForField("right") is not { } right) continue;
+            var shape = right.Type == "identifier" && typedParams.TryGetValue(right.Text, out var t) ? t
+                : right.Type is "new_expression" or "array" or "object" ? ShapeOfExpr(right, shapes, 0) : null;
+            if (shape is not null) fields.TryAdd(property.Text, shape);
         }
-    }
-
-    /// <summary>type_annotation 里的类型名：T 或 T&lt;…&gt;；其他形态（联合、A.B、数组、内置类型）返回 null。</summary>
-    private static string? TypeNameOf(Node? annotation)
-    {
-        var type = annotation?.NamedChildren.FirstOrDefault();
-        return type?.Type switch
-        {
-            "type_identifier" => type.Text,
-            "generic_type" => type.GetChildForField("name") is { Type: "type_identifier" } n ? n.Text : null,
-            _ => null,
-        };
     }
 
     private static string? StringValue(Node? node)
@@ -583,13 +596,16 @@ public abstract class ScriptAdapterBase(string languageId, string grammarName, I
         if (node.Parent is { Type: "member_expression" } member && member.GetChildForField("property") == node)
         {
             var receiver = member.GetChildForField("object");
+            // 接收者推得出形态（内建对象、带类型的变量、new 出来的实例、函数的返回值……）就带上，推不出是 Other
             var binding = receiver?.Type switch
             {
+                null => new ScriptBinding(ScriptReceiver.Other),
                 "this" or "super" => ThisBinding(node, bindings),
-                "identifier" when bindings.ByLocal.TryGetValue(receiver.Text, out var b) => new ScriptBinding(ScriptReceiver.Import, b.Source, b.Imported),
+                "identifier" when bindings.ByLocal.TryGetValue(receiver.Text, out var b) && IsImportedName(receiver, receiver.Text, bindings.Shapes)
+                    => new ScriptBinding(ScriptReceiver.Import, b.Source, b.Imported),
                 "member_expression" => FieldBinding(receiver, bindings) ?? new ScriptBinding(ScriptReceiver.Other),
                 "call_expression" when RequireSource(receiver) is { } source => new ScriptBinding(ScriptReceiver.Import, source, "default"), // require('m').f()
-                _ => new ScriptBinding(ScriptReceiver.Other),
+                _ => ReceiverBinding(receiver, bindings) ?? new ScriptBinding(ScriptReceiver.Other),
             };
             return reference with { Script = binding, Via = via };
         }
@@ -625,14 +641,12 @@ public abstract class ScriptAdapterBase(string languageId, string grammarName, I
             : new ScriptBinding(ScriptReceiver.This, null, baseName);
     }
 
-    /// <summary>this.svc.x()：svc 是本类带类型的成员时给出类型的绑定。</summary>
+    /// <summary>this.svc.x()：svc 是本类推得出形态的成员时给出绑定（类型 → Typed，new Map() 这类 → 内建）。</summary>
     private static ScriptBinding? FieldBinding(Node receiver, ImportBindings bindings)
     {
-        if (receiver.GetChildForField("object") is not { Type: "this" } || receiver.GetChildForField("property") is not { Type: "property_identifier" } field) return null;
-        if (EnclosingClass(receiver, bindings) is not { } info || !info.FieldTypes.TryGetValue(field.Text, out var type)) return null;
-        return bindings.ByLocal.TryGetValue(type, out var b)
-            ? new ScriptBinding(ScriptReceiver.Typed, b.Source, b.Imported)
-            : new ScriptBinding(ScriptReceiver.Typed, null, type);
+        if (receiver.GetChildForField("object") is not { Type: "this" } || receiver.GetChildForField("property") is not { Type: "property_identifier" or "private_property_identifier" } field) return null;
+        if (EnclosingClass(receiver, bindings) is not { } info || !info.FieldShapes.TryGetValue(field.Text, out var shape)) return null;
+        return BindingFor(shape, bindings.Shapes);
     }
 
     private static ClassInfo? EnclosingClass(Node node, ImportBindings bindings)

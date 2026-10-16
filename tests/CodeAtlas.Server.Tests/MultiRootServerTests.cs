@@ -64,6 +64,24 @@ public sealed class MultiRootServerTests : IDisposable
     }
 
     [Fact]
+    public async Task SymbolFlow_NonEntryFrontendFunction_HopsIntoTheBackend_EntryGivesTheSameFlowAsArchFlow()
+    {
+        using var s = NewService();
+        await Index(s, full: true);
+        var entry = Assert.Single(s.Entries("../other/Other.Api", "http", null));
+        Assert.Equal(System.Text.Json.JsonSerializer.Serialize(s.Flow(entry.SymbolId, null)), System.Text.Json.JsonSerializer.Serialize(s.SymbolFlow(entry.SymbolId, null)));
+
+        // boot() 不是入口，但在前端容器里：fetch('/api/hello') 对上了后端路由，照样续接进控制器
+        var boot = s.Search("boot", 5).Single(x => x.QualifiedName == "src/app.ts:boot");
+        Assert.Null(s.Flow(boot.Id, null));
+        var f = s.SymbolFlow(boot.Id, null)!;
+        Assert.Equal(("main-ui", "boot", (string?)null), (f.ContainerKey, f.EntryLabel, f.Route));
+        var hop = Assert.Single(f.Root.Children, c => c.Kind == "hop");
+        Assert.Equal(("HTTP /api/hello", "src/app.ts", (int?)1), (hop.Label, hop.Path, hop.Line));
+        Assert.Equal("HelloController.Get", Assert.Single(hop.Children).Label);
+    }
+
+    [Fact]
     public async Task SecondIncrementalRun_KeepsExternalFiles()
     {
         using var s = NewService();

@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 
 namespace CodeAtlas.Core.Architecture.Rules;
@@ -9,7 +9,9 @@ public sealed record TsResolution(string? Value, string? Failure);
 /// <summary>
 /// TS / JS 常量解析：跟着 import 找到定义文件（tsconfig.json 的 paths 别名、相对路径、目录的 index.ts、export * 桶文件），
 /// 求值顶层 / 局部 const 的初始化表达式——字符串、模板字符串、+ 拼接、嵌套对象字面量（含 as const）、箭头函数成员（参数保留成 ${参数}）。
-/// 只做静态文本层面的求值：函数体、运算符、new、动态下标都不求值，给出失败原因。每个文件只分词一次，声明的求值结果缓存。
+/// 取值不止一个的写法给出"多个取值"（<see cref="Alternatives"/>）：三元 c ? A : B、常量表的动态下标 TABLE[key].x（对表里每一项求值）、
+/// 花括号函数体里的 return（switch 各分支、if 里的 return；null / undefined 分支算"没有地址"不计入）。分支里有一个解析不了就整体失败，不挑能解析的那半。
+/// 只做静态文本层面的求值：运算符、new、函数体里的其他语句都不求值，给出失败原因。每个文件只分词一次，声明的求值结果缓存。
 /// </summary>
 public sealed class TsConstantResolver
 {
@@ -73,6 +75,16 @@ public sealed class TsConstantResolver
 
     // ───────────── 给规则用的内部接口 ─────────────
 
+    /// <summary>并行读入并切好词（规则随后逐个取）。单线程逐个读的话，Windows 上每次打开文件的扫描开销会占大头。</summary>
+    internal void Preload(IEnumerable<string> files)
+    {
+        var todo = files.Where(f => !_modules.ContainsKey(f)).Distinct(StringComparer.Ordinal).ToList();
+        var loaded = new TsModule?[todo.Count];
+        Parallel.For(0, todo.Count, new ParallelOptions { MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 4, 16) },
+            i => loaded[i] = _read(todo[i]) is { } text ? new TsModule(todo[i], text) : null);
+        for (var i = 0; i < todo.Count; i++) _modules[todo[i]] = loaded[i];
+    }
+
     internal TsModule? Module(string file)
     {
         if (_modules.TryGetValue(file, out var cached)) return cached;
@@ -98,8 +110,29 @@ public sealed class TsConstantResolver
         VFail f => new TsResolution(null, f.Reason),
         VObj => new TsResolution(null, "不是字符串: 对象字面量"),
         VFn => new TsResolution(null, "不是字符串: 函数"),
+        VAlt a => new TsResolution(null, "多个取值: " + string.Join(" | ", a.Items.Select(x => x is VStr s ? s.Value : "…"))),
         _ => new TsResolution(null, "不是字符串: 模块"),
     };
+
+    /// <summary>值的全部字符串取值：单个字符串 → 一项；多个取值且每项都是字符串 → 各项（去重、保序）；其余 → null。</summary>
+    internal static IReadOnlyList<string>? Alternatives(TsVal v) => v switch
+    {
+        VStr s => [s.Value],
+        VAlt a when a.Items.All(x => x is VStr) => a.Items.Select(x => ((VStr)x).Value).Distinct(StringComparer.Ordinal).ToList(),
+        _ => null,
+    };
+
+    /// <summary>在 file 的末尾求值，返回全部字符串取值（见 <see cref="Alternatives"/>）；求值失败或不是字符串 → null。</summary>
+    public IReadOnlyList<string>? ResolveAlternatives(string file, string expression)
+    {
+        var m = Module(file);
+        if (m is null) return null;
+        var tokens = TsLexer.Tokenize(expression);
+        var parser = new TsParser(tokens, expression, int.MaxValue / 2);
+        var i = 0;
+        var expr = parser.ParseExpression(ref i);
+        return i < tokens.Count ? null : Alternatives(Eval(m, expr, EmptyParams, 0));
+    }
 
     /// <summary>名字在 offset 处可见的声明（最近的前一个；没有就用顶层的）的初始化表达式起点；函数声明返回 -1 号 token。</summary>
     internal TsDecl? FindDecl(TsModule m, string name, int offset)
@@ -171,8 +204,64 @@ public sealed class TsConstantResolver
                 return new VStr(sb.ToString());
             }
             case RefE r: return EvalRef(m, r, ps, depth);
+            case CondE c: return Combine([c.Then, c.Else], m, ps, depth, "运算 ?");
+            case RetE r: return Combine(r.Returns, m, ps, depth, "没有返回值");
+            case IdxE x: return EvalIndex(m, x, ps, depth);
             default: return new VFail("无法解析");
         }
+    }
+
+    private const int MaxAlternatives = 8;
+
+    /// <summary>
+    /// 几个分支的取值合起来：null / undefined 分支不计入；有一个分支失败就整体失败（原因取 failure，分支自己的原因更具体时用它）；
+    /// 全部是同一个字符串 → 这个字符串；否则多个取值（超过 <see cref="MaxAlternatives"/> 个不展开）。
+    /// </summary>
+    private TsVal Combine(IEnumerable<TsExpr> branches, TsModule m, IReadOnlySet<string> ps, int depth, string failure)
+    {
+        var items = new List<TsVal>();
+        foreach (var b in branches)
+        {
+            if (TsParser.IsAbsent(b)) continue;
+            var v = Eval(m, b, ps, depth + 1);
+            if (v is VFail f) return b is UnkE ? new VFail(failure) : f;
+            if (v is VAlt a) items.AddRange(a.Items); else items.Add(v);
+        }
+        return Alt(items, failure);
+    }
+
+    private static TsVal Alt(List<TsVal> items, string failure)
+    {
+        if (items.Count == 0) return new VFail(failure);
+        if (items.All(x => x is VStr))
+        {
+            var strings = items.Select(x => ((VStr)x).Value).Distinct(StringComparer.Ordinal).ToList();
+            if (strings.Count == 1) return new VStr(strings[0]);
+            items = strings.Select(s => (TsVal)new VStr(s)).ToList();
+        }
+        if (items.Count == 1) return items[0];
+        return items.Count > MaxAlternatives ? new VFail($"取值过多（{items.Count} 个）") : new VAlt(items);
+    }
+
+    /// <summary>TABLE[key].a.b：TABLE 是对象字面量时对每一项取 .a.b，合成多个取值；TABLE 不是对象、带展开（...）或某项取不到 → 动态下标失败。</summary>
+    private TsVal EvalIndex(TsModule m, IdxE x, IReadOnlySet<string> ps, int depth)
+    {
+        var fail = new VFail("动态下标: " + x.Raw);
+        var owner = Eval(m, x.Base, ps, depth + 1);
+        if (owner is not VObj obj || obj.Obj.Spreads.Count > 0 || obj.Obj.Members.Count == 0) return fail;
+        var items = new List<TsVal>();
+        foreach (var member in obj.Obj.Members.Values)
+        {
+            TsVal? cur = Eval(obj.Module, member, EmptyParams, depth + 1);
+            foreach (var key in x.Rest)
+            {
+                if (cur is null or VFail) break;
+                cur = Member(cur, key, depth + 1);
+            }
+            if (cur is null or VFail or VAlt) return fail;
+            items.Add(cur);
+        }
+        return Alt(items, fail.Reason);
     }
 
     private TsVal EvalRef(TsModule m, RefE r, IReadOnlySet<string> ps, int depth)
@@ -192,7 +281,9 @@ public sealed class TsConstantResolver
         {
             var inner = new HashSet<string>(ps);
             inner.UnionWith(fn.Fn.Params);
-            return Eval(fn.Module, body, inner, depth + 1);
+            var result = Eval(fn.Module, body, inner, depth + 1);
+            // 花括号函数体：return 里有解析不了的就还是"函数调用"（不把函数体内部的原因冒出来）
+            return body is RetE && result is VFail ? new VFail("函数调用: " + r.Raw) : result;
         }
         return new VFail("函数调用: " + r.Raw);
     }
@@ -215,6 +306,18 @@ public sealed class TsConstantResolver
             case VMod mod:
                 var v = ExportLookup(mod.Module, key, depth + 1);
                 return v is VFail f && f.Reason.StartsWith("未定义: ", StringComparison.Ordinal) ? null : v;
+            case VAlt alt:
+            {
+                // 多个取值（meta = TABLE[format]）再取成员 meta.endpoint：每一项都取，有一项没有这个成员就算没有
+                var items = new List<TsVal>();
+                foreach (var item in alt.Items)
+                {
+                    var hit = Member(item, key, depth + 1);
+                    if (hit is null or VFail) return hit;
+                    items.Add(hit);
+                }
+                return Alt(items, "没有成员: " + key);
+            }
             default:
                 return null;
         }
@@ -260,7 +363,8 @@ public sealed class TsConstantResolver
 
     private TsVal DeclValue(TsModule m, TsDecl d, int depth)
     {
-        if (d.TokenIndex < 0) return new VFn(m, new FnE([], null, d.Offset)); // function name() { … } / class Name { … }
+        if (d.TokenIndex < 0) // function name() { … }：求值 return；class Name { … } 不求值
+            return new VFn(m, m.IsIdent(d.NameIndex - 1, "function") ? new TsParser(m.Tokens, m.Text, 0).FunctionDeclaration(d.NameIndex) : new FnE([], null, d.Offset));
         var key = (m.File, d.TokenIndex);
         if (_declValues.TryGetValue(key, out var cached)) return cached;
         if (!_evaluating.Add(key)) return new VFail("循环引用: " + d.Name);
@@ -396,6 +500,8 @@ internal sealed record VObj(TsModule Module, ObjE Obj) : TsVal;
 internal sealed record VFn(TsModule Module, FnE Fn) : TsVal;
 internal sealed record VMod(TsModule Module) : TsVal;
 internal sealed record VFail(string Reason) : TsVal;
+/// <summary>多个取值（2 ~ 8 项，字符串已去重）：三元、常量表的动态下标、函数体的多个 return。</summary>
+internal sealed record VAlt(IReadOnlyList<TsVal> Items) : TsVal;
 
 // ───────────── 模块：分词结果 + import / 再导出 / 声明表 ─────────────
 
@@ -755,9 +861,15 @@ internal sealed record CatE(IReadOnlyList<TsExpr> Items, IReadOnlyList<string> R
 /// <param name="Called">链的最后是一次调用 a.b(…)；实参不求值。</param>
 internal sealed record RefE(IReadOnlyList<string> Path, bool Called, string Raw, int Offset) : TsExpr(Offset);
 internal sealed record ObjE(IReadOnlyDictionary<string, TsExpr> Members, IReadOnlyList<TsExpr> Spreads, int Offset) : TsExpr(Offset);
-/// <param name="Body">表达式体；null = 花括号函数体（不求值）。</param>
+/// <param name="Body">表达式体；花括号函数体是 <see cref="RetE"/>（它的 return）；null = 没有 return 的函数体或方法（不求值）。</param>
 internal sealed record FnE(IReadOnlyList<string> Params, TsExpr? Body, int Offset) : TsExpr(Offset);
 internal sealed record UnkE(string Reason, int Offset) : TsExpr(Offset);
+/// <summary>c ? Then : Else（条件不求值）。</summary>
+internal sealed record CondE(TsExpr Then, TsExpr Else, int Offset) : TsExpr(Offset);
+/// <summary>花括号函数体里属于它自己的 return 表达式（嵌套函数里的不算；空 return 记成 undefined）。</summary>
+internal sealed record RetE(IReadOnlyList<TsExpr> Returns, int Offset) : TsExpr(Offset);
+/// <summary>Base[动态键].Rest…：Base 是不带调用的引用。</summary>
+internal sealed record IdxE(RefE Base, IReadOnlyList<string> Rest, string Raw, int Offset) : TsExpr(Offset);
 
 /// <summary>TS 表达式子集的递归下降解析：遇到认不出的结构给 UnkE 并跳到同层的结束符，不抛异常。</summary>
 internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias)
@@ -765,10 +877,19 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
     private static readonly HashSet<string> Terminators = [",", ")", "]", "}", ";"];
     private static readonly HashSet<string> BinaryOps = ["||", "??", "&&", "?", "-", "*", "/", "%", "==", "===", "!=", "!==", "<", ">", "|", "&", "**"];
 
-    private bool IsPunct(int i, string p) => i < tokens.Count && tokens[i].Kind == TsTokKind.Punct && tokens[i].Text == p;
-    private bool IsIdent(int i, string? name = null) => i < tokens.Count && tokens[i].Kind == TsTokKind.Ident && (name is null || tokens[i].Text == name);
+    private static readonly HashSet<string> BlockKeywords = ["if", "for", "while", "switch", "catch", "with"];
+    private const int MaxReturns = 16;
+
+    // >0：正在解析三元的分支，跳过时同层的 ":" 也算结束（分支到此为止）
+    private int _ternary;
+
+    private bool IsPunct(int i, string p) => i >= 0 && i < tokens.Count && tokens[i].Kind == TsTokKind.Punct && tokens[i].Text == p;
+    private bool IsIdent(int i, string? name = null) => i >= 0 && i < tokens.Count && tokens[i].Kind == TsTokKind.Ident && (name is null || tokens[i].Text == name);
     private int Off(int i) => (i < tokens.Count ? tokens[i].Offset : text.Length) + offsetBias;
     private string Raw(int from, int to) => from >= to || to > tokens.Count ? "" : text[tokens[from].Offset..tokens[to - 1].End].Trim();
+
+    /// <summary>null / undefined 字面量：三元、return 里表示"没有地址"的分支。</summary>
+    public static bool IsAbsent(TsExpr e) => e is UnkE { Reason: "不是常量: null" or "不是常量: undefined" };
 
     public TsExpr ParseExpression(ref int i)
     {
@@ -782,13 +903,141 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
             items.Add(ParseUnary(ref i));
             raws.Add(Raw(s, i));
         }
+        if (IsPunct(i, "?")) return Ternary(ref i, start);
         if (i < tokens.Count && ((tokens[i].Kind == TsTokKind.Punct && BinaryOps.Contains(tokens[i].Text)) || IsIdent(i, "instanceof") || IsIdent(i, "in")))
         {
             var op = tokens[i].Text;
+            // 条件里带运算（a === b ? X : Y、!x ? …）：同层往后找到三元的 ?，条件不求值
+            if (TernaryMark(i) is var q and >= 0) { i = q; return Ternary(ref i, start); }
             SkipToTerminator(ref i);
             return new UnkE("运算 " + op, Off(start));
         }
         return items.Count == 1 ? items[0] : new CatE(items, raws, Off(start));
+    }
+
+    /// <summary>tokens[i] 是三元的 ?：解析两个分支。</summary>
+    private TsExpr Ternary(ref int i, int start)
+    {
+        i++;
+        _ternary++;
+        var then = ParseExpression(ref i);
+        _ternary--;
+        if (!IsPunct(i, ":"))
+        {
+            SkipToTerminator(ref i);
+            return new UnkE("运算 ?", Off(start));
+        }
+        i++;
+        var otherwise = ParseExpression(ref i);
+        return new CondE(then, otherwise, Off(start));
+    }
+
+    /// <summary>从 from 起同层往后找三元的 ?；先遇到结束符（含 :）→ -1。</summary>
+    private int TernaryMark(int from)
+    {
+        for (var j = from; j < tokens.Count; j++)
+        {
+            var t = tokens[j];
+            if (t.Kind != TsTokKind.Punct) continue;
+            if (t.Text is "(" or "[" or "{")
+            {
+                var c = MatchClose(j);
+                if (c < 0) return -1;
+                j = c;
+                continue;
+            }
+            if (t.Text == "?") return j;
+            if (t.Text == ":" || Terminators.Contains(t.Text)) return -1;
+        }
+        return -1;
+    }
+
+    /// <summary>function name&lt;T&gt;(参数): 返回类型 { … }：nameIndex 是名字 token。</summary>
+    public FnE FunctionDeclaration(int nameIndex)
+    {
+        var off = Off(nameIndex);
+        var open = nameIndex + 1;
+        while (open < tokens.Count && !IsPunct(open, "("))
+        {
+            if (IsPunct(open, "{") || IsPunct(open, ";")) return new FnE([], null, off);
+            open++;
+        }
+        var close = MatchClose(open);
+        if (close < 0) return new FnE([], null, off);
+        var ps = Params(open + 1, close);
+        var body = close + 1;
+        // 跳过返回类型注解；遇到 ; 是重载声明（没有函数体）
+        while (body < tokens.Count && !IsPunct(body, "{"))
+        {
+            if (IsPunct(body, ";")) return new FnE(ps, null, off);
+            body++;
+        }
+        var end = MatchClose(body);
+        return new FnE(ps, end < 0 ? null : BracedBody(body, end), off);
+    }
+
+    /// <summary>花括号函数体 [open, close]：收集属于它自己的 return（嵌套函数 / 方法体里的跳过）。没有 return、或 return 太多 → null。</summary>
+    private RetE? BracedBody(int open, int close)
+    {
+        var returns = new List<TsExpr>();
+        var braces = new Stack<bool>(); // 每层 { 是不是嵌套函数的函数体
+        var nested = 0;
+        var saved = _ternary;
+        _ternary = 0;
+        try
+        {
+            for (var j = open + 1; j < close; j++)
+            {
+                var t = tokens[j];
+                if (t.Kind == TsTokKind.Punct)
+                {
+                    if (t.Text == "{")
+                    {
+                        var fn = IsFunctionBrace(j);
+                        braces.Push(fn);
+                        if (fn) nested++;
+                    }
+                    else if (t.Text == "}" && braces.Count > 0 && braces.Pop()) nested--;
+                    continue;
+                }
+                if (nested > 0 || !IsIdent(j, "return") || IsPunct(j - 1, ".")) continue;
+                if (IsPunct(j + 1, ";") || IsPunct(j + 1, "}"))
+                {
+                    returns.Add(new UnkE("不是常量: undefined", Off(j)));
+                    continue;
+                }
+                var k = j + 1;
+                returns.Add(ParseExpression(ref k));
+                if (returns.Count > MaxReturns) return null;
+                j = Math.Max(j, k - 1);
+            }
+        }
+        finally { _ternary = saved; }
+        return returns.Count == 0 ? null : new RetE(returns, Off(open));
+    }
+
+    /// <summary>tokens[open] 是 {：它是不是函数 / 方法体（前面是 =>，或参数表 ")"，或参数表后的返回类型注解）；if / for / while / switch / catch 的块不是。</summary>
+    private bool IsFunctionBrace(int open)
+    {
+        if (IsPunct(open - 1, "=>")) return true;
+        var j = open - 1;
+        // ): 返回类型 {：往回跨过简单的类型注解（不越过语句边界）
+        for (var steps = 0; j >= 0 && steps < 16 && !IsPunct(j, ")"); j--, steps++)
+        {
+            if (tokens[j].Kind == TsTokKind.Punct && tokens[j].Text is ";" or "{" or "}" or "=" or ",") return false;
+            if (IsPunct(j, ":") && IsPunct(j - 1, ")")) { j--; break; }
+            if (steps == 0 && !(tokens[j].Kind == TsTokKind.Ident || IsPunct(j, ">") || IsPunct(j, "]"))) return false;
+        }
+        if (!IsPunct(j, ")")) return false;
+        if (j != open - 1 && !IsPunct(j + 1, ":")) return false;
+        var depth = 0;
+        for (var k = j; k >= 0; k--)
+        {
+            if (tokens[k].Kind != TsTokKind.Punct) continue;
+            if (tokens[k].Text == ")") depth++;
+            else if (tokens[k].Text == "(" && --depth == 0) return !(k > 0 && tokens[k - 1].Kind == TsTokKind.Ident && BlockKeywords.Contains(tokens[k - 1].Text));
+        }
+        return false;
     }
 
     private TsExpr ParseUnary(ref int i)
@@ -844,7 +1093,10 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
                     return ArrowBody(ps, ref i, off);
                 }
                 i++;
+                var saved = _ternary;
+                _ternary = 0; // 括号里自成一层，外面三元分支的 ":" 管不到
                 var inner = ParseExpression(ref i);
+                _ternary = saved;
                 if (!IsPunct(i, ")")) { i = close + 1; return new UnkE("复杂表达式", off); }
                 i++;
                 return inner;
@@ -893,8 +1145,19 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
             {
                 if (IsPunct(i, "?.")) i++;
                 if (i + 2 < tokens.Count && tokens[i + 1].Kind is TsTokKind.Str or TsTokKind.Num && IsPunct(i + 2, "]")) { path.Add(tokens[i + 1].Text); i += 3; continue; }
+                var baseEnd = i;
                 var close = MatchClose(i);
                 i = close < 0 ? tokens.Count : close + 1;
+                // TABLE[key].a.b：后面只跟成员访问时留给求值（对表里每一项取值）；再跟调用 / 下标就不管了
+                var rest = new List<string>();
+                while (close >= 0)
+                {
+                    if ((IsPunct(i, ".") || IsPunct(i, "?.")) && IsIdent(i + 1)) { rest.Add(tokens[i + 1].Text); i += 2; continue; }
+                    if (IsPunct(i, "!") && (IsPunct(i + 1, ".") || IsPunct(i + 1, "?."))) { i++; continue; }
+                    break;
+                }
+                if (close >= 0 && !IsPunct(i, "(") && !IsPunct(i, "[") && !IsPunct(i, "?."))
+                    return new IdxE(new RefE(path, false, Raw(start, baseEnd), off), rest, Raw(start, i), off);
                 SkipToTerminator(ref i);
                 return new UnkE("动态下标: " + Raw(start, i), off);
             }
@@ -924,6 +1187,16 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
         if (close < 0) { i = tokens.Count; return new UnkE("花括号不配对", off); }
         var members = new Dictionary<string, TsExpr>(StringComparer.Ordinal);
         var spreads = new List<TsExpr>();
+        var saved = _ternary;
+        _ternary = 0;
+        try { ObjectMembers(ref i, close, members, spreads); }
+        finally { _ternary = saved; }
+        i = close + 1;
+        return new ObjE(members, spreads, off);
+    }
+
+    private void ObjectMembers(ref int i, int close, Dictionary<string, TsExpr> members, List<TsExpr> spreads)
+    {
         i++;
         while (i < close)
         {
@@ -939,7 +1212,9 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
             }
             else if (IsPunct(i, "["))
             {
+                // 计算键 [Kind.Deals]: …：按原文记成 "[Kind.Deals]"，只给动态下标枚举各项用（字面量成员访问碰不到这种名字）
                 var c = MatchClose(i);
+                if (c > i + 1) key = "[" + Raw(i + 1, c) + "]";
                 i = c < 0 ? close : c + 1;
             }
             else { SkipMember(ref i, close); continue; }
@@ -961,8 +1236,6 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
             }
             SkipMember(ref i, close);
         }
-        i = close + 1;
-        return new ObjE(members, spreads, off);
     }
 
     /// <summary>跳到对象成员的分隔逗号（同层）或对象结尾。</summary>
@@ -984,9 +1257,10 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
     {
         if (IsPunct(i, "{"))
         {
+            var open = i;
             var close = MatchClose(i);
             i = close < 0 ? tokens.Count : close + 1;
-            return new FnE(ps, null, off);
+            return new FnE(ps, close < 0 ? null : BracedBody(open, close), off);
         }
         if (i >= tokens.Count) return new FnE(ps, null, off);
         return new FnE(ps, ParseExpression(ref i), off);
@@ -1061,7 +1335,7 @@ internal sealed class TsParser(List<TsToken> tokens, string text, int offsetBias
                     i = c < 0 ? tokens.Count : c + 1;
                     continue;
                 }
-                if (Terminators.Contains(t.Text)) return;
+                if (Terminators.Contains(t.Text) || (_ternary > 0 && t.Text == ":")) return;
             }
             i++;
         }

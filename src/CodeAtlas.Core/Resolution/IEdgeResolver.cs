@@ -17,6 +17,11 @@ public sealed class ResolveContext(IndexDatabase db, IReadOnlyList<PendingRefere
     public IReadOnlyList<ScriptPathConfig> ScriptConfigs { get; } = scriptConfigs ?? [];
     /// <summary>仓库里的 go.mod（module 路径与本地 replace），解析 Go 的 import 路径用。</summary>
     public IReadOnlyList<GoModFile> GoModules { get; init; } = [];
+    /// <summary>
+    /// 增量只解析受影响文件时，其余文件里解析别处要用的引用（父类型、Go 内嵌、返回值提示、Python 绑定等）：
+    /// 只用来建各语言的索引（与全量时看到的一样），不解析、不写边。全量时为空。
+    /// </summary>
+    public IReadOnlyList<PendingReference> SupportReferences { get; init; } = [];
 }
 
 /// <summary>边的解析器扩展点。主解析完成后按注册顺序执行，可把未解析引用改写为边或新符号。</summary>

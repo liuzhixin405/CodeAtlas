@@ -71,10 +71,14 @@ public static class LensQuery
         {
             var c = counts.GetValueOrDefault(m.Id);
             return new SymbolLensDto(ImpactBuilder.ToDto(m, file.Path), c.Callers?.Count ?? 0, c.Sites?.Count ?? 0, c.Tests?.Count ?? 0,
-                outlines[m.Id].Steps.Count, entries.Contains(m.Id));
+                outlines[m.Id].Steps.Count, entries.Contains(m.Id), DispatchTargets(outlines[m.Id].Steps));
         }).ToList();
         return new FileLensDto(file.Path, symbols, stale);
     }
+
+    /// <summary>分派到的 Handler：第一层的 dispatch 步骤与分发调用下的 dispatch 子步骤，按目标去重。</summary>
+    internal static int DispatchTargets(IReadOnlyList<OutlineStepDto> steps) =>
+        steps.SelectMany(s => s.Children.Prepend(s)).Where(s => s.Kind == "dispatch").Select(s => s.Target?.Id ?? -s.Order - 1).Distinct().Count();
 
     /// <summary>读不到文件（被删、被锁）算过期；记录里没有哈希（解析失败 / 超大跳过）不判过期。</summary>
     private static bool IsStale(FileRecord file, ProjectRoots roots)

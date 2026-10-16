@@ -107,6 +107,66 @@ public static class OutlineQuery
         return result;
     }
 
+    /// <summary>
+    /// 按用户写的名字找符号（CLI query 与面板搜索用）：完整限定名 → 短名 → "类型.方法"之类的限定名后缀。
+    /// 后缀比较时两边都去掉参数表与泛型参数（Roslyn 的限定名带参数表，泛型类成员是 Ns.Repo&lt;T&gt;.Find），脚本限定名去掉"路径:"前缀：
+    /// IndexCommand.Run、TransactionBehavior.Handle、JobLockRepository.AddAsync、Repo&lt;T&gt;.Find、Find(int) 都能找到；
+    /// 名字里写了参数表（Find(int)）且有多个重载时，只留参数表一致的那个。后缀按段对齐（Run 不会匹配 RunRoslyn，Index.Run 不会匹配 IndexCommand.Run）。
+    /// </summary>
+    public static IReadOnlyList<SymbolRecord> FindSymbols(IndexDatabase db, string target)
+    {
+        target = target.Trim();
+        if (target.Length == 0) return [];
+        var exact = ReadSymbols(db, $"SELECT {SymbolColumns} FROM symbols s WHERE s.qualified_name = $q", 1, ("$q", target));
+        if (exact.Count > 0) return exact;
+        var want = NormalizeName(target);
+        var member = MapBuilder.MemberName(want);
+        if (member.Length == 0) return [];
+        // 短名：表里的 name 列（Roslyn 的方法名、TS 的函数名）；局部函数、顶级语句的 name 也是最后一段
+        var named = ReadSymbols(db, $"SELECT {SymbolColumns} FROM symbols s WHERE s.name = $n ORDER BY s.qualified_name", 1, ("$n", member));
+        if (target == member) return named;
+        var hits = named.Where(s => EndsWithSegments(NormalizeName(s.QualifiedName), want)).ToList();
+        // 写了脚本路径（useOrders.ts:useOrders）：路径也要按目录段对上（别的文件里的同名函数不算）
+        if (ScriptPath(target) is { } path)
+            hits = hits.Where(s => ScriptPath(s.QualifiedName) is { } p && (p == path || p.EndsWith("/" + path, StringComparison.Ordinal))).ToList();
+        // 写了参数表：多个重载时按参数表文本（去空白）再挑一次；一个都对不上就保留全部（参数类型写法不同：int vs Int32）
+        if (hits.Count > 1 && target.IndexOf('(') is var paren and >= 0)
+        {
+            var args = Compact(target[paren..]);
+            var same = hits.Where(s => s.QualifiedName.IndexOf('(') is var p and >= 0 && Compact(s.QualifiedName[p..]) == args).ToList();
+            if (same.Count > 0) hits = same;
+        }
+        return hits;
+
+        static string Compact(string s) => string.Concat(s.Where(c => !char.IsWhiteSpace(c)));
+    }
+
+    /// <summary>脚本限定名的"路径:"部分（src/a.ts:Comp.method → src/a.ts）；不是脚本限定名返回 null。</summary>
+    private static string? ScriptPath(string q)
+    {
+        var colon = q.LastIndexOf(':');
+        return colon > 0 && !q.StartsWith("external:", StringComparison.Ordinal) && q[..colon].Contains('.') && q.IndexOf('(') is var p && (p < 0 || p > colon) ? q[..colon] : null;
+    }
+
+    /// <summary>名字比较用的形状：去掉 external: 与脚本"路径:"前缀、所有括号里的内容（参数表）与泛型参数，'/' 当作 '.'。</summary>
+    internal static string NormalizeName(string q)
+    {
+        if (q.StartsWith("external:", StringComparison.Ordinal)) q = q["external:".Length..];
+        if (ScriptPath(q) is { } path) q = q[(path.Length + 1)..]; // src/a.ts:Comp.method
+        var sb = new System.Text.StringBuilder(q.Length);
+        var paren = 0;
+        foreach (var c in q)
+        {
+            if (c == '(') paren++;
+            else if (c == ')') { if (paren > 0) paren--; }
+            else if (paren == 0) sb.Append(c == '/' ? '.' : c);
+        }
+        return MapBuilder.StripGenericArgs(sb.ToString());
+    }
+
+    private static bool EndsWithSegments(string qualified, string suffix) =>
+        qualified == suffix || (qualified.EndsWith(suffix, StringComparison.Ordinal) && qualified[qualified.Length - suffix.Length - 1] == '.');
+
     private static EdgeRecord ReadEdge(SqliteDataReader r) => new(
         r.GetInt64(0), r.GetInt64(1), r.IsDBNull(2) ? null : r.GetInt64(2), r.GetString(3),
         DbNames.ParseEdgeKind(r.GetString(4)), DbNames.ParseSource(r.GetString(5)), r.GetDouble(6),
@@ -116,11 +176,11 @@ public static class OutlineQuery
     /// <summary>id 列表内联进 SQL（都是 long，没有注入问题；免得撞 SQLite 的参数个数上限）。空表给一个不存在的 id。</summary>
     internal static string Ids(IReadOnlyCollection<long> ids) => ids.Count == 0 ? "-1" : string.Join(",", ids);
 
-    internal static List<SymbolRecord> ReadSymbols(IndexDatabase db, string sql, int count)
+    internal static List<SymbolRecord> ReadSymbols(IndexDatabase db, string sql, int count, params (string Name, object? Value)[] parameters)
     {
         var list = new List<SymbolRecord>();
         if (count == 0) return list;
-        using var cmd = db.CreateCommand(sql);
+        using var cmd = db.CreateCommand(sql, parameters);
         using var r = cmd.ExecuteReader();
         while (r.Read()) list.Add(ReadSymbol(r));
         return list;

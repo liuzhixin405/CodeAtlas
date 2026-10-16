@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { callersTitle, declarationIntact, fileLenses, LensCache, lensSpecs, StaleSuffix } from "../src/codeLensModel";
+import { BrandPrefix, callersTitle, declarationIntact, fileLenses, LensCache, lensSpecs, StaleSuffix, withBrand } from "../src/codeLensModel";
 import type { FileLensDto, SymbolDto, SymbolLensDto } from "../webview/types";
 
 function sym(id: number, name: string, startLine: number, endLine = startLine + 5): SymbolDto {
@@ -46,6 +46,21 @@ describe("CodeLens 文案", () => {
 
   it("只有测试调用：没有调用方 + 测试 K", () => {
     expect(titles(lens({ callers: 0, callSites: 0, testCallers: 2 }))).toEqual(["没有调用方", "测试 2", "调用 4 个", "影响范围"]);
+  });
+
+  it("经分派到 Handler：调用计数后面写「分派 N」，提示里说能直接跳到 Handler；老服务没有这个字段时不写", () => {
+    const specs = lensSpecs(lens({ callees: 1, dispatches: 1 }), false);
+    const callees = specs.find((s) => s.kind === "callees")!;
+    expect(callees.title).toBe("调用 1 个 · 分派 1");
+    expect(callees.tooltip).toContain("经分派");
+    expect(titles(lens({ callees: 1 }))).toContain("调用 1 个");
+  });
+
+  it("每行第一条前面加 ctg 标识（和语言插件的「N 个引用」区分），只加一次", () => {
+    expect(BrandPrefix).toBe("ctg: ");
+    const branded = withBrand(lensSpecs(lens({ isEntry: true }), false));
+    expect(branded.map((s) => s.title)).toEqual(["ctg: 入口", "被 2 处调用", "调用 4 个", "影响范围"]);
+    expect(withBrand([])).toEqual([]);
   });
 
   it("调用 0 个：显示但不能点", () => {
@@ -113,7 +128,7 @@ describe("行号漂移时隐藏", () => {
 
   it("stale 标记带进每个方法的标题", () => {
     const out = fileLenses({ ...dto, stale: true }, { checkLines: false, lineText: text(doc) });
-    expect(out[0]!.lenses[0]!.title).toBe(`被 2 处调用${StaleSuffix}`);
+    expect(out[0]!.lenses[0]!.title).toBe(`${BrandPrefix}被 2 处调用${StaleSuffix}`); // fileLenses 给第一条加 ctg 标识
   });
 });
 

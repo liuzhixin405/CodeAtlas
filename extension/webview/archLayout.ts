@@ -55,6 +55,7 @@ export const SubKindLabels: Record<string, string> = {
   "python-service": "Python 服务",
   "node-service": "Node 服务",
   "node-cli": "Node 命令行",
+  "vscode-extension": "VS Code 扩展",
   repo: "整个仓库",
   "java-service": "Java 服务",
   "service-registry": "服务注册中心",
@@ -90,7 +91,7 @@ function nodeLabel(n: ArchNodeDto): string {
 }
 
 function edgeLabel(e: ArchEdgeDto): string {
-  const confidence = e.source === "declared" ? "声明" : e.confidence >= 0.9 ? "路由" : e.confidence >= 0.7 ? "配置" : "仅客户端";
+  const confidence = e.source === "declared" ? "声明" : e.confidence >= 0.9 ? "路由" : e.confidence >= 0.7 ? "配置" : e.confidence >= 0.5 ? "仅客户端" : "来自共享库，拿不准";
   return `${e.protocol} · ${confidence}`;
 }
 

@@ -1,3 +1,4 @@
+using CodeAtlas.Core.Diagnostics;
 using CodeAtlas.Core.Resolution;
 using CodeAtlas.Core.Roslyn;
 using CodeAtlas.Core.Storage;
@@ -35,20 +36,26 @@ internal static class IndexCommand
 
             stdout.WriteLine($"files: {report.FilesScanned}  parsed: {report.FilesParsed}  unchanged: {report.FilesUnchanged}  skipped: {report.FilesSkipped}  removed: {report.FilesRemoved}  failed: {report.FilesFailed}");
             stdout.WriteLine($"symbols: {report.TotalSymbols}  edges: {report.TotalEdges}  elapsed: {report.Elapsed.TotalSeconds:F1}s");
+            stdout.WriteLine($"timings: {PhaseTimings.Format(report.Timings ?? [])}");
             foreach (var (path, error) in report.Errors) stderr.WriteLine($"  失败 {path}: {error}");
             var exit = report.FilesFailed > 0 ? 1 : 0;
 
             if (roslynMode != "off")
             {
-                var roslynExit = RunRoslyn(db, roots, args.Value("--sln"), roslynMode == "on", stdout, stderr);
+                var roslynExit = RunRoslyn(db, roots, args.Value("--sln"), roslynMode == "on", options.Full, stdout, stderr);
                 if (roslynExit != 0) exit = roslynExit;
             }
 
-            // 容器图事实：只读文件系统与源码文本，几秒钟；失败不影响索引结果
+            // 后处理三步共用清单与源码缓存；输入没变时 arch + entries 整段跳过，git ref 没变时 git 跳过（见 PostIndexSteps）
+            var postTimings = new PhaseTimings();
+            var steps = new CodeAtlas.Server.PostIndexSteps(roots, db, postTimings);
+            // 容器图事实：只读文件系统与源码文本；失败不影响索引结果
             try
             {
-                var (_, arch) = CodeAtlas.Core.Architecture.ArchitectureScanner.ScanAndStore(roots, db);
-                stdout.WriteLine($"arch: containers: {arch.Containers}  externals: {arch.Externals}  edges: {arch.Edges}  unmatched: {arch.OutboundUnmatched}  elapsed: {arch.Elapsed.TotalSeconds:F1}s");
+                var arch = steps.Arch();
+                stdout.WriteLine(arch is null
+                    ? "arch: 输入没变，跳过"
+                    : $"arch: containers: {arch.Containers}  externals: {arch.Externals}  edges: {arch.Edges}  unmatched: {arch.OutboundUnmatched}  elapsed: {arch.Elapsed.TotalSeconds:F1}s");
             }
             catch (Exception ex) { stderr.WriteLine($"提示：容器图扫描失败：{ex.Message}"); }
 
@@ -57,11 +64,14 @@ internal static class IndexCommand
                 try
                 {
                     var sw = System.Diagnostics.Stopwatch.StartNew();
-                    var git = CodeAtlas.Core.Architecture.GitHistory.Run(roots);
-                    CodeAtlas.Core.Storage.GitStorage.Replace(db, git);
-                    stdout.WriteLine(git.Error is null
-                        ? $"git: commits: {git.Commits}  files: {git.Files.Count}  coupled-pairs: {git.Coupling.Count}  skipped-large: {git.CommitsSkippedForCoupling}  elapsed: {sw.Elapsed.TotalSeconds:F1}s"
-                        : $"git: 不可用（{git.Error}）");
+                    if (!steps.Git()) stdout.WriteLine($"git: ref 没变，跳过  elapsed: {sw.Elapsed.TotalSeconds:F1}s");
+                    else
+                    {
+                        var git = CodeAtlas.Core.Storage.GitStorage.Read(db);
+                        stdout.WriteLine(git.Error is null
+                            ? $"git: commits: {git.Commits}  files: {git.Files.Count}  coupled-pairs: {git.Coupling.Count}  skipped-large: {git.CommitsSkippedForCoupling}  elapsed: {sw.Elapsed.TotalSeconds:F1}s"
+                            : $"git: 不可用（{git.Error}）");
+                    }
                 }
                 catch (Exception ex) { stderr.WriteLine($"提示：git 统计失败：{ex.Message}"); }
             }
@@ -69,11 +79,12 @@ internal static class IndexCommand
             // 入口识别与路由匹配：依赖上面写好的符号、边和容器；失败不影响索引结果
             try
             {
-                var post = CodeAtlas.Server.ArchitecturePostProcess.Run(roots, db);
-                stdout.WriteLine(FormatEntries(post));
+                var post = steps.Entries();
+                stdout.WriteLine(FormatEntries(post) + (post.Skipped ? "  （输入没变，沿用）" : ""));
                 stdout.WriteLine(post.FormatRules());
             }
             catch (Exception ex) { stderr.WriteLine($"提示：入口识别失败：{ex.Message}"); }
+            stdout.WriteLine($"post timings: {PhaseTimings.Format(postTimings.Items)}");
             return exit;
         }
         finally
@@ -88,9 +99,13 @@ internal static class IndexCommand
     /// <summary>
     /// required 为 false（auto）时缺 worker / 解决方案只提示不报错。
     /// 没给 --sln 时主根、外部根、被纳入的嵌套仓库各找一个解决方案，依次跑；部分失败打印原因、退出码 1，其余照常写回。
+    /// 不带 --full 时只跑待 Roslyn 的文件（改过的、依赖它们的、新文件），没有就跳过。
     /// </summary>
-    private static int RunRoslyn(IndexDatabase db, CodeAtlas.Core.Workspace.ProjectRoots roots, string? slnArg, bool required, TextWriter stdout, TextWriter stderr)
+    private static int RunRoslyn(IndexDatabase db, CodeAtlas.Core.Workspace.ProjectRoots roots, string? slnArg, bool required, bool full, TextWriter stdout, TextWriter stderr)
     {
+        var pending = full ? null : new IndexReader(db).GetRoslynPendingFiles();
+        // auto：没有待更新的就不必找 worker；on：照常检查 worker 与解决方案（缺了要报错），之后再跳过
+        if (pending is { Count: 0 } && !required) return SkipNothingPending(stdout);
         var worker = RoslynRunner.FindWorker();
         if (worker is null)
         {
@@ -110,15 +125,18 @@ internal static class IndexCommand
             stderr.WriteLine($"{(required ? "错误" : "提示")}：{unavailable}");
             return required ? 1 : 0;
         }
-        foreach (var sln in solutions) stderr.WriteLine($"[roslyn] {sln}");
+        if (pending is { Count: 0 }) return SkipNothingPending(stdout);
+        if (pending is not null) stderr.WriteLine($"[roslyn] 增量：{pending.Count} 个待更新的 C# 文件");
+        else foreach (var sln in solutions) stderr.WriteLine($"[roslyn] {sln}");
         var sw = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             var r = RoslynRunner.RunAndApplyAsync(db, worker, solutions, roots,
                 p => { if (p.Done % 200 == 0 || p.Done == p.Total) stderr.WriteLine($"  {p.Done}/{p.Total}"); },
-                line => stderr.WriteLine("  " + line), CancellationToken.None).GetAwaiter().GetResult();
+                line => stderr.WriteLine("  " + line), CancellationToken.None, pendingFiles: pending).GetAwaiter().GetResult();
             var failed = r.FailedSolutions ?? [];
-            stdout.WriteLine($"roslyn: solutions: {r.Solutions - failed.Count}/{r.Solutions}  files: {r.Files}  skipped: {r.FilesSkipped}  merged: {r.SymbolsMerged}  added: {r.SymbolsAdded}  edges: {r.Edges}  di: {r.DiRegistrations}  errors: {r.Errors}  kept: {r.HeuristicKept}  kept-types: {r.HeuristicTypeEdgesKept}  elapsed: {sw.Elapsed.TotalSeconds:F1}s");
+            stdout.WriteLine($"roslyn: {(r.Incremental ? "incremental" : "full")}  solutions: {r.Solutions - failed.Count}/{r.Solutions}  files: {r.Files}  misses: {r.Misses}  skipped: {r.FilesSkipped}  merged: {r.SymbolsMerged}  added: {r.SymbolsAdded}  edges: {r.Edges}  di: {r.DiRegistrations}  errors: {r.Errors}  kept: {r.HeuristicKept}  kept-types: {r.HeuristicTypeEdgesKept}  elapsed: {sw.Elapsed.TotalSeconds:F1}s");
+            stdout.WriteLine($"roslyn timings: {PhaseTimings.Format(r.Timings ?? [])}");
             foreach (var f in failed) stderr.WriteLine($"错误：解决方案失败 {f}");
             return failed.Count > 0 ? 1 : 0;
         }
@@ -127,6 +145,12 @@ internal static class IndexCommand
             stderr.WriteLine($"错误：{ex.Message}");
             return 1;
         }
+    }
+
+    private static int SkipNothingPending(TextWriter stdout)
+    {
+        stdout.WriteLine("roslyn: 没有待更新的 C# 文件，跳过");
+        return 0;
     }
 
     private static void WarnIfNotIgnored(string repo, TextWriter stderr)

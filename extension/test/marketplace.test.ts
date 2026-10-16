@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 interface Manifest {
+  publisher: string;
   name: string;
   displayName: string;
   version: string;
@@ -26,6 +27,7 @@ describe("Marketplace branding", () => {
       packages: Record<string, { name?: string; version: string }>;
     };
     expect(manifest.name).toBe("codetrail-graph");
+    expect(manifest.publisher).toBe("164910441");
     expect(manifest.displayName).toBe("CodeTrail Graph");
     expect(lock.name).toBe(manifest.name);
     expect(lock.version).toBe(manifest.version);
