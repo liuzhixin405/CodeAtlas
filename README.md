@@ -1,5 +1,7 @@
 # CodeAtlas
 
+**[安装 VS Code 插件：CodeTrail Graph](https://marketplace.visualstudio.com/items?itemName=164910441.codetrail-graph)** — 打开市场页面后点击 **Install**，按提示在 VS Code 中完成安装。
+
 本地代码阅读器，帮人重新读懂（尤其是 AI 写的）代码。两个方向：**从项目往下**（容器图 → 框架流程 → 入口流程），**从方法出发**（调用时序、调用大纲、影响范围、模块关系、编辑器里的 CodeLens 跳转）。
 
 当前状态：有 VS Code 扩展（面板 + 侧边栏 + CodeLens）、本地服务和命令行。能把 TypeScript / TSX / JavaScript / C# / Go / Python / Java 仓库索引进 SQLite（C# 另有 Roslyn 精确语义），识别部分分派链路和框架管道，并支持本地或联网 AI 叙述。早期里程碑规划见 [设计文档](docs/superpowers/specs/2026-10-13-codeatlas-design.md) 与 [扩展设计](docs/superpowers/specs/2026-10-13-vscode-extension-design.md)，当前能力和限制以使用指南为准。
@@ -8,7 +10,7 @@
 
 市场品牌为 **CodeTrail Graph**，后端项目仍叫 CodeAtlas；内部 `codeatlas.*` 命令、设置及 `.codeatlas` 索引目录不变。
 
-1. 在扩展市场搜索 **CodeTrail Graph**，或运行 `code --install-extension 164910441.codetrail-graph`。离线包及源码构建方式见 [使用指南](docs/vscode-extension-guide.md)；构建需要 .NET 10 SDK，最终用户无需另装 .NET 运行时。
+1. 打开 [CodeTrail Graph 插件市场页面](https://marketplace.visualstudio.com/items?itemName=164910441.codetrail-graph) 点击 **Install**，或运行 `code --install-extension 164910441.codetrail-graph`。离线包及源码构建方式见 [使用指南](docs/vscode-extension-guide.md)；构建需要 .NET 10 SDK，最终用户无需另装 .NET 运行时。
 2. 打开仓库，把光标放在任意方法或类名上，**右键 → CodeTrail Graph → 在调用图中查看**（或 `Ctrl+Alt+G`）。第一次会提示建立索引，耗时取决于项目规模与是否启用 Roslyn。
 3. 调用图默认是**时序图**，按调用顺序从上到下、按项目分列；工具栏「时序 | 网状」可切换画法。网状图自动向下展开主分支，「↑ 到源头」追调用者。项目地图包括容器、框架流程、命名空间，面板支持跨视图后退 / 前进。
 4. 保存文件后自动增量索引（可在设置 `codeatlas.indexOnSave` 关闭）；C# 有待更新文件时会自动补算 Roslyn。服务进程由扩展管理，命令面板里有「CodeTrail Graph: 重启服务」。
